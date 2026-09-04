@@ -202,9 +202,17 @@ fn validate_completion_cross_parameters(
         }
     }
 
-    if req.stream && req.best_of.is_some() {
+    // Only reject streaming when best_of would actually require generating and
+    // ranking multiple candidates (best_of > 1); that is fundamentally
+    // incompatible with token-by-token streaming. best_of == 1 (the OpenAI
+    // default many clients send explicitly, e.g. vLLM's benchmark_serving) is a
+    // no-op -- there is nothing to choose between -- so accept it, matching
+    // vLLM's behavior. Validating on presence alone rejected harmless best_of=1
+    // requests with "best_of is not supported when stream is enabled".
+    if req.stream && req.best_of.map(|b| b > 1).unwrap_or(false) {
         let mut error = validator::ValidationError::new("best_of_not_supported_with_stream");
-        error.message = Some("best_of is not supported when stream is enabled".into());
+        error.message =
+            Some("best_of > 1 is not supported when stream is enabled".into());
         return Err(error);
     }
 
