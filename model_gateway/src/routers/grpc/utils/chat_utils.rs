@@ -22,7 +22,7 @@ use openai_protocol::{
 };
 use serde_json::{json, Value};
 use tokio::sync::Semaphore;
-use tracing::error;
+use tracing::{error, warn};
 use uuid::Uuid;
 
 use crate::routers::{
@@ -71,27 +71,74 @@ pub(crate) fn resolve_tokenizer(
     stage_name: &str,
 ) -> Result<Arc<dyn Tokenizer>, Box<Response>> {
     let model_id = ctx.input.model_id.as_str();
+    let registry = &ctx.components.tokenizer_registry;
 
-    let tokenizer = ctx
-        .components
-        .tokenizer_registry
-        .get(model_id)
-        .ok_or_else(|| {
-            error!(
-                function = %stage_name,
-                model = %model_id,
-                "Tokenizer not found for model"
-            );
-            Box::new(error::internal_error(
-                "tokenizer_not_found",
-                format!("Tokenizer not found for model: {model_id}"),
-            ))
-        })?;
+    // Happy path: the request's model id names a registered tokenizer.
+    let tokenizer = match registry.get(model_id) {
+        Some(tokenizer) => tokenizer,
+        None => resolve_tokenizer_fallback(registry, model_id, stage_name)?,
+    };
 
     // Cache tokenizer in context for reuse in response processing stage
     ctx.state.tokenizer = Some(tokenizer.clone());
 
     Ok(tokenizer)
+}
+
+/// Resolve a tokenizer when the request's model id did not match any registered
+/// name or id.
+///
+/// Single-model deployments are the common case for this gateway (one engine
+/// serving one model under `--served-model-name`). A client that sends a
+/// mismatched model field — a stale alias, or an unexpanded `${MODEL}`
+/// placeholder from a shell/benchmark harness — would otherwise get an opaque
+/// 500. When exactly one tokenizer is registered there is no ambiguity about
+/// which model is meant, so fall back to it and warn (the mismatch is still a
+/// client bug worth surfacing in logs).
+///
+/// With zero or more than one registered tokenizer there is no safe guess, so
+/// return a `404 model_not_found` that lists the available model names. That
+/// is both the correct status for an unknown model and far more actionable than
+/// the previous generic 500.
+fn resolve_tokenizer_fallback(
+    registry: &llm_tokenizer::TokenizerRegistry,
+    model_id: &str,
+    stage_name: &str,
+) -> Result<Arc<dyn Tokenizer>, Box<Response>> {
+    let available: Vec<String> = registry.list().into_iter().map(|entry| entry.name).collect();
+
+    if available.len() == 1 {
+        // Exactly one model served: the requested id is unambiguous even when
+        // it does not match. Serve it, but log the mismatch.
+        let only = &available[0];
+        warn!(
+            function = %stage_name,
+            requested_model = %model_id,
+            served_model = %only.as_str(),
+            "Requested model does not match the served model; \
+             falling back to the only registered tokenizer"
+        );
+        // Safe: `list()` reported exactly one entry, so `get` by that name hits.
+        if let Some(tokenizer) = registry.get(only.as_str()) {
+            return Ok(tokenizer);
+        }
+    }
+
+    error!(
+        function = %stage_name,
+        model = %model_id,
+        available = ?available,
+        "Tokenizer not found for model"
+    );
+    let detail = if available.is_empty() {
+        format!("Tokenizer not found for model '{model_id}': no models are currently served")
+    } else {
+        format!(
+            "Tokenizer not found for model '{model_id}'. Available models: {}",
+            available.join(", ")
+        )
+    };
+    Err(Box::new(error::not_found("model_not_found", detail)))
 }
 
 /// Below this input size (in bytes) the `spawn_blocking` + permit round-trip
@@ -1530,5 +1577,105 @@ mod tests {
         let id = generate_tool_call_id("gpt-4o", "get_weather", 0, 0);
         assert!(id.starts_with("call_"), "got: {id}");
         assert!(!id.contains("get_weather"), "got: {id}");
+    }
+    // --- resolve_tokenizer -------------------------------------------------
+
+    use std::sync::Arc as StdArc;
+
+    use http::StatusCode;
+    use llm_tokenizer::{traits::Tokenizer, MockTokenizer, TokenizerRegistry};
+    use reasoning_parser::ParserFactory as ReasoningParserFactory;
+    use tool_parser::ParserFactory as ToolParserFactory;
+
+    use crate::{
+        routers::grpc::{
+            context::{RequestContext, SharedComponents},
+            utils::ParserResolver,
+        },
+        worker::WorkerRegistry,
+    };
+
+    async fn components_with_models(models: &[&str]) -> StdArc<SharedComponents> {
+        let tokenizer_registry = StdArc::new(TokenizerRegistry::new());
+        for name in models {
+            let tokenizer = StdArc::new(MockTokenizer::new()) as StdArc<dyn Tokenizer>;
+            tokenizer_registry
+                .load(
+                    &TokenizerRegistry::generate_id(),
+                    name,
+                    "test",
+                    || async move { Ok(tokenizer) },
+                )
+                .await
+                .expect("load must succeed for a unique name");
+        }
+        StdArc::new(SharedComponents {
+            tokenizer_registry,
+            worker_registry: StdArc::new(WorkerRegistry::new()),
+            tool_parser_factory: ToolParserFactory::default(),
+            reasoning_parser_factory: ReasoningParserFactory::default(),
+            parser_resolver: ParserResolver::disabled(),
+            multimodal: None,
+        })
+    }
+
+    fn ctx_for_model(components: StdArc<SharedComponents>, requested: &str) -> RequestContext {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": requested,
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .expect("valid chat request");
+        RequestContext::for_chat(StdArc::new(request), None, requested.to_string(), components)
+    }
+
+    #[tokio::test]
+    async fn resolve_tokenizer_exact_match() {
+        let components = components_with_models(&["test"]).await;
+        let mut ctx = ctx_for_model(components, "test");
+        let resolved = resolve_tokenizer(&mut ctx, "unit-test");
+        assert!(resolved.is_ok(), "exact name must resolve");
+        assert!(ctx.state.tokenizer.is_some(), "resolved tokenizer is cached");
+    }
+
+    #[tokio::test]
+    async fn resolve_tokenizer_single_model_fallback_on_mismatch() {
+        // The ${MODEL} regression: client sends a literal unexpanded placeholder
+        // while a single model is served. Fall back to the only tokenizer.
+        let components = components_with_models(&["test"]).await;
+        let mut ctx = ctx_for_model(components, "${MODEL}");
+        let resolved = resolve_tokenizer(&mut ctx, "unit-test");
+        assert!(
+            resolved.is_ok(),
+            "single-model deployment must fall back on a mismatched model id"
+        );
+        assert!(ctx.state.tokenizer.is_some());
+    }
+
+    #[tokio::test]
+    async fn resolve_tokenizer_no_models_returns_404() {
+        let components = components_with_models(&[]).await;
+        let mut ctx = ctx_for_model(components, "${MODEL}");
+        let err = resolve_tokenizer(&mut ctx, "unit-test").expect_err("no models => error");
+        assert_eq!(err.status(), StatusCode::NOT_FOUND);
+        assert!(ctx.state.tokenizer.is_none());
+    }
+
+    #[tokio::test]
+    async fn resolve_tokenizer_multi_model_mismatch_returns_404() {
+        // With more than one model there is no safe guess; surface a 404 that
+        // lists the available models instead of silently picking one.
+        let components = components_with_models(&["alpha", "beta"]).await;
+        let mut ctx = ctx_for_model(components, "${MODEL}");
+        let err = resolve_tokenizer(&mut ctx, "unit-test").expect_err("ambiguous => error");
+        assert_eq!(err.status(), StatusCode::NOT_FOUND);
+        assert!(ctx.state.tokenizer.is_none());
+    }
+
+    #[tokio::test]
+    async fn resolve_tokenizer_multi_model_exact_match_still_works() {
+        let components = components_with_models(&["alpha", "beta"]).await;
+        let mut ctx = ctx_for_model(components, "beta");
+        assert!(resolve_tokenizer(&mut ctx, "unit-test").is_ok());
+        assert!(ctx.state.tokenizer.is_some());
     }
 }
