@@ -860,6 +860,7 @@ const SGLANG_GRPC_KEYS: &[&str] = &[
 const TOKENSPEED_GRPC_KEYS: &[&str] = &[
     "model",
     "served_model_name",
+    "served_model_names",
     "tokenizer",
     "tp_size",
     "dp_size",
@@ -931,6 +932,31 @@ fn pick_prost_fields(labels: &mut HashMap<String, String>, s: &prost_types::Stru
                     }
                     prost_types::value::Kind::BoolValue(b) => {
                         labels.insert((*key).to_string(), b.to_string());
+                    }
+                    prost_types::value::Kind::ListValue(list) => {
+                        // JSON-encode non-empty lists (e.g. served_model_names).
+                        let mut arr = Vec::new();
+                        for item in &list.values {
+                            match item.kind.as_ref() {
+                                Some(prost_types::value::Kind::StringValue(s))
+                                    if !s.is_empty() =>
+                                {
+                                    arr.push(serde_json::Value::String(s.clone()));
+                                }
+                                Some(prost_types::value::Kind::NumberValue(n)) => {
+                                    arr.push(serde_json::json!(n));
+                                }
+                                Some(prost_types::value::Kind::BoolValue(b)) => {
+                                    arr.push(serde_json::Value::Bool(*b));
+                                }
+                                _ => {}
+                            }
+                        }
+                        if !arr.is_empty() {
+                            if let Ok(s) = serde_json::to_string(&arr) {
+                                labels.insert((*key).to_string(), s);
+                            }
+                        }
                     }
                     _ => {}
                 }

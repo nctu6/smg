@@ -837,6 +837,7 @@ mod tests {
             container: None,
             mcp_servers: None,
             rid: None,
+            mm_processor_kwargs: None,
             other: serde_json::Map::new(),
         };
         assert_eq!(get_history_tool_calls_count_messages(&request), 0);
@@ -887,6 +888,7 @@ mod tests {
             container: None,
             mcp_servers: None,
             rid: None,
+            mm_processor_kwargs: None,
             other: serde_json::Map::new(),
         };
         assert_eq!(get_history_tool_calls_count_messages(&request), 2);

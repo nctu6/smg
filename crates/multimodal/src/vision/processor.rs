@@ -210,6 +210,27 @@ impl VisionProcessorRegistry {
         let mut registry = Self::new();
 
         for pattern in [
+            "gemma-3",
+            "gemma3",
+            "Gemma3ImageProcessor",
+        ] {
+            registry.register(
+                pattern,
+                Box::new(super::processors::Gemma3Processor::new()),
+            );
+        }
+        for pattern in [
+            "gemma-4",
+            "gemma4",
+            "Gemma4ImageProcessor",
+        ] {
+            registry.register(
+                pattern,
+                Box::new(super::processors::Gemma4Processor::new()),
+            );
+        }
+
+        for pattern in [
             "glm-5.3-flash",
             "glm5.3-flash",
             "glm53_flash",

@@ -21,6 +21,8 @@
 //! - **LLaMA 4 Vision** (`llama4_vision`): Tile-based processing with 336x336 tiles and global tile
 //! - **Pixtral/Mistral3** (`pixtral`): CLIP-based preprocessing with dynamic resolution
 
+pub mod gemma3;
+pub mod gemma4;
 pub mod glm53_flash;
 pub mod inkling;
 pub mod kimi_k25;
@@ -37,6 +39,8 @@ pub mod qwen3_omni_vision;
 pub mod qwen3_vl;
 pub mod qwen_vl_base;
 
+pub use gemma3::Gemma3Processor;
+pub use gemma4::Gemma4Processor;
 pub use glm53_flash::Glm53FlashProcessor;
 pub use inkling::InklingImageProcessor;
 pub use kimi_k25::KimiK25Processor;

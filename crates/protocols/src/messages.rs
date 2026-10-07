@@ -77,6 +77,9 @@ pub struct CreateMessageRequest {
     /// Request ID forwarded to the backend for log correlation (SGLang extension)
     pub rid: Option<String>,
 
+    /// vLLM-compatible multimodal processor kwargs (e.g. do_pan_and_scan).
+    pub mm_processor_kwargs: Option<HashMap<String, Value>>,
+
     /// Additional fields not explicitly defined above (e.g. beta features like
     /// context_management, output_config). Captured and forwarded to backends.
     #[serde(flatten)]
@@ -2025,6 +2028,7 @@ mod tests {
             container: None,
             mcp_servers: None,
             rid: None,
+            mm_processor_kwargs: None,
             other: Map::new(),
         }
     }

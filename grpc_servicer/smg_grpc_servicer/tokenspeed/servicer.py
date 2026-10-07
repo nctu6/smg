@@ -619,7 +619,7 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
             tokenizer_path=tokenizer_path or "",
             default_sampling_params_json=self.server_args.preferred_sampling_params or "",
             weight_version="",
-            served_model_name=(self.server_args.served_model_name or model_path),
+            served_model_name=(self.server_args.canonical_served_model_name),
             max_context_length=int(self.async_llm.context_len),
             vocab_size=int(model_config.vocab_size),
             model_type=(getattr(hf_config, "model_type", "") or "") if hf_config else "",
@@ -722,6 +722,20 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
             # single-rank engines simply stay label-free.
             if isinstance(dp_size, int) and dp_size > 1:
                 server_args_dict["dp_size"] = dp_size
+
+        # vLLM-parity multi served names: keep Struct field as canonical string
+        # for pick_prost_fields, and advertise the full list as JSON so
+        # create_worker can register one ModelCard per id on /v1/models.
+        names = list(getattr(self.server_args, "served_model_names", None) or [])
+        if not names:
+            names = [
+                getattr(self.server_args, "canonical_served_model_name", None)
+                or getattr(self.server_args, "model", None)
+                or getattr(self.server_args, "model_path", "")
+                or ""
+            ]
+        server_args_dict["served_model_name"] = names[0]
+        server_args_dict["served_model_names"] = names
 
         server_args_struct = Struct()
         server_args_struct.update(_make_json_serializable(server_args_dict))
@@ -1500,7 +1514,12 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         if modality == Modality.VIDEO and has_image_grid:
             raise ValueError("VIDEO MultimodalItem must not carry image_grid_thw")
         if modality == Modality.VIDEO and not has_video_grid:
-            raise ValueError("VIDEO MultimodalItem must carry video_grid_thw")
+            # Qwen/MRoPE families require video_grid_thw. Gemma4 video reuses the
+            # vision tower with image_position_ids and has no T/H/W grid.
+            if "image_position_ids" not in model_specific_data:
+                raise ValueError(
+                    "VIDEO MultimodalItem must carry video_grid_thw or image_position_ids"
+                )
         if modality == Modality.AUDIO and (has_image_grid or has_video_grid):
             raise ValueError("AUDIO MultimodalItem must not carry image/video grid tensors")
 

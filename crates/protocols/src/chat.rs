@@ -317,6 +317,10 @@ pub struct ChatCompletionRequest {
     /// Chat template kwargs
     pub chat_template_kwargs: Option<HashMap<String, Value>>,
 
+    /// vLLM-compatible multimodal processor kwargs (e.g. do_pan_and_scan, max_soft_tokens).
+    /// Default / absent keeps HF processor defaults (pan-and-scan off).
+    pub mm_processor_kwargs: Option<HashMap<String, Value>>,
+
     /// Return model hidden states
     #[serde(default, skip_serializing_if = "is_false")]
     pub return_hidden_states: bool,

@@ -74,15 +74,67 @@ pub(crate) fn resolve_tokenizer(
     let registry = &ctx.components.tokenizer_registry;
 
     // Happy path: the request's model id names a registered tokenizer.
+    // Multi `--served-model-name`: extras are first-class ModelCards for
+    // `/v1/models`, but the tokenizer is registered under the canonical id
+    // only. Resolve via the worker that serves this id, then fall back.
     let tokenizer = match registry.get(model_id) {
         Some(tokenizer) => tokenizer,
-        None => resolve_tokenizer_fallback(registry, model_id, stage_name)?,
+        None => {
+            if let Some(tokenizer) =
+                resolve_tokenizer_via_worker(ctx, registry, model_id)
+            {
+                tokenizer
+            } else {
+                resolve_tokenizer_fallback(registry, model_id, stage_name)?
+            }
+        }
     };
 
     // Cache tokenizer in context for reuse in response processing stage
     ctx.state.tokenizer = Some(tokenizer.clone());
 
     Ok(tokenizer)
+}
+
+/// When extras are first-class ModelCards (vLLM multi served-name), the
+/// tokenizer registry still keys by the canonical served name. Look up a
+/// worker that advertises ``model_id`` and reuse its primary tokenizer.
+fn resolve_tokenizer_via_worker(
+    ctx: &RequestContext,
+    registry: &llm_tokenizer::TokenizerRegistry,
+    model_id: &str,
+) -> Option<Arc<dyn Tokenizer>> {
+    let workers = ctx.components.worker_registry.get_by_model(model_id);
+    let worker = workers.first()?;
+    let canonical = worker.model_id();
+    if canonical == model_id {
+        return None;
+    }
+    registry.get(canonical)
+}
+
+/// Resolve the tokenizer registry entry for ``model_id``, including multi
+/// ``--served-model-name`` aliases that only register under the canonical id.
+pub(crate) fn resolve_tokenizer_entry(
+    ctx: &RequestContext,
+    model_id: &str,
+) -> Option<llm_tokenizer::TokenizerEntry> {
+    let registry = &ctx.components.tokenizer_registry;
+    if let Some(entry) = registry
+        .get_by_name(model_id)
+        .or_else(|| registry.get_by_id(model_id))
+    {
+        return Some(entry);
+    }
+    let workers = ctx.components.worker_registry.get_by_model(model_id);
+    let worker = workers.first()?;
+    let canonical = worker.model_id();
+    if canonical == model_id {
+        return None;
+    }
+    registry
+        .get_by_name(canonical)
+        .or_else(|| registry.get_by_id(canonical))
 }
 
 /// Resolve a tokenizer when the request's model id did not match any registered

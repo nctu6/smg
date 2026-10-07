@@ -44,6 +44,7 @@ pub(crate) async fn process_multimodal_plan(
     components: &MultimodalComponents,
     tokenizer_id: &str,
     tokenizer_source: &str,
+    mm_processor_kwargs: Option<&HashMap<String, serde_json::Value>>,
 ) -> Result<MultimodalOutput> {
     let log_timing = log_mm_timing_enabled();
     let total_started = Instant::now();
@@ -198,6 +199,7 @@ pub(crate) async fn process_multimodal_plan(
             spec,
             tokenizer_id,
             &model_config,
+            mm_processor_kwargs,
         )
     }))
     .await?;
@@ -338,18 +340,26 @@ async fn preprocess_modality(
     spec: &dyn ModelProcessorSpec,
     tokenizer_id: &str,
     model_config: &MultimodalModelConfig,
+    mm_processor_kwargs: Option<&HashMap<String, serde_json::Value>>,
 ) -> Result<PreprocessedEncoderInputs> {
     // Run CPU-intensive preprocessing on a blocking thread pool so it doesn't
     // block the tokio async runtime under concurrent load.
     // TODO: consider making the thread pool size configurable.
     let modality = media.modality();
-    let pp_config = match modality {
+    let mut pp_config = match modality {
         Modality::Video => model_config
             .video_preprocessor_config
             .clone()
             .unwrap_or_else(|| model_config.preprocessor_config.clone()),
         _ => model_config.preprocessor_config.clone(),
     };
+    // Request-body mm_processor_kwargs (vLLM parity). Default off = HF
+    // Gemma3ProcessorKwargs.do_pan_and_scan: False / absent.
+    if let Some(kwargs) = mm_processor_kwargs {
+        for (k, v) in kwargs {
+            pp_config.extra.insert(k.clone(), v.clone());
+        }
+    }
 
     if let MediaBatch::Images(images) = media {
         if let (Some(cache), [image]) = (components.pixel_cache.clone(), images.as_slice()) {

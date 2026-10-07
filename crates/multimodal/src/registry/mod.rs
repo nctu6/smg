@@ -1,3 +1,5 @@
+mod gemma3;
+mod gemma4;
 mod glm53_flash;
 mod inkling;
 mod kimi_k25;
@@ -12,6 +14,8 @@ mod qwen3_vl;
 mod qwen_vl;
 mod traits;
 
+use gemma3::Gemma3VisionSpec;
+use gemma4::Gemma4VisionSpec;
 use glm53_flash::Glm53FlashSpec;
 use inkling::InklingSpec;
 use kimi_k25::KimiK25VisionSpec;
@@ -39,6 +43,8 @@ impl ModelRegistry {
     pub fn new() -> Self {
         Self {
             specs: vec![
+                LazySpec::new(|| Box::new(Gemma4VisionSpec)),
+                LazySpec::new(|| Box::new(Gemma3VisionSpec)),
                 LazySpec::new(|| Box::new(Glm53FlashSpec)),
                 LazySpec::new(|| Box::new(InklingSpec)),
                 // Kimi-K3 must be registered before Kimi-K2.5: the two families

@@ -53,11 +53,7 @@ impl ChatPreparationStage {
         // by the per-model spec. Falls back to vLLM-compatible media-first when
         // the model has no multimodal components or matches no spec.
         let model_id = ctx.input.model_id.as_str();
-        let tokenizer_entry = ctx
-            .components
-            .tokenizer_registry
-            .get_by_name(model_id)
-            .or_else(|| ctx.components.tokenizer_registry.get_by_id(model_id));
+        let tokenizer_entry = utils::resolve_tokenizer_entry(ctx, model_id);
         let media_order = match (ctx.components.multimodal.as_ref(), tokenizer_entry.as_ref()) {
             (Some(mm_components), Some(entry)) => {
                 multimodal::resolve_media_part_order(
@@ -195,6 +191,20 @@ impl ChatPreparationStage {
         if let Some((mm_components, model_id, tokenizer_id, tokenizer_source, media_plan)) =
             mm_context
         {
+            let mut mm_kwargs = request
+                .mm_processor_kwargs
+                .clone()
+                .unwrap_or_default();
+            if let Some(v) = request.other.get("do_pan_and_scan") {
+                mm_kwargs
+                    .entry("do_pan_and_scan".to_string())
+                    .or_insert(v.clone());
+            }
+            let mm_kwargs = if mm_kwargs.is_empty() {
+                None
+            } else {
+                Some(mm_kwargs)
+            };
             match multimodal::process_multimodal_plan(
                 media_plan,
                 model_id,
@@ -203,6 +213,7 @@ impl ChatPreparationStage {
                 mm_components,
                 &tokenizer_id,
                 &tokenizer_source,
+                mm_kwargs.as_ref(),
             )
             .await
             {

@@ -223,11 +223,13 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
             vec![None] // single worker, no DP
         };
 
+        let model_cards = expand_served_model_cards(&model_card, &labels);
+
         let workers: Vec<Arc<dyn Worker>> = dp_ranks
             .into_iter()
             .map(|dp| {
                 let mut builder = BasicWorkerBuilder::new(url.clone())
-                    .model(model_card.clone())
+                    .models(model_cards.clone())
                     .worker_type(config.worker_type)
                     .connection_mode(*connection_mode)
                     .runtime_type(runtime_type)
@@ -404,6 +406,51 @@ fn validate_parser_overrides(
         }
     }
     Ok(())
+}
+
+
+/// Expand a discovered worker into one [`ModelCard`] per served API id.
+///
+/// TokenSpeed (vLLM parity) may advertise multiple `--served-model-name`
+/// values for one process / one weight set. The canonical id is
+/// `model_card.id`; extras arrive as a JSON array label `served_model_names`.
+/// Each name becomes its own card so `/v1/models` lists them all (aliases
+/// alone stay out of discovery by design).
+fn expand_served_model_cards(
+    model_card: &ModelCard,
+    labels: &HashMap<String, String>,
+) -> Vec<ModelCard> {
+    let mut names: Vec<String> = Vec::new();
+    if let Some(json) = labels.get("served_model_names") {
+        if let Ok(parsed) = serde_json::from_str::<Vec<String>>(json) {
+            for name in parsed {
+                if !name.is_empty() && !names.iter().any(|n| n == &name) {
+                    names.push(name);
+                }
+            }
+        }
+    }
+    if names.is_empty() {
+        names.push(model_card.id.clone());
+    } else if !names.iter().any(|n| n == &model_card.id) {
+        // Keep canonical first.
+        names.insert(0, model_card.id.clone());
+    } else {
+        // Move canonical to front.
+        names.retain(|n| n != &model_card.id);
+        names.insert(0, model_card.id.clone());
+    }
+
+    names
+        .into_iter()
+        .map(|id| {
+            let mut card = model_card.clone();
+            card.id = id;
+            // Extra served names are first-class ids, not aliases of each other.
+            card.aliases.clear();
+            card
+        })
+        .collect()
 }
 
 fn build_model_card(

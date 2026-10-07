@@ -32,7 +32,7 @@ pub use factory::{
 };
 pub use huggingface::HuggingFaceTokenizer;
 pub use mock::MockTokenizer;
-pub use registry::{LoadError, LoadOutcome, TokenizerRegistry};
+pub use registry::{LoadError, LoadOutcome, TokenizerEntry, TokenizerRegistry};
 pub use sequence::Sequence;
 pub use stop::{SequenceDecoderOutput, StopSequenceConfig, StopSequenceDecoder};
 pub use stream::DecodeStream;
