@@ -326,6 +326,12 @@ pub(crate) enum ExecutionPlan {
         shared_request_id: String,
         requests: Vec<ProtoGenerateRequest>,
     },
+    /// Batched embedding fan-out: one Embed RPC per input string. Sub ids are
+    /// `{shared_request_id}-p{i}`; the OpenAI response id stays shared.
+    EmbedBatch {
+        shared_request_id: String,
+        requests: Vec<ProtoEmbedRequest>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -356,6 +362,9 @@ impl ExecutionPlan {
             }
             Self::Batch {
                 shared_request_id, ..
+            }
+            | Self::EmbedBatch {
+                shared_request_id, ..
             } => shared_request_id,
         }
     }
@@ -366,7 +375,7 @@ impl ExecutionPlan {
             | Self::PrefillDecode(_)
             | Self::EncodePrefillDecode { .. }
             | Self::Batch { .. } => "generate",
-            Self::Single(ProtoRequest::Embed(_)) => "embed",
+            Self::Single(ProtoRequest::Embed(_)) | Self::EmbedBatch { .. } => "embed",
         }
     }
 
@@ -380,6 +389,7 @@ impl ExecutionPlan {
                 ExecutionPlanKind::PrefillDecode => "prefill_decode",
                 ExecutionPlanKind::EncodePrefillDecode => "encode_prefill_decode",
             },
+            Self::EmbedBatch { .. } => "single",
         }
     }
 
@@ -392,6 +402,9 @@ impl ExecutionPlan {
             }
             Self::Batch { requests, .. } => {
                 requests.iter().map(ProtoGenerateRequest::wire_len).sum()
+            }
+            Self::EmbedBatch { requests, .. } => {
+                requests.iter().map(ProtoEmbedRequest::wire_len).sum()
             }
         }
     }
@@ -414,7 +427,7 @@ impl ExecutionPlan {
                 request.set_request_id(request_id);
                 Ok(())
             }
-            Self::Batch { .. } => {
+            Self::Batch { .. } | Self::EmbedBatch { .. } => {
                 error!(
                     function = "ExecutionPlan::set_request_id",
                     "Single id stamp on a batch plan"
@@ -435,7 +448,7 @@ impl ExecutionPlan {
             Self::Single(ProtoRequest::Generate(request))
             | Self::PrefillDecode(request)
             | Self::EncodePrefillDecode { request } => std::slice::from_mut(request).iter_mut(),
-            Self::Single(ProtoRequest::Embed(_)) => [].iter_mut(),
+            Self::Single(ProtoRequest::Embed(_)) | Self::EmbedBatch { .. } => [].iter_mut(),
             Self::Batch { requests, .. } => requests.iter_mut(),
         }
     }
@@ -468,8 +481,11 @@ pub(crate) enum PreparationOutput {
         token_ids: Vec<u32>,
     },
     Embedding {
-        original_text: String,
-        token_ids: Vec<u32>,
+        /// One entry per input string; scalar requests carry exactly one.
+        items: Vec<EmbeddingItem>,
+        /// `Some` iff multiple inputs: texts joined for routing affinity,
+        /// mirroring `EmbeddingRequest::extract_text_for_routing`.
+        joined_routing_text: Option<String>,
     },
     Harmony {
         token_ids: Vec<u32>,
@@ -489,6 +505,12 @@ pub(crate) struct CompletionItem {
     pub token_ids: Vec<u32>,
 }
 
+/// One tokenized embedding input string.
+pub(crate) struct EmbeddingItem {
+    pub text: String,
+    pub token_ids: Vec<u32>,
+}
+
 impl PreparationOutput {
     /// Token IDs (common to all variants). Batched completions expose the
     /// first prompt's tokens as the routing-affinity proxy.
@@ -497,9 +519,11 @@ impl PreparationOutput {
             Self::Chat { token_ids, .. }
             | Self::Messages { token_ids, .. }
             | Self::Generate { token_ids, .. }
-            | Self::Embedding { token_ids, .. }
             | Self::Harmony { token_ids, .. } => token_ids,
             Self::Completion { items, .. } => {
+                items.first().map_or(&[], |item| item.token_ids.as_slice())
+            }
+            Self::Embedding { items, .. } => {
                 items.first().map_or(&[], |item| item.token_ids.as_slice())
             }
         }
@@ -512,6 +536,7 @@ impl PreparationOutput {
     pub fn total_input_token_count(&self) -> usize {
         match self {
             Self::Completion { items, .. } => items.iter().map(|item| item.token_ids.len()).sum(),
+            Self::Embedding { items, .. } => items.iter().map(|item| item.token_ids.len()).sum(),
             other => other.token_ids().len(),
         }
     }
@@ -532,7 +557,12 @@ impl PreparationOutput {
             } => joined_routing_text
                 .as_deref()
                 .or_else(|| items.first().map(|item| item.text.as_str())),
-            Self::Embedding { original_text, .. } => Some(original_text),
+            Self::Embedding {
+                items,
+                joined_routing_text,
+            } => joined_routing_text
+                .as_deref()
+                .or_else(|| items.first().map(|item| item.text.as_str())),
             Self::Generate { original_text, .. } => original_text.as_deref(),
             Self::Harmony { selection_text, .. } => Some(selection_text),
         }

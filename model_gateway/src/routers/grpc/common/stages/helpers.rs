@@ -236,32 +236,47 @@ impl IdStamp {
             Self::Minted { prefix } => {
                 plan.set_request_id(format!("{prefix}{}", uuid::Uuid::now_v7()))
             }
-            Self::Batch(batch) => {
-                let ExecutionPlan::Batch {
+            Self::Batch(batch) => match plan {
+                ExecutionPlan::Batch {
                     shared_request_id,
                     requests,
                     ..
-                } = plan
-                else {
+                } => {
+                    let shared = batch
+                        .stable_shared
+                        .clone()
+                        .unwrap_or_else(|| format!("{}{}", batch.prefix, uuid::Uuid::now_v7()));
+                    for (i, request) in requests.iter_mut().enumerate() {
+                        request.set_request_id(batch_sub_id(&shared, i, batch.unique_subs));
+                    }
+                    *shared_request_id = shared;
+                    Ok(())
+                }
+                ExecutionPlan::EmbedBatch {
+                    shared_request_id,
+                    requests,
+                } => {
+                    let shared = batch
+                        .stable_shared
+                        .clone()
+                        .unwrap_or_else(|| format!("{}{}", batch.prefix, uuid::Uuid::now_v7()));
+                    for (i, request) in requests.iter_mut().enumerate() {
+                        request.set_request_id(batch_sub_id(&shared, i, batch.unique_subs));
+                    }
+                    *shared_request_id = shared;
+                    Ok(())
+                }
+                _ => {
                     error!(
                         function = "IdStamp::restamp",
                         "Batch id stamp on a non-batch plan"
                     );
-                    return Err(error::internal_error(
+                    Err(error::internal_error(
                         "id_stamp_plan_mismatch",
                         "Id stamp does not match the plan shape",
-                    ));
-                };
-                let shared = batch
-                    .stable_shared
-                    .clone()
-                    .unwrap_or_else(|| format!("{}{}", batch.prefix, uuid::Uuid::now_v7()));
-                for (i, request) in requests.iter_mut().enumerate() {
-                    request.set_request_id(batch_sub_id(&shared, i, batch.unique_subs));
+                    ))
                 }
-                *shared_request_id = shared;
-                Ok(())
-            }
+            },
         }
     }
 }

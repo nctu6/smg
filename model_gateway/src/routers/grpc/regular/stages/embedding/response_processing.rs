@@ -48,7 +48,6 @@ impl ProcessStage for EmbeddingResponseProcessingStage {
             ));
         }
 
-        // Extract execution result
         let execution_result = ctx.response.execution_result.take().ok_or_else(|| {
             error!(
                 function = "EmbeddingResponseProcessingStage::process",
@@ -57,28 +56,45 @@ impl ProcessStage for EmbeddingResponseProcessingStage {
             error::internal_error("execution_result_missing", "Execution result missing")
         })?;
 
-        // Expect Embedding result variant
-        let proto_response = if let ExecutionResult::Embedding { response } = execution_result {
-            response
-        } else {
-            error!(
-                function = "EmbeddingResponseProcessingStage::process",
-                "Invalid execution result: expected Embedding"
-            );
-            return Err(error::internal_error(
-                "invalid_execution_result",
-                "Expected Embedding result",
-            ));
+        let embedding_response = match execution_result {
+            ExecutionResult::Embedding { response } => self
+                .convert_responses(ctx, vec![response])
+                .map_err(|boxed_err| *boxed_err)?,
+            ExecutionResult::Batch { results } => {
+                let mut protos = Vec::with_capacity(results.len());
+                for (i, result) in results.into_iter().enumerate() {
+                    match result {
+                        ExecutionResult::Embedding { response } => protos.push(response),
+                        other => {
+                            error!(
+                                function = "EmbeddingResponseProcessingStage::process",
+                                index = i,
+                                "Invalid batched execution result: expected Embedding"
+                            );
+                            let _ = other;
+                            return Err(error::internal_error(
+                                "invalid_execution_result",
+                                "Expected Embedding result in batch",
+                            ));
+                        }
+                    }
+                }
+                self.convert_responses(ctx, protos)
+                    .map_err(|boxed_err| *boxed_err)?
+            }
+            _ => {
+                error!(
+                    function = "EmbeddingResponseProcessingStage::process",
+                    "Invalid execution result: expected Embedding or Batch"
+                );
+                return Err(error::internal_error(
+                    "invalid_execution_result",
+                    "Expected Embedding result",
+                ));
+            }
         };
 
-        // Convert proto response to HTTP response
-        let embedding_response = self
-            .convert_response(ctx, proto_response)
-            .map_err(|boxed_err| *boxed_err)?;
-
-        // Store in context for pipeline to extract
         ctx.response.final_response = Some(FinalResponse::Embedding(embedding_response));
-
         Ok(None)
     }
 
@@ -92,45 +108,42 @@ impl EmbeddingResponseProcessingStage {
         clippy::unused_self,
         reason = "method on stage struct for consistency with other stage convert_response methods"
     )]
-    fn convert_response(
+    fn convert_responses(
         &self,
         ctx: &DispatchContext,
-        proto: ProtoEmbedComplete,
+        protos: Vec<ProtoEmbedComplete>,
     ) -> Result<EmbeddingResponse, Box<Response>> {
         let dispatch = ctx.dispatch.as_ref().ok_or_else(|| {
             error!(
-                function = "EmbeddingResponseProcessingStage::convert_response",
+                function = "EmbeddingResponseProcessingStage::convert_responses",
                 "Dispatch metadata missing in context"
             );
             error::internal_error("dispatch_missing", "Dispatch metadata missing")
         })?;
 
         let model = dispatch.model.clone();
-
-        // Convert flat embedding vector to response
-        // single input -> single embedding object
-
-        let embedding_data = EmbeddingObject {
-            object: "embedding".to_string(),
-            embedding: proto.embedding().to_vec(),
-            index: 0,
-        };
-
-        let prompt_tokens = proto.prompt_tokens();
-
-        let usage = openai_protocol::common::UsageInfo {
-            prompt_tokens,
-            total_tokens: prompt_tokens, // Embedding has no completion tokens
-            completion_tokens: 0,
-            prompt_tokens_details: None,
-            reasoning_tokens: None,
-        };
+        let mut prompt_tokens: u32 = 0;
+        let mut data = Vec::with_capacity(protos.len());
+        for (index, proto) in protos.into_iter().enumerate() {
+            prompt_tokens = prompt_tokens.saturating_add(proto.prompt_tokens());
+            data.push(EmbeddingObject {
+                object: "embedding".to_string(),
+                embedding: proto.embedding().to_vec(),
+                index: index as u32,
+            });
+        }
 
         Ok(EmbeddingResponse {
             object: "list".to_string(),
-            data: vec![embedding_data],
+            data,
             model,
-            usage,
+            usage: openai_protocol::common::UsageInfo {
+                prompt_tokens,
+                total_tokens: prompt_tokens,
+                completion_tokens: 0,
+                prompt_tokens_details: None,
+                reasoning_tokens: None,
+            },
         })
     }
 }

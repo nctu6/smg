@@ -1262,14 +1262,14 @@ impl ProtoGenerateRequest {
         matches!(self, Self::Vllm(_))
     }
 
-    /// Check if this is TensorRT-LLM
-    pub fn is_trtllm(&self) -> bool {
-        matches!(self, Self::Trtllm(_))
-    }
-
     /// Check if this is TokenSpeed
     pub fn is_tokenspeed(&self) -> bool {
         matches!(self, Self::TokenSpeed(_))
+    }
+
+    /// Check if this is TensorRT-LLM
+    pub fn is_trtllm(&self) -> bool {
+        matches!(self, Self::Trtllm(_))
     }
 
     /// Sanitize sampling params for the prefill-only leg (vLLM PD mode).
@@ -2237,6 +2237,7 @@ impl ProtoStream {
 pub enum ProtoEmbedRequest {
     Sglang(Box<sglang::EmbedRequest>),
     Vllm(Box<vllm::EmbedRequest>),
+    TokenSpeed(Box<tokenspeed::EmbedRequest>),
 }
 
 impl ProtoEmbedRequest {
@@ -2246,6 +2247,7 @@ impl ProtoEmbedRequest {
         match self {
             Self::Sglang(req) => req.encoded_len(),
             Self::Vllm(req) => req.encoded_len(),
+            Self::TokenSpeed(req) => req.encoded_len(),
         }
     }
 
@@ -2257,7 +2259,7 @@ impl ProtoEmbedRequest {
     pub fn as_sglang(&self) -> &sglang::EmbedRequest {
         match self {
             Self::Sglang(req) => req,
-            Self::Vllm(_) => panic!("Expected SGLang embed request"),
+            Self::Vllm(_) | Self::TokenSpeed(_) => panic!("Expected SGLang embed request"),
         }
     }
 
@@ -2269,7 +2271,7 @@ impl ProtoEmbedRequest {
     pub fn as_sglang_mut(&mut self) -> &mut sglang::EmbedRequest {
         match self {
             Self::Sglang(req) => req,
-            Self::Vllm(_) => panic!("Expected SGLang embed request"),
+            Self::Vllm(_) | Self::TokenSpeed(_) => panic!("Expected SGLang embed request"),
         }
     }
 
@@ -2283,6 +2285,11 @@ impl ProtoEmbedRequest {
         matches!(self, Self::Vllm(_))
     }
 
+    /// Check if this is TokenSpeed
+    pub fn is_tokenspeed(&self) -> bool {
+        matches!(self, Self::TokenSpeed(_))
+    }
+
     /// Clone the inner request (for passing to embed())
     pub fn clone_inner(&self) -> Self {
         self.clone()
@@ -2293,6 +2300,7 @@ impl ProtoEmbedRequest {
         match self {
             Self::Sglang(req) => &req.request_id,
             Self::Vllm(req) => &req.request_id,
+            Self::TokenSpeed(req) => &req.request_id,
         }
     }
 
@@ -2301,6 +2309,7 @@ impl ProtoEmbedRequest {
         match self {
             Self::Sglang(req) => req.request_id = request_id,
             Self::Vllm(req) => req.request_id = request_id,
+            Self::TokenSpeed(req) => req.request_id = request_id,
         }
     }
 }
@@ -2310,6 +2319,7 @@ impl ProtoEmbedRequest {
 pub enum ProtoEmbedComplete {
     Sglang(sglang::EmbedResponse),
     Vllm(vllm::EmbedResponse),
+    TokenSpeed(tokenspeed::EmbedResponse),
 }
 
 impl ProtoEmbedComplete {
@@ -2317,6 +2327,7 @@ impl ProtoEmbedComplete {
         match self {
             Self::Sglang(r) => &r.embedding,
             Self::Vllm(r) => &r.embedding,
+            Self::TokenSpeed(r) => &r.embedding,
         }
     }
 
@@ -2324,6 +2335,7 @@ impl ProtoEmbedComplete {
         match self {
             Self::Sglang(r) => r.prompt_tokens,
             Self::Vllm(r) => r.prompt_tokens,
+            Self::TokenSpeed(r) => r.prompt_tokens,
         }
     }
 
@@ -2331,6 +2343,7 @@ impl ProtoEmbedComplete {
         match self {
             Self::Sglang(r) => r.embedding_dim,
             Self::Vllm(r) => r.embedding_dim,
+            Self::TokenSpeed(r) => r.embedding_dim,
         }
     }
 }

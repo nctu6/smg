@@ -8,13 +8,14 @@ import "common.proto";
 
 // TokenSpeed scheduler gRPC service. Self-contained wire definition apart
 // from the cross-engine admin messages in smg.grpc.common (flush/profile).
-// Trimmed to text+multimodal generation (no embed, no LoRA, no hidden-state
-// forwarding). Multimodal carries preprocessed tensors only — media fetch +
+// Text+multimodal generation plus Embed for pooling checkpoints.
+// No LoRA / hidden-state forwarding. Multimodal carries preprocessed tensors only — media fetch +
 // per-model preprocess happen in the gateway (see crates/multimodal). EPD: a
 // prefill request may carry `EncodeBootstrapInfo` so its multimodal embeddings
 // arrive from an encode worker over Mooncake (see tokenspeed_encoder.proto).
 service TokenSpeedScheduler {
   rpc Generate(GenerateRequest) returns (stream GenerateResponse);
+  rpc Embed(EmbedRequest) returns (EmbedResponse);
   rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
   rpc Abort(AbortRequest) returns (AbortResponse);
   rpc GetModelInfo(GetModelInfoRequest) returns (GetModelInfoResponse);
@@ -281,6 +282,23 @@ message OutputLogProbs {
 message TopLogProbs {
   repeated float values = 1;
   repeated uint32 token_ids = 2;
+}
+
+
+// =====================
+// Embed (pooling)
+// =====================
+
+message EmbedRequest {
+  string request_id = 1;
+  // Tokenized input (router does its own tokenization).
+  TokenizedInput tokenized = 2;
+}
+
+message EmbedResponse {
+  repeated float embedding = 1;
+  uint32 prompt_tokens = 2;
+  uint32 embedding_dim = 3;
 }
 
 // =====================

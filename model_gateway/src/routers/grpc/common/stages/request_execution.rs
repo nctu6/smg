@@ -86,6 +86,7 @@ pub(crate) async fn execute_plan(
 
     let sub_requests = match &execution_plan {
         ExecutionPlan::Batch { requests, .. } => requests.len(),
+        ExecutionPlan::EmbedBatch { requests, .. } => requests.len(),
         _ => 1,
     };
     ctx.load_guards = Some(LoadGuards::scaled(
@@ -131,6 +132,9 @@ pub(crate) async fn execute_plan(
             }
             ExecutionPlan::Batch { kind, requests, .. } => {
                 execute_batch_dispatch(kind, requests, clients, workers, model).await
+            }
+            ExecutionPlan::EmbedBatch { requests, .. } => {
+                execute_embed_batch_dispatch(requests, clients, workers).await
             }
         }
     }
@@ -264,6 +268,19 @@ async fn execute_batch_dispatch(
         }
     });
 
+    let results = try_join_all(dispatches).await?;
+    Ok(ExecutionResult::Batch { results })
+}
+
+async fn execute_embed_batch_dispatch(
+    requests: Vec<ProtoEmbedRequest>,
+    clients: &ClientSelection,
+    workers: &WorkerSelection,
+) -> Result<ExecutionResult, Response> {
+    let dispatches = requests.into_iter().map(|request| {
+        let mut clients = clients.clone();
+        async move { execute_single_embed(request, &mut clients, workers).await }
+    });
     let results = try_join_all(dispatches).await?;
     Ok(ExecutionResult::Batch { results })
 }

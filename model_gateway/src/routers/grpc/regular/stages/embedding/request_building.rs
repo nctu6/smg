@@ -10,7 +10,10 @@ use crate::routers::{
         backend_client::BackendClient,
         client::GrpcClient,
         common::stages::{helpers, BuildStage},
-        context::{AttemptStamp, BuildOutput, ExecutionPlan, RequestContext, RequestType},
+        context::{
+            AttemptStamp, BuildOutput, ExecutionPlan, PreparationOutput, RequestContext,
+            RequestType,
+        },
         proto_wrapper::ProtoEmbedRequest,
         spec::ResponseSpec,
     },
@@ -31,10 +34,55 @@ impl Default for EmbeddingRequestBuildingStage {
     }
 }
 
+fn build_one_embed(
+    client: &BackendClient,
+    request_id: String,
+    original_text: Option<String>,
+    token_ids: Vec<u32>,
+) -> Result<ProtoEmbedRequest, Response> {
+    match client {
+        BackendClient::Grpc(GrpcClient::Sglang(c)) => {
+            let req = c.build_embed_request(request_id, original_text, token_ids);
+            Ok(ProtoEmbedRequest::Sglang(Box::new(req)))
+        }
+        BackendClient::Grpc(GrpcClient::Vllm(c)) => {
+            let req = c.build_embed_request(request_id, original_text, token_ids);
+            Ok(ProtoEmbedRequest::Vllm(Box::new(req)))
+        }
+        BackendClient::Grpc(GrpcClient::Trtllm(_)) => {
+            error!(
+                function = "EmbeddingRequestBuildingStage::build",
+                "TensorRT-LLM embedding not yet supported"
+            );
+            Err(error::not_implemented(
+                "unsupported_backend",
+                "TensorRT-LLM embedding is not yet supported via gRPC",
+            ))
+        }
+        BackendClient::Grpc(GrpcClient::Mlx(_)) => {
+            error!(
+                function = "EmbeddingRequestBuildingStage::build",
+                "MLX embedding not supported"
+            );
+            Err(error::not_implemented(
+                "unsupported_backend",
+                "MLX embedding is not supported via gRPC",
+            ))
+        }
+        BackendClient::Grpc(GrpcClient::TokenSpeed(c)) => {
+            let req = c.build_embed_request(request_id, original_text, token_ids);
+            Ok(ProtoEmbedRequest::TokenSpeed(Box::new(req)))
+        }
+        BackendClient::Zmq(_) => Err(error::not_implemented(
+            "unsupported_backend",
+            "ZMQ backend does not support embeddings yet",
+        )),
+    }
+}
+
 #[async_trait]
 impl BuildStage for EmbeddingRequestBuildingStage {
     async fn build(&self, ctx: &mut RequestContext) -> Result<BuildOutput, Response> {
-        // Preparation output should have tokenized input
         let prep_output = ctx.state.preparation.as_ref().ok_or_else(|| {
             error!(
                 function = "EmbeddingRequestBuildingStage::build",
@@ -43,7 +91,17 @@ impl BuildStage for EmbeddingRequestBuildingStage {
             error::internal_error("preparation_missing", "Preparation output missing")
         })?;
 
-        // Extract client
+        let PreparationOutput::Embedding { items, .. } = prep_output else {
+            error!(
+                function = "EmbeddingRequestBuildingStage::build",
+                "Expected Embedding preparation output"
+            );
+            return Err(error::internal_error(
+                "preparation_wrong_type",
+                "Expected Embedding preparation output",
+            ));
+        };
+
         let client = ctx
             .state
             .clients
@@ -73,69 +131,59 @@ impl BuildStage for EmbeddingRequestBuildingStage {
                 ));
             }
         };
-        let (request_id, id_stamp) = helpers::resolve_request_id_stamp(
+
+        if items.len() == 1 {
+            let (request_id, id_stamp) = helpers::resolve_request_id_stamp(
+                &ctx.input.request_type,
+                ctx.input.tenant_request_meta.as_ref(),
+                prefix,
+                false,
+            );
+            let item = &items[0];
+            let proto_req = build_one_embed(
+                client,
+                request_id,
+                Some(item.text.clone()),
+                item.token_ids.clone(),
+            )?;
+            return Ok(BuildOutput {
+                plan: ExecutionPlan::embed(proto_req),
+                spec,
+                stamp: AttemptStamp {
+                    id: id_stamp,
+                    sampling_mask: None,
+                    sampling_baseline: None,
+                    inject_pd_metadata: false,
+                },
+            });
+        }
+
+        // N inputs → N Embed RPCs (mirrors completion batch fan-out).
+        let (shared_request_id, batch_stamp) = helpers::resolve_batch_id_stamp(
             &ctx.input.request_type,
             ctx.input.tenant_request_meta.as_ref(),
             prefix,
             false,
         );
-
-        // Build backend-specific embed request
-        let original_text = prep_output.routing_text().map(String::from);
-        let token_ids = prep_output.token_ids().to_vec();
-
-        let proto_req = match client {
-            BackendClient::Grpc(GrpcClient::Sglang(c)) => {
-                let req = c.build_embed_request(request_id.clone(), original_text, token_ids);
-                ProtoEmbedRequest::Sglang(Box::new(req))
-            }
-            BackendClient::Grpc(GrpcClient::Vllm(c)) => {
-                let req = c.build_embed_request(request_id.clone(), original_text, token_ids);
-                ProtoEmbedRequest::Vllm(Box::new(req))
-            }
-            BackendClient::Grpc(GrpcClient::Trtllm(_)) => {
-                error!(
-                    function = "EmbeddingRequestBuildingStage::build",
-                    "TensorRT-LLM embedding not yet supported"
-                );
-                return Err(error::not_implemented(
-                    "unsupported_backend",
-                    "TensorRT-LLM embedding is not yet supported via gRPC",
-                ));
-            }
-            BackendClient::Grpc(GrpcClient::Mlx(_)) => {
-                error!(
-                    function = "EmbeddingRequestBuildingStage::build",
-                    "MLX embedding not supported"
-                );
-                return Err(error::not_implemented(
-                    "unsupported_backend",
-                    "MLX embedding is not supported via gRPC",
-                ));
-            }
-            BackendClient::Grpc(GrpcClient::TokenSpeed(_)) => {
-                error!(
-                    function = "EmbeddingRequestBuildingStage::build",
-                    "TokenSpeed backend does not support embeddings"
-                );
-                return Err(error::not_implemented(
-                    "unsupported_backend",
-                    "TokenSpeed backend does not support embeddings",
-                ));
-            }
-            BackendClient::Zmq(_) => {
-                return Err(error::not_implemented(
-                    "unsupported_backend",
-                    "ZMQ backend does not support embeddings yet",
-                ));
-            }
-        };
+        let mut requests = Vec::with_capacity(items.len());
+        for (i, item) in items.iter().enumerate() {
+            let sub_id = helpers::batch_sub_id(&shared_request_id, i, batch_stamp.unique_subs);
+            requests.push(build_one_embed(
+                client,
+                sub_id,
+                Some(item.text.clone()),
+                item.token_ids.clone(),
+            )?);
+        }
 
         Ok(BuildOutput {
-            plan: ExecutionPlan::embed(proto_req),
+            plan: ExecutionPlan::EmbedBatch {
+                shared_request_id,
+                requests,
+            },
             spec,
             stamp: AttemptStamp {
-                id: id_stamp,
+                id: helpers::IdStamp::Batch(batch_stamp),
                 sampling_mask: None,
                 sampling_baseline: None,
                 inject_pd_metadata: false,

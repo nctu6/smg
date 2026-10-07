@@ -107,6 +107,22 @@ impl TokenSpeedSchedulerClient {
         ))
     }
 
+    /// Submit an embedding request (pooling models only).
+    pub async fn embed(
+        &self,
+        req: tokenspeed_proto::EmbedRequest,
+    ) -> Result<tokenspeed_proto::EmbedResponse, tonic::Status> {
+        let mut client = self.client.clone();
+        let mut request = Request::new(req);
+
+        if let Err(e) = self.trace_injector.inject(request.metadata_mut()) {
+            warn!("Failed to inject trace context: {}", e);
+        }
+
+        let response = client.embed(request).await?;
+        Ok(response.into_inner())
+    }
+
     pub async fn health_check(
         &self,
     ) -> Result<tokenspeed_proto::HealthCheckResponse, tonic::Status> {
@@ -177,6 +193,27 @@ impl TokenSpeedSchedulerClient {
     crate::impl_subscribe_kv_events!();
 
     // ── Request builders ──────────────────────────────────────────────
+
+    /// Build a TokenSpeed EmbedRequest from tokenized input.
+    #[expect(
+        clippy::unused_self,
+        reason = "method receiver kept for consistent public API"
+    )]
+    pub fn build_embed_request(
+        &self,
+        request_id: String,
+        original_text: Option<String>,
+        token_ids: Vec<u32>,
+    ) -> tokenspeed_proto::EmbedRequest {
+        tokenspeed_proto::EmbedRequest {
+            request_id,
+            tokenized: Some(tokenspeed_proto::TokenizedInput {
+                original_text: original_text.unwrap_or_default(),
+                input_ids: token_ids,
+            }),
+        }
+    }
+
 
     pub fn build_generate_request_from_chat(
         request_id: String,

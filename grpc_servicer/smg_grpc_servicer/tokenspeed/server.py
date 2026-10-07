@@ -212,10 +212,11 @@ def _wait_and_warmup(
     server_args: ServerArgs,
     health_servicer: TokenSpeedHealthServicer,
 ) -> None:
-    """Probe the gRPC server until it can generate one token, then set SERVING.
+    """Probe the gRPC server until one RPC succeeds, then set SERVING.
 
     Hits the external port so the warmup exercises transport, proto codec,
-    and scheduler IPC end-to-end.
+    and scheduler IPC end-to-end. Uses Embed for pooling checkpoints and
+    Generate for generative models.
     """
     if os.getenv("TOKENSPEED_SKIP_GRPC_WARMUP", "0").lower() in ("1", "true", "yes"):
         logger.info("TOKENSPEED_SKIP_GRPC_WARMUP=1 — skipping warmup")
@@ -264,32 +265,55 @@ def _wait_and_warmup(
         channel.close()
         return
 
-    # Generative only — warmup is a 1-token generate.
+    # Generative: 1-token Generate. Embedding/pooling: one Embed so the
+    # probe matches the only RPC this worker accepts (Generate is rejected).
     warmup_ok = False
+    is_embedding = bool(getattr(server_args, "is_embedding", False))
     try:
-        warmup = tokenspeed_scheduler_pb2.GenerateRequest(
-            request_id=f"WARMUP_{time.time()}",
-            tokenized=tokenspeed_scheduler_pb2.TokenizedInput(
-                input_ids=[0],
-                original_text="warmup",
-            ),
-            sampling_params=tokenspeed_scheduler_pb2.SamplingParams(
-                temperature=0.0,
-                max_new_tokens=1,
-            ),
-            stream=False,
-        )
-        final = None
-        for resp in stub.Generate(warmup, timeout=600):
-            final = resp
-        if final is None or not final.HasField("complete"):
-            logger.warning(
-                "Warmup Generate returned no Complete frame (last=%r)",
-                final,
+        if is_embedding:
+            warmup = tokenspeed_scheduler_pb2.EmbedRequest(
+                request_id=f"WARMUP_{time.time()}",
+                tokenized=tokenspeed_scheduler_pb2.TokenizedInput(
+                    input_ids=[0],
+                    original_text="warmup",
+                ),
             )
+            resp = stub.Embed(warmup, timeout=600)
+            if resp is None or not resp.embedding:
+                logger.warning(
+                    "Warmup Embed returned empty embedding (resp=%r)",
+                    resp,
+                )
+            else:
+                logger.info(
+                    "Warmup embedding succeeded (dim=%s)",
+                    resp.embedding_dim or len(resp.embedding),
+                )
+                warmup_ok = True
         else:
-            logger.info("Warmup generation succeeded")
-            warmup_ok = True
+            warmup = tokenspeed_scheduler_pb2.GenerateRequest(
+                request_id=f"WARMUP_{time.time()}",
+                tokenized=tokenspeed_scheduler_pb2.TokenizedInput(
+                    input_ids=[0],
+                    original_text="warmup",
+                ),
+                sampling_params=tokenspeed_scheduler_pb2.SamplingParams(
+                    temperature=0.0,
+                    max_new_tokens=1,
+                ),
+                stream=False,
+            )
+            final = None
+            for resp in stub.Generate(warmup, timeout=600):
+                final = resp
+            if final is None or not final.HasField("complete"):
+                logger.warning(
+                    "Warmup Generate returned no Complete frame (last=%r)",
+                    final,
+                )
+            else:
+                logger.info("Warmup generation succeeded")
+                warmup_ok = True
     except Exception as e:  # noqa: BLE001
         logger.warning("TokenSpeed warmup failed: %s", e)
     finally:

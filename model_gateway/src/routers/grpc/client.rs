@@ -454,9 +454,10 @@ impl GrpcClient {
                 let resp = client.embed(*boxed_req).await?;
                 Ok(ProtoEmbedComplete::Vllm(resp))
             }
-            (Self::TokenSpeed(_), _) => Err(tonic::Status::unimplemented(
-                "TokenSpeed backend does not support embedding",
-            )),
+            (Self::TokenSpeed(client), ProtoEmbedRequest::TokenSpeed(boxed_req)) => {
+                let resp = client.embed(*boxed_req).await?;
+                Ok(ProtoEmbedComplete::TokenSpeed(resp))
+            }
             (Self::Mlx(_), _) => Err(tonic::Status::unimplemented(
                 "MLX backend does not support embedding",
             )),

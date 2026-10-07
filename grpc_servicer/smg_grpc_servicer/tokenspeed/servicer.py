@@ -4,8 +4,9 @@ Implements ``tokenspeed.grpc.scheduler.TokenSpeedScheduler`` on top of
 :class:`tokenspeed.runtime.engine.async_llm.AsyncLLM`. The proto field set
 is intentionally minimal — generative LLM serving, precomputed multimodal,
 KV-cache-event streaming for cache-aware routing, and tokenizer-bundle
-streaming (GetTokenizer) for remote tokenizer construction; no Embed /
-PD-disaggregated / LoRA / hidden states / classifier outputs.
+streaming (GetTokenizer) for remote tokenizer construction, and Embed for
+pooling checkpoints; no PD-disaggregated / LoRA / hidden states / classifier
+outputs.
 """
 
 from __future__ import annotations
@@ -74,6 +75,13 @@ UNLINK_MM_SHM_AFTER_READ = os.getenv("TOKENSPEED_UNLINK_MM_SHM_AFTER_READ", "1")
     "false",
     "no",
 )
+
+
+def _lazy_embedding_req_input():
+    """Late import for ``tokenspeed.runtime.engine.io_struct.EmbeddingReqInput``."""
+    from tokenspeed.runtime.engine.io_struct import EmbeddingReqInput
+
+    return EmbeddingReqInput
 
 
 def _lazy_generate_req_input():
@@ -310,6 +318,128 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
                     if state is not None and not getattr(state, "finished", False):
                         self.async_llm.abort_request(r)
 
+
+    # ------------------------------------------------------------------
+    # Embed (unary) — pooling / embedding checkpoints only
+    # ------------------------------------------------------------------
+
+    async def Embed(
+        self,
+        request: tokenspeed_scheduler_pb2.EmbedRequest,
+        context: grpc.aio.ServicerContext,
+    ) -> tokenspeed_scheduler_pb2.EmbedResponse:
+        """Handle embedding requests via AsyncLLM + EmbeddingReqInput."""
+        rid = request.request_id
+        logger.info("Embed request %s", rid)
+
+        try:
+            is_embedding = (
+                bool(getattr(self.server_args, "is_embedding", False))
+                or not bool(getattr(self.async_llm, "is_generation", True))
+            )
+            if not is_embedding:
+                await context.abort(
+                    grpc.StatusCode.FAILED_PRECONDITION,
+                    "This TokenSpeed worker serves a generative model; "
+                    "start with a pooling checkpoint (or --is-embedding).",
+                )
+                return
+
+            req_obj = self._build_embed_req(request)
+        except ValueError as e:
+            logger.warning("Embed invalid request %s: %s", rid, e)
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(e))
+            return
+        except Exception as e:  # noqa: BLE001
+            logger.exception("Failed to build embed request for %s", rid)
+            await context.abort(grpc.StatusCode.INTERNAL, str(e))
+            return
+
+        try:
+            final_output = None
+            async for output in self.async_llm.generate_request(req_obj):
+                final_output = output
+
+            if final_output is None:
+                await context.abort(
+                    grpc.StatusCode.INTERNAL,
+                    f"Embed request {rid} did not produce a result",
+                )
+                return
+
+            # Batch fan-out can yield a list; take the first / only vector.
+            if isinstance(final_output, list):
+                if not final_output:
+                    await context.abort(
+                        grpc.StatusCode.INTERNAL,
+                        f"Embed request {rid} returned an empty batch",
+                    )
+                    return
+                final_output = final_output[0]
+
+            embedding = final_output.get("embedding")
+            if embedding is None:
+                await context.abort(
+                    grpc.StatusCode.INTERNAL,
+                    f"Embed request {rid} returned no embedding field",
+                )
+                return
+
+            # Flatten nested list/tensor forms to a 1-D float list.
+            if hasattr(embedding, "tolist"):
+                embedding = embedding.tolist()
+            if embedding and isinstance(embedding[0], (list, tuple)):
+                embedding = list(embedding[0])
+            embedding = [float(x) for x in embedding]
+
+            meta = final_output.get("meta_info") or {}
+            prompt_tokens = int(meta.get("prompt_tokens") or 0)
+            if prompt_tokens <= 0 and request.HasField("tokenized"):
+                prompt_tokens = len(request.tokenized.input_ids)
+
+            return tokenspeed_scheduler_pb2.EmbedResponse(
+                embedding=embedding,
+                prompt_tokens=prompt_tokens,
+                embedding_dim=len(embedding),
+            )
+        except grpc.aio.AbortError:
+            raise
+        except ValueError as e:
+            logger.warning("Embed invalid request %s: %s", rid, e)
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(e))
+        except Exception as e:  # noqa: BLE001
+            logger.exception("Embed failed for request %s", rid)
+            await context.abort(grpc.StatusCode.INTERNAL, str(e))
+
+    def _build_embed_req(self, request: tokenspeed_scheduler_pb2.EmbedRequest):
+        """Translate proto EmbedRequest → TokenSpeed EmbeddingReqInput."""
+        if not request.HasField("tokenized"):
+            raise ValueError("EmbedRequest.tokenized is required")
+        input_ids = list(request.tokenized.input_ids)
+        if not input_ids:
+            raise ValueError("EmbedRequest.tokenized.input_ids is empty")
+
+        EmbeddingReqInput = _lazy_embedding_req_input()
+        obj = EmbeddingReqInput(
+            input_ids=input_ids,
+            text=None,
+            sampling_params={"max_new_tokens": 0},
+        )
+        # Preserve router-assigned request id when the engine allows it.
+        if hasattr(obj, "rid"):
+            try:
+                object.__setattr__(obj, "rid", request.request_id)
+            except Exception:
+                obj.rid = request.request_id  # type: ignore[attr-defined]
+        obj.normalize_batch_and_arguments()
+        # normalize may mint a new rid; pin the gateway's id back.
+        if isinstance(obj.rid, list):
+            obj.rid = [request.request_id]
+        else:
+            obj.rid = request.request_id
+        return obj
+
+
     # ------------------------------------------------------------------
     # HealthCheck (unary)
     # ------------------------------------------------------------------
@@ -319,10 +449,12 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         request: tokenspeed_scheduler_pb2.HealthCheckRequest,
         context: grpc.aio.ServicerContext,
     ) -> tokenspeed_scheduler_pb2.HealthCheckResponse:
-        """Deep health probe — sends a 1-token generation to the scheduler.
+        """Deep health probe — one scheduler round-trip, then report healthy.
 
-        Any scheduler push within ``HEALTH_CHECK_TIMEOUT`` counts as alive.
-        ``log_metrics=False`` so health checks don't skew Prometheus counters.
+        Generative workers: 1-token Generate. Embedding/pooling workers: one
+        Embed (Generate is rejected). Any scheduler push within
+        ``HEALTH_CHECK_TIMEOUT`` counts as alive. ``log_metrics=False`` so
+        health checks don't skew Prometheus counters.
         """
         rid = f"HEALTH_CHECK_{time.time()}"
 
@@ -343,12 +475,23 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
                 message="Health check passed (disaggregation worker; shallow probe)",
             )
 
-        GenerateReqInput = _lazy_generate_req_input()
-        probe = GenerateReqInput(
-            input_ids=[0],
-            sampling_params={"max_new_tokens": 1, "temperature": 0.0},
-            log_metrics=False,
+        is_embedding = bool(getattr(self.server_args, "is_embedding", False)) or not bool(
+            getattr(self.async_llm, "is_generation", True)
         )
+        if is_embedding:
+            EmbeddingReqInput = _lazy_embedding_req_input()
+            probe = EmbeddingReqInput(
+                input_ids=[0],
+                sampling_params={"max_new_tokens": 0},
+                log_metrics=False,
+            )
+        else:
+            GenerateReqInput = _lazy_generate_req_input()
+            probe = GenerateReqInput(
+                input_ids=[0],
+                sampling_params={"max_new_tokens": 1, "temperature": 0.0},
+                log_metrics=False,
+            )
         probe.rid = rid
 
         tic = time.time()
