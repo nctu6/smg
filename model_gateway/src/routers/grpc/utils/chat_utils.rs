@@ -120,21 +120,43 @@ pub(crate) fn resolve_tokenizer_entry(
     model_id: &str,
 ) -> Option<llm_tokenizer::TokenizerEntry> {
     let registry = &ctx.components.tokenizer_registry;
-    if let Some(entry) = registry
-        .get_by_name(model_id)
-        .or_else(|| registry.get_by_id(model_id))
-    {
+    let workers = ctx.components.worker_registry.get_by_model(model_id);
+    let canonical = workers.first().map(|worker| worker.model_id().to_string());
+    lookup_tokenizer_entry(registry, model_id, canonical.as_deref())
+}
+
+/// Registry lookup behind [`resolve_tokenizer_entry`].
+///
+/// Order: the request's model id (name, then id), the canonical id of the
+/// worker serving it, then the sole registered entry. The last step mirrors
+/// [`resolve_tokenizer_fallback`] so the multimodal path resolves the same
+/// tokenizer the text path already serves. Without it, a request that lands
+/// while only the startup tokenizer (keyed by the model path) is registered
+/// tokenizes fine as text but fails multimodal preparation with
+/// `multimodal_config_missing`.
+fn lookup_tokenizer_entry(
+    registry: &llm_tokenizer::TokenizerRegistry,
+    model_id: &str,
+    canonical: Option<&str>,
+) -> Option<llm_tokenizer::TokenizerEntry> {
+    let by_key = |key: &str| registry.get_by_name(key).or_else(|| registry.get_by_id(key));
+    if let Some(entry) = by_key(model_id) {
         return Some(entry);
     }
-    let workers = ctx.components.worker_registry.get_by_model(model_id);
-    let worker = workers.first()?;
-    let canonical = worker.model_id();
-    if canonical == model_id {
-        return None;
+    if let Some(entry) = canonical.filter(|c| *c != model_id).and_then(by_key) {
+        return Some(entry);
     }
-    registry
-        .get_by_name(canonical)
-        .or_else(|| registry.get_by_id(canonical))
+    let mut entries = registry.list();
+    if entries.len() == 1 {
+        let entry = entries.pop()?;
+        warn!(
+            requested_model = %model_id,
+            served_model = %entry.name,
+            "Requested model has no tokenizer entry; using the only registered tokenizer"
+        );
+        return Some(entry);
+    }
+    None
 }
 
 /// Resolve a tokenizer when the request's model id did not match any registered
@@ -1707,7 +1729,7 @@ mod tests {
     async fn resolve_tokenizer_no_models_returns_404() {
         let components = components_with_models(&[]).await;
         let mut ctx = ctx_for_model(components, "${MODEL}");
-        let err = resolve_tokenizer(&mut ctx, "unit-test").expect_err("no models => error");
+        let err = resolve_tokenizer(&mut ctx, "unit-test").err().expect("no models => error");
         assert_eq!(err.status(), StatusCode::NOT_FOUND);
         assert!(ctx.state.tokenizer.is_none());
     }
@@ -1718,7 +1740,7 @@ mod tests {
         // lists the available models instead of silently picking one.
         let components = components_with_models(&["alpha", "beta"]).await;
         let mut ctx = ctx_for_model(components, "${MODEL}");
-        let err = resolve_tokenizer(&mut ctx, "unit-test").expect_err("ambiguous => error");
+        let err = resolve_tokenizer(&mut ctx, "unit-test").err().expect("ambiguous => error");
         assert_eq!(err.status(), StatusCode::NOT_FOUND);
         assert!(ctx.state.tokenizer.is_none());
     }
@@ -1729,5 +1751,57 @@ mod tests {
         let mut ctx = ctx_for_model(components, "beta");
         assert!(resolve_tokenizer(&mut ctx, "unit-test").is_ok());
         assert!(ctx.state.tokenizer.is_some());
+    }
+
+    mod tokenizer_entry_lookup {
+        use std::sync::Arc;
+
+        use llm_tokenizer::{mock::MockTokenizer, traits::Tokenizer, TokenizerRegistry};
+
+        use super::super::lookup_tokenizer_entry;
+
+        async fn add(registry: &TokenizerRegistry, id: &str, name: &str) {
+            registry
+                .load(id, name, "/models/m", || async {
+                    Ok(Arc::new(MockTokenizer::new()) as Arc<dyn Tokenizer>)
+                })
+                .await
+                .unwrap();
+        }
+
+        #[tokio::test]
+        async fn exact_name_wins() {
+            let r = TokenizerRegistry::new();
+            add(&r, "id-a", "/models/m").await;
+            add(&r, "id-b", "test").await;
+            assert_eq!(lookup_tokenizer_entry(&r, "test", None).unwrap().id, "id-b");
+        }
+
+        #[tokio::test]
+        async fn canonical_worker_id_resolves_alias() {
+            let r = TokenizerRegistry::new();
+            add(&r, "id-a", "/models/m").await;
+            add(&r, "id-b", "test").await;
+            let e = lookup_tokenizer_entry(&r, "alias", Some("test")).unwrap();
+            assert_eq!(e.id, "id-b");
+        }
+
+        #[tokio::test]
+        async fn sole_startup_entry_is_used_before_worker_tokenizer_lands() {
+            // Only the startup tokenizer (keyed by model path) is registered.
+            let r = TokenizerRegistry::new();
+            add(&r, "id-a", "/models/m").await;
+            let e = lookup_tokenizer_entry(&r, "test", Some("test")).unwrap();
+            assert_eq!(e.id, "id-a");
+        }
+
+        #[tokio::test]
+        async fn ambiguous_or_empty_registry_has_no_fallback() {
+            let r = TokenizerRegistry::new();
+            assert!(lookup_tokenizer_entry(&r, "test", None).is_none());
+            add(&r, "id-a", "m1").await;
+            add(&r, "id-b", "m2").await;
+            assert!(lookup_tokenizer_entry(&r, "test", None).is_none());
+        }
     }
 }

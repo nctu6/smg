@@ -1569,6 +1569,13 @@ mod request_release_tests {
         ) -> Result<TonicResponse<Self::GetTokenizerStream>, Status> {
             Err(Status::unimplemented("release-test stub"))
         }
+
+        async fn embed(
+            &self,
+            _request: TonicRequest<ts::EmbedRequest>,
+        ) -> Result<TonicResponse<ts::EmbedResponse>, Status> {
+            Err(Status::unimplemented("release-test stub"))
+        }
     }
 
     #[expect(

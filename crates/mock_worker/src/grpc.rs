@@ -268,6 +268,14 @@ impl TokenSpeedScheduler for MockScheduler {
         // remote-tokenizer fallback treats Unimplemented as "not supported".
         Err(Status::unimplemented("mock-worker"))
     }
+
+    async fn embed(
+        &self,
+        _request: Request<ts::EmbedRequest>,
+    ) -> Result<Response<ts::EmbedResponse>, Status> {
+        // The mock serves generation only; pooling models are out of scope.
+        Err(Status::unimplemented("mock-worker"))
+    }
 }
 
 /// Map the engine's [`engine::GenEvent`] channel to the gRPC generate stream.
