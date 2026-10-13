@@ -9,9 +9,15 @@ use llm_multimodal::{
     MediaConnector, MediaConnectorConfig, Modality, ModelRegistry, PreProcessorConfig,
     VisionProcessorRegistry,
 };
+use openai_protocol::worker::MmProcessingMode;
 use tracing::{debug, warn};
 
-use super::pixel_cache::{pixel_cache_from_env, PixelCache};
+use super::{
+    inflight::MultimodalInflight,
+    pixel_cache::{pixel_cache_with_budget, PixelCache},
+    settings::MultimodalSettings,
+};
+use crate::worker::http_client::build_with;
 
 /// Cached model configuration files loaded from the tokenizer directory.
 #[derive(Debug, Clone)]
@@ -243,31 +249,87 @@ pub(crate) struct MultimodalComponents {
     pub pixel_cache: Option<Arc<PixelCache>>,
     /// Router-configured per-modality media-count limits replacing spec limits.
     pub modality_limit_overrides: HashMap<Modality, usize>,
+    /// Where media is fetched and preprocessed for vLLM gRPC workers.
+    pub processing: MmProcessingMode,
+    /// Cap on preprocessed media bytes in flight; `None` leaves it unbounded.
+    pub inflight: Option<Arc<MultimodalInflight>>,
+    /// The engine's own video frame budget, for the specs that sample a clip
+    /// the way its loader does (the worker-side pipeline knows it; `None`
+    /// keeps each spec's own constant).
+    pub video_frame_budget: Option<usize>,
 }
 
 impl MultimodalComponents {
     /// Create multimodal components with default registries and a reference
     /// to the shared `MultimodalConfigRegistry` owned by `AppContext`.
+    /// `settings` is the resolved flag > env > default bundle.
     pub fn new(
         config_registry: Arc<MultimodalConfigRegistry>,
         image_limit_override: Option<usize>,
+        max_inflight_bytes: Option<usize>,
+        settings: &MultimodalSettings,
     ) -> Result<Self> {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .context("Failed to create reqwest client")?;
-        let media_connector = MediaConnector::new(client, MediaConnectorConfig::default())
-            .context("Failed to create MediaConnector")?;
+        // The router fetches client-supplied media URLs itself here: the
+        // connector's host policy (the allow-list and the address policy)
+        // comes from the same resolved settings as the placement mode.
+        let connector_config = MediaConnectorConfig {
+            allowed_domains: settings.allowed_media_domains.value.clone(),
+            allow_private_hosts: settings.allow_private_media_hosts.value,
+            ..MediaConnectorConfig::default()
+        };
+        // The line shows the allow-list as the connector enforces it (trimmed,
+        // a list with no names being none), not as it was spelled.
+        tracing::info!(
+            allowed_media_domains =
+                ?llm_multimodal::effective_allowed_domains(connector_config.allowed_domains.as_deref()),
+            allow_private_media_hosts = connector_config.allow_private_hosts,
+            allow_private_media_hosts_source = settings.allow_private_media_hosts.source.as_str(),
+            "media fetch policy for router-side processing"
+        );
+        let media_connector = build_with(
+            || crate::http_client::client_builder().timeout(std::time::Duration::from_secs(30)),
+            false,
+            "media HTTP client",
+            |client| MediaConnector::new(client, connector_config.clone()),
+        )
+        .map_err(anyhow::Error::msg)?;
+
+        super::report_jpeg_decoder();
+        let processing = settings.processing.value;
+        tracing::info!(
+            mode = %processing,
+            source = settings.processing.source.as_str(),
+            "multimodal processing mode"
+        );
+
+        let inflight = max_inflight_bytes
+            .map(|bytes| {
+                let inflight = MultimodalInflight::new(bytes);
+                // Zero is not how an operator asks for no limit: it would
+                // refuse every request carrying media. Leaving the setting
+                // off is, so a budget too small to admit anything is more
+                // likely a mistake than an intent to serve nothing.
+                anyhow::ensure!(
+                    inflight.budget_bytes() > 0,
+                    "multimodal_max_inflight_bytes is {bytes}, too little to admit any request \
+                     carrying media; leave it unset to hold an unbounded amount"
+                );
+                Ok(Arc::new(inflight))
+            })
+            .transpose()?;
 
         Ok(Self {
             media_connector: Arc::new(media_connector),
             vision_processor_registry: Arc::new(VisionProcessorRegistry::with_defaults()),
             model_registry: Arc::new(ModelRegistry::default()),
             config_registry,
-            pixel_cache: pixel_cache_from_env(),
+            pixel_cache: pixel_cache_with_budget(settings.pixel_cache_mb.value),
             modality_limit_overrides: image_limit_override
                 .map(|limit| HashMap::from([(Modality::Image, limit)]))
                 .unwrap_or_default(),
+            processing,
+            inflight,
+            video_frame_budget: None,
         })
     }
 }
@@ -436,5 +498,55 @@ mod tests {
             .await
             .expect("preloaded entry must be returned without touching source");
         assert!(Arc::ptr_eq(&got, &cfg));
+    }
+
+    /// The resolved settings, not the environment, decide the placement mode
+    /// and the pixel cache the components come up with.
+    #[test]
+    fn components_take_placement_and_pixel_cache_from_the_settings() {
+        use super::super::settings::{Setting, SettingSource};
+
+        let settings = MultimodalSettings {
+            processing: Setting {
+                value: MmProcessingMode::Worker,
+                source: SettingSource::Flag,
+            },
+            ..MultimodalSettings::default()
+        };
+        let components = MultimodalComponents::new(
+            Arc::new(MultimodalConfigRegistry::new()),
+            None,
+            None,
+            &settings,
+        )
+        .unwrap();
+        assert_eq!(components.processing, MmProcessingMode::Worker);
+        assert!(
+            components.pixel_cache.is_none(),
+            "0 MiB keeps the cache off"
+        );
+    }
+
+    fn components(max_inflight_bytes: Option<usize>) -> Result<MultimodalComponents> {
+        MultimodalComponents::new(
+            Arc::new(MultimodalConfigRegistry::new()),
+            None,
+            max_inflight_bytes,
+            &MultimodalSettings::default(),
+        )
+    }
+
+    /// A budget too small to admit anything would turn every request carrying
+    /// media away. Read as "no limit" it would do the opposite instead, so it
+    /// is refused and the operator is told which one to ask for.
+    #[test]
+    fn a_budget_that_admits_nothing_stops_startup() {
+        assert!(components(None).unwrap().inflight.is_none());
+        assert!(components(Some(0)).is_err());
+        assert!(components(Some(1)).is_err());
+
+        let sized = components(Some(8192)).unwrap();
+        let inflight = sized.inflight.expect("a usable budget is kept");
+        assert_eq!(inflight.budget_bytes(), 8192);
     }
 }

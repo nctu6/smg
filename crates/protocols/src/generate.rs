@@ -5,19 +5,22 @@ use serde_json::{Map, Value};
 use validator::Validate;
 
 use super::{
-    common::{default_true, deserialize_null_as_false, is_false, GenerationRequest, InputIds},
+    common::{
+        default_true, deserialize_null_as_false, is_false, CachePartition, GenerationRequest,
+        InputIds,
+    },
     sampling_params::SamplingParams,
 };
 use crate::validated::Normalizable;
 
 // ============================================================================
-// SGLang Generate API (native format)
+// The native Generate API (one engine's own format)
 // ============================================================================
 
 #[derive(Clone, Debug, Serialize, Deserialize, Validate, schemars::JsonSchema)]
 #[validate(schema(function = "validate_generate_request"))]
 pub struct GenerateRequest {
-    /// Text input - SGLang native format
+    /// Text input - the native format
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
 
@@ -55,7 +58,7 @@ pub struct GenerateRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audio_data: Option<Value>,
 
-    /// Sampling parameters (sglang style)
+    /// Sampling parameters (the native API's style)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sampling_params: Option<SamplingParams>,
 
@@ -108,7 +111,7 @@ pub struct GenerateRequest {
     pub lora_id: Option<String>,
 
     /// Custom logit processor for advanced sampling control. Must be a serialized instance
-    /// of `CustomLogitProcessor` in python/sglang/srt/sampling/custom_logit_processor.py
+    /// of the engine's `CustomLogitProcessor` (srt/sampling/custom_logit_processor.py).
     /// Use the processor's `to_str()` method to generate the serialized string.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub custom_logit_processor: Option<String>,
@@ -211,6 +214,17 @@ impl GenerationRequest for GenerateRequest {
         self.stream
     }
 
+    fn cache_partition(&self) -> CachePartition<'_> {
+        CachePartition {
+            // Another engine's `cache_salt` is a passthrough extension on this
+            // protocol; `extra_key` is the native API's typed classification key.
+            cache_salt: self.other.get("cache_salt").and_then(Value::as_str),
+            extra_key: self.extra_key.as_deref(),
+            // Either name identifies the adapter the engine namespaces by.
+            lora_path: self.lora_path.as_deref().or(self.lora_id.as_deref()),
+        }
+    }
+
     fn get_model(&self) -> Option<&str> {
         Some(self.model.as_str())
     }
@@ -257,10 +271,10 @@ impl GenerationRequest for GenerateRequest {
 }
 
 // ============================================================================
-// SGLang Generate Response Types
+// Native Generate Response Types
 // ============================================================================
 
-/// SGLang generate response (single completion or array for n>1)
+/// Native generate response (single completion or array for n>1)
 ///
 /// Format for n=1:
 /// ```json
@@ -400,5 +414,29 @@ mod tests {
 
         let r = req();
         assert_eq!(r.routing_tokens(), None);
+    }
+
+    #[test]
+    fn cache_partition_uses_the_typed_extra_key_and_falls_back_to_lora_id() {
+        let request: GenerateRequest = serde_json::from_value(serde_json::json!({
+            "text": "hi",
+            "extra_key": "k",
+            "lora_id": "adapter-id",
+            "cache_salt": "tenant-a"
+        }))
+        .unwrap();
+        let partition = request.cache_partition();
+        assert_eq!(partition.cache_salt, Some("tenant-a"));
+        assert_eq!(partition.extra_key, Some("k"));
+        assert_eq!(partition.lora_path, Some("adapter-id"));
+
+        let typed_path: GenerateRequest = serde_json::from_value(serde_json::json!({
+            "text": "hi",
+            "lora_path": "adapter-path",
+            "lora_id": "adapter-id"
+        }))
+        .unwrap();
+        assert_eq!(typed_path.cache_partition().lora_path, Some("adapter-path"));
+        assert!(typed_path.cache_partition().cache_salt.is_none());
     }
 }

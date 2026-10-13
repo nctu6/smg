@@ -290,9 +290,11 @@ pub struct MockWorker {
     config: Arc<RwLock<MockWorkerConfig>>,
     shutdown_handle: Option<tokio::task::JoinHandle<()>>,
     shutdown_tx: Option<oneshot::Sender<()>>,
-    /// Resolved bind port, cached so sync `Drop` can prune this worker's entry
-    /// from the global scheduler-controls table.
-    bound_port: Option<u16>,
+    /// The port the worker is known by: the configured one, or the bound one
+    /// when the config left it 0. The per-port test tables (scheduler
+    /// controls, request recorders) are keyed by it, and sync `Drop` prunes
+    /// this worker's entries with it.
+    named_port: Option<u16>,
 }
 
 impl MockWorker {
@@ -301,11 +303,21 @@ impl MockWorker {
             config: Arc::new(RwLock::new(config)),
             shutdown_handle: None,
             shutdown_tx: None,
-            bound_port: None,
+            named_port: None,
         }
     }
 
-    /// Start the mock worker server
+    /// Start the mock worker server and return the URL it answers on.
+    ///
+    /// The worker binds the configured port when it is free (a test that
+    /// announces the port elsewhere, as the discovery tests do through a pod
+    /// annotation, needs the engine on exactly that port) and an ephemeral
+    /// one when the config left it 0 or another process on the host holds it
+    /// (a fleet running beside the tests, say the replay harness on 19500 and
+    /// up per lane, must not make a test fail to bind). Either way the
+    /// configured port stays the worker's *name*: the per-port test tables
+    /// are keyed by it, and the app test context rewrites URLs a test spells
+    /// out with it to the bound address.
     #[expect(
         clippy::disallowed_methods,
         clippy::print_stderr,
@@ -313,19 +325,19 @@ impl MockWorker {
     )]
     pub async fn start(&mut self) -> Result<String, Box<dyn std::error::Error>> {
         let config = self.config.clone();
-        let port = config.read().await.port;
-
-        // If port is 0, find an available port
-        let port = if port == 0 {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-            let port = listener.local_addr()?.port();
-            drop(listener);
-            config.write().await.port = port;
-            port
-        } else {
-            port
+        let named_port = config.read().await.port;
+        let listener = match named_port {
+            0 => tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?,
+            named => match tokio::net::TcpListener::bind(("127.0.0.1", named)).await {
+                Ok(listener) => listener,
+                Err(_) => tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?,
+            },
         };
-        self.bound_port = Some(port);
+        let port = listener.local_addr()?.port();
+        if named_port == 0 {
+            config.write().await.port = port;
+        }
+        self.named_port = Some(if named_port == 0 { port } else { named_port });
 
         let app = Router::new()
             .route("/health", get(health_handler))
@@ -356,22 +368,22 @@ impl MockWorker {
                 post(responses_cancel_handler),
             )
             .route("/flush_cache", post(flush_cache_handler))
+            .route("/pause_generation", post(rl_control_handler))
+            .route("/continue_generation", post(rl_control_handler))
+            .route("/update_weights_from_disk", post(rl_control_handler))
+            .route("/update_weight_version", post(rl_control_handler))
+            .route("/pause", post(rl_control_handler))
+            .route("/resume", post(rl_control_handler))
+            .route("/v1/loads", get(loads_handler))
             .route("/v1/models", get(v1_models_handler))
             .with_state(config);
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         self.shutdown_tx = Some(shutdown_tx);
 
-        // Spawn the server in a separate task
+        // The listener is bound and queuing connections before this returns,
+        // so no start-up wait is needed.
         let handle = tokio::spawn(async move {
-            let listener = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
-                Ok(l) => l,
-                Err(e) => {
-                    eprintln!("Failed to bind to port {port}: {e}");
-                    return;
-                }
-            };
-
             let server = axum::serve(listener, app).with_graceful_shutdown(async move {
                 let _ = shutdown_rx.await;
             });
@@ -383,11 +395,7 @@ impl MockWorker {
 
         self.shutdown_handle = Some(handle);
 
-        // Wait for the server to start
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-        let url = format!("http://127.0.0.1:{port}");
-        Ok(url)
+        Ok(format!("http://127.0.0.1:{port}"))
     }
 
     /// Stop the mock worker server
@@ -410,8 +418,8 @@ impl Drop for MockWorker {
             let _ = shutdown_tx.send(());
         }
         // Prune our scheduler controls and recorder so a later worker reusing
-        // this port doesn't inherit stale state.
-        if let Some(port) = self.bound_port {
+        // this name doesn't inherit stale state.
+        if let Some(port) = self.named_port {
             clear_scheduler_controls(port);
             clear_request_recorder(port);
         }
@@ -1503,6 +1511,53 @@ async fn responses_handler(
             .into_response()
         }
     }
+}
+
+/// Engine-native RL control routes. Records the body (verbatim-forwarding
+/// assertions) and answers like SGLang: `{"success": true, "message": ...}`.
+async fn rl_control_handler(
+    State(config): State<Arc<RwLock<MockWorkerConfig>>>,
+    version: Version,
+    body: Option<Json<serde_json::Value>>,
+) -> Response {
+    let config = config.read().await;
+
+    if should_fail(&config) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"success": false, "message": "Random failure for testing"})),
+        )
+            .into_response();
+    }
+
+    if let Some(Json(body)) = body {
+        record_request(config.port, version, &body);
+    }
+
+    Json(json!({"success": true, "message": "ok"})).into_response()
+}
+
+/// Engine-native load report. The gateway's load monitor prefers this route
+/// over `/metrics`, so serving it is what puts a mock worker into `/loads`.
+async fn loads_handler() -> Response {
+    Json(json!({
+        "dp_rank_count": 1,
+        "loads": [{
+            "dp_rank": 0,
+            "num_running_reqs": 2,
+            "num_waiting_reqs": 1,
+            "num_used_tokens": 1024,
+            "max_total_num_tokens": 8192,
+            "token_usage": 0.125,
+        }],
+        "aggregate": {
+            "total_running_reqs": 2,
+            "total_waiting_reqs": 1,
+            "total_reqs": 3,
+            "avg_token_usage": 0.125,
+        },
+    }))
+    .into_response()
 }
 
 async fn flush_cache_handler(State(config): State<Arc<RwLock<MockWorkerConfig>>>) -> Response {

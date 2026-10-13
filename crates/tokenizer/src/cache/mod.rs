@@ -14,12 +14,14 @@
 //! let encoding = cached.encode("Hello world")?;
 //! ```
 
+mod activity;
 mod fingerprint;
 mod l0;
 mod l1;
 
 use std::sync::Arc;
 
+pub use activity::{cache_activity_stats, CacheActivityStats};
 use anyhow::Result;
 pub use fingerprint::TokenizerFingerprint;
 pub use l0::{CacheStats, L0Cache};
@@ -31,7 +33,10 @@ use crate::{
     chat_template::{
         ChatTemplateContentFormat, ChatTemplateParams, ThinkingKeyName, ThinkingToggle,
     },
-    traits::{Decoder, Encoder, Encoding, SpecialTokens, TokenIdType, Tokenizer},
+    traits::{
+        ChatTemplateOutput, DecodeStep, Decoder, Encoder, Encoding, IncrementalDecoder,
+        SpecialTokens, TokenIdType, Tokenizer,
+    },
 };
 
 /// Configuration for the tokenizer cache
@@ -41,6 +46,9 @@ pub struct CacheConfig {
     pub enable_l0: bool,
     /// Maximum number of entries in L0 cache
     pub l0_max_entries: usize,
+    /// Byte budget of the L0 cache (texts, ids and per-entry overhead); an
+    /// input whose entry would exceed a quarter of it is not cached
+    pub l0_max_memory: usize,
     /// Enable L1 (prefix) cache
     pub enable_l1: bool,
     /// Maximum memory for L1 cache in bytes
@@ -51,8 +59,9 @@ impl Default for CacheConfig {
     fn default() -> Self {
         Self {
             enable_l0: true,
-            l0_max_entries: 10_000, // ~22MB memory for typical prompts
-            enable_l1: false,       // Opt-in for now
+            l0_max_entries: 10_000,
+            l0_max_memory: l0::DEFAULT_MAX_BYTES,
+            enable_l1: false,                // Opt-in for now
             l1_max_memory: 50 * 1024 * 1024, // 50MB
         }
     }
@@ -78,7 +87,10 @@ impl CachedTokenizer {
         let fingerprint = TokenizerFingerprint::from_tokenizer(inner.as_ref());
 
         let l0 = if config.enable_l0 {
-            Some(L0Cache::new(config.l0_max_entries))
+            Some(L0Cache::with_limits(
+                config.l0_max_entries,
+                config.l0_max_memory,
+            ))
         } else {
             None
         };
@@ -183,7 +195,21 @@ impl Encoder for CachedTokenizer {
                 .collect();
 
             let encoding = match l1.lookup_with_seeds(input, &tokens, add_special_tokens) {
-                PrefixLookup::Hit(prefix_tokens, prefix_len) if prefix_len < input.len() => {
+                PrefixLookup::Hit(prefix_tokens, prefix_len, Some((deepest, digest))) => {
+                    // Also cache this input's deepest boundary: a later input that extends
+                    // it (the next turn of the same conversation) then matches there, not at
+                    // the shorter prefix this one shares with other conversations.
+                    let middle = self.inner.encode(&input[prefix_len..deepest], false)?;
+                    let mut merged_tokens =
+                        Vec::with_capacity(prefix_tokens.len() + middle.token_ids().len());
+                    merged_tokens.extend_from_slice(&prefix_tokens);
+                    merged_tokens.extend_from_slice(middle.token_ids());
+                    l1.insert_prefix(digest, deepest, &merged_tokens);
+                    let tail = self.inner.encode(&input[deepest..], false)?;
+                    merged_tokens.extend_from_slice(tail.token_ids());
+                    Encoding::Plain(merged_tokens)
+                }
+                PrefixLookup::Hit(prefix_tokens, prefix_len, None) if prefix_len < input.len() => {
                     let suffix = &input[prefix_len..];
                     // The cached prefix already carries any leading special tokens,
                     // so the suffix must never re-add them (it is never segment 0).
@@ -201,7 +227,7 @@ impl Encoder for CachedTokenizer {
                 // Defensive: boundaries always exclude input.len(), so a full-input
                 // match cannot occur; if it ever did, the entry is keyed on the whole
                 // input and the cached tokens ARE the full encoding.
-                PrefixLookup::Hit(prefix_tokens, _) => Encoding::Plain(prefix_tokens.to_vec()),
+                PrefixLookup::Hit(prefix_tokens, _, _) => Encoding::Plain(prefix_tokens.to_vec()),
                 // No special token boundaries — nothing cacheable; single plain encode
                 // (preserves the inner tokenizer's native encoding variant).
                 PrefixLookup::Miss(seeds) if seeds.is_empty() => {
@@ -224,7 +250,11 @@ impl Encoder for CachedTokenizer {
             };
 
             if let Some(l0) = &self.l0 {
-                l0.insert(input.to_string(), add_special_tokens, encoding.clone());
+                l0.insert(
+                    input.to_string(),
+                    add_special_tokens,
+                    Encoding::Plain(encoding.token_ids().to_vec()),
+                );
             }
 
             return Ok(encoding);
@@ -234,7 +264,11 @@ impl Encoder for CachedTokenizer {
         let encoding = self.inner.encode(input, add_special_tokens)?;
 
         if let Some(l0) = &self.l0 {
-            l0.insert(input.to_string(), add_special_tokens, encoding.clone());
+            l0.insert(
+                input.to_string(),
+                add_special_tokens,
+                Encoding::Plain(encoding.token_ids().to_vec()),
+            );
         }
 
         Ok(encoding)
@@ -251,9 +285,76 @@ impl Encoder for CachedTokenizer {
 }
 
 impl Decoder for CachedTokenizer {
+    fn uses_byte_fallback(&self) -> bool {
+        self.inner.uses_byte_fallback()
+    }
+
     fn decode(&self, token_ids: &[TokenIdType], skip_special_tokens: bool) -> Result<String> {
         // Decoding is not cached (it's fast enough and rarely repeated)
         self.inner.decode(token_ids, skip_special_tokens)
+    }
+
+    // Incremental decoding is the inner tokenizer's business too; without these
+    // forwards a cached tokenizer would fall back to the generic double decode.
+    fn decode_step(
+        &self,
+        token_id: TokenIdType,
+        ids: &mut Vec<TokenIdType>,
+        prefix: &mut String,
+        prefix_index: &mut usize,
+        skip_special_tokens: bool,
+    ) -> Result<Option<String>> {
+        self.inner
+            .decode_step(token_id, ids, prefix, prefix_index, skip_special_tokens)
+    }
+
+    fn decode_step_eager(
+        &self,
+        token_id: TokenIdType,
+        ids: &mut Vec<TokenIdType>,
+        prefix: &mut String,
+        prefix_index: &mut usize,
+        skip_special_tokens: bool,
+    ) -> Result<Option<String>> {
+        self.inner
+            .decode_step_eager(token_id, ids, prefix, prefix_index, skip_special_tokens)
+    }
+
+    fn decode_step_reporting(
+        &self,
+        token_id: TokenIdType,
+        ids: &mut Vec<TokenIdType>,
+        prefix: &mut String,
+        prefix_index: &mut usize,
+        skip_special_tokens: bool,
+        eager: bool,
+    ) -> Result<DecodeStep> {
+        self.inner.decode_step_reporting(
+            token_id,
+            ids,
+            prefix,
+            prefix_index,
+            skip_special_tokens,
+            eager,
+        )
+    }
+
+    fn finish_decode(
+        &self,
+        ids: &mut Vec<TokenIdType>,
+        prefix: &mut String,
+        prefix_index: &mut usize,
+        skip_special_tokens: bool,
+    ) -> Result<DecodeStep> {
+        self.inner
+            .finish_decode(ids, prefix, prefix_index, skip_special_tokens)
+    }
+
+    fn incremental_decoder(
+        &self,
+        skip_special_tokens: bool,
+    ) -> Option<Box<dyn IncrementalDecoder>> {
+        self.inner.incremental_decoder(skip_special_tokens)
     }
 }
 
@@ -286,6 +387,22 @@ impl Tokenizer for CachedTokenizer {
         self.inner.apply_chat_template(messages, params)
     }
 
+    fn apply_chat_template_with_encoding(
+        &self,
+        messages: &[serde_json::Value],
+        params: ChatTemplateParams,
+        assistant_prefix: Option<&str>,
+    ) -> Result<ChatTemplateOutput> {
+        // Forward rather than inherit the default: the default would render
+        // through the inner tokenizer's flat template and report `FromText`,
+        // silently dropping a deferred encode. A flat rendering still reaches
+        // the L0/L1 caches because the caller encodes its text through
+        // `self.encode`; a deferred encode never does, since two renderings
+        // can share one text with different ids.
+        self.inner
+            .apply_chat_template_with_encoding(messages, params, assistant_prefix)
+    }
+
     fn chat_template_content_format(&self) -> ChatTemplateContentFormat {
         self.inner.chat_template_content_format()
     }
@@ -302,8 +419,28 @@ impl Tokenizer for CachedTokenizer {
         self.inner.native_reasoning_effort_values()
     }
 
+    fn native_reasoning_effort_off_values(&self) -> &'static [&'static str] {
+        self.inner.native_reasoning_effort_off_values()
+    }
+
     fn think_in_prefill(&self) -> bool {
         self.inner.think_in_prefill()
+    }
+
+    fn prefill_opens_think_block(&self) -> bool {
+        self.inner.prefill_opens_think_block()
+    }
+
+    fn renderer_capabilities(&self) -> crate::traits::RendererCapabilities {
+        self.inner.renderer_capabilities()
+    }
+
+    fn native_thinking_mode(
+        &self,
+        template_kwargs: Option<&std::collections::HashMap<String, serde_json::Value>>,
+        thinking: Option<bool>,
+    ) -> Option<bool> {
+        self.inner.native_thinking_mode(template_kwargs, thinking)
     }
 
     fn eos_token_ids(&self) -> &[TokenIdType] {
@@ -459,6 +596,7 @@ mod tests {
         CacheConfig {
             enable_l0: false,
             l0_max_entries: 0,
+            l0_max_memory: usize::MAX,
             enable_l1: true,
             l1_max_memory: 1024 * 1024,
         }
@@ -506,6 +644,39 @@ mod tests {
     }
 
     #[test]
+    fn test_l1_hit_caches_the_deepest_boundary_for_the_next_turn() {
+        // Two conversations share a system prompt. The second one's first turn hits the
+        // first conversation's system-prompt boundary; its next turn must then match its
+        // own previous turn, tokenizing only the bytes past that turn's deepest boundary.
+        let counting = Arc::new(CountingTokenizer::new());
+        let cached = CachedTokenizer::new(counting.clone(), l1_only_config());
+        let system = "<|im_start|>system\nYou are helpful.<|im_end|>";
+        let first = format!(
+            "{system}<|im_start|>user\nfirst conversation<|im_end|><|im_start|>assistant\n"
+        );
+        cached.encode(&first, true).unwrap();
+
+        let turn_one = format!(
+            "{system}<|im_start|>user\nsecond conversation<|im_end|><|im_start|>assistant\n"
+        );
+        cached.encode(&turn_one, true).unwrap();
+        let deepest = turn_one.rfind("<|im_start|>").unwrap() + "<|im_start|>".len();
+
+        let turn_two = format!(
+            "{turn_one}answer<|im_end|><|im_start|>user\nmore<|im_end|><|im_start|>assistant\n"
+        );
+        counting.reset();
+        let encoded = cached.encode(&turn_two, true).unwrap();
+        assert_eq!(
+            counting.bytes_encoded(),
+            turn_two.len() - deepest,
+            "the next turn must match its own previous turn, not the shared prefix"
+        );
+        let fresh = BosTokenizer::new().encode(&turn_two, true).unwrap();
+        assert_eq!(encoded.token_ids(), fresh.token_ids());
+    }
+
+    #[test]
     fn test_l1_multi_turn_growth_matches_uncached() {
         // Append-only conversation: every turn's cached encode (miss on turn 0,
         // prefix hits afterwards) must equal a fresh uncached encode, under both
@@ -545,6 +716,7 @@ mod tests {
         let config = CacheConfig {
             enable_l0: false,
             l0_max_entries: 0,
+            l0_max_memory: usize::MAX,
             enable_l1: true,
             l1_max_memory: 1024 * 1024,
         };
@@ -564,6 +736,7 @@ mod tests {
             CacheConfig {
                 enable_l0: false,
                 l0_max_entries: 0,
+                l0_max_memory: usize::MAX,
                 enable_l1: false,
                 l1_max_memory: 0,
             },
@@ -609,6 +782,7 @@ mod tests {
         let config = CacheConfig {
             enable_l0: false,
             l0_max_entries: 0,
+            l0_max_memory: usize::MAX,
             enable_l1: false,
             l1_max_memory: 0,
         };
@@ -674,5 +848,65 @@ mod tests {
         assert_eq!(cached.vocab_size(), tokenizer.vocab_size());
         assert!(cached.token_to_id("Hello").is_some());
         assert!(cached.id_to_token(1).is_some());
+    }
+
+    #[test]
+    fn forwards_deferred_chat_encodes_from_the_inner_tokenizer() {
+        use crate::{
+            chat_template::ChatTemplateParams,
+            mock::MockTokenizer,
+            traits::{PromptEncoding, Tokenizer as _},
+        };
+
+        let inner = MockTokenizer::new()
+            .with_deferred_chat_ids(vec![7, 8, 9])
+            .with_unbilled_prompt_tokens(3);
+        let cached = CachedTokenizer::new(
+            Arc::new(inner),
+            CacheConfig {
+                enable_l0: true,
+                ..Default::default()
+            },
+        );
+        let messages = vec![serde_json::json!({"role": "user", "content": "Hello"})];
+        let params = ChatTemplateParams {
+            add_generation_prompt: true,
+            ..Default::default()
+        };
+
+        let rendered = cached
+            .apply_chat_template_with_encoding(&messages, params, Some("Sure"))
+            .unwrap();
+        assert!(
+            rendered.text.ends_with("assistant: Sure"),
+            "{}",
+            rendered.text
+        );
+        assert_eq!(rendered.unbilled_prompt_tokens, 3);
+        let PromptEncoding::Deferred(job) = rendered.encoding else {
+            panic!("the wrapper must hand the inner tokenizer's deferred encode through");
+        };
+        assert_eq!(job.run().unwrap().token_ids(), &[7, 8, 9]);
+
+        // A flat inner tokenizer reports `FromText`, and the caller's
+        // `encode(text)` still goes through the wrapper's caches.
+        let flat = CachedTokenizer::new(
+            Arc::new(MockTokenizer::new()),
+            CacheConfig {
+                enable_l0: true,
+                ..Default::default()
+            },
+        );
+        let params = ChatTemplateParams {
+            add_generation_prompt: true,
+            ..Default::default()
+        };
+        let rendered = flat
+            .apply_chat_template_with_encoding(&messages, params, None)
+            .unwrap();
+        assert!(matches!(rendered.encoding, PromptEncoding::FromText));
+        let _ = flat.encode(&rendered.text, false).unwrap();
+        let _ = flat.encode(&rendered.text, false).unwrap();
+        assert_eq!(flat.cache_stats().map(|s| s.hits), Some(1));
     }
 }

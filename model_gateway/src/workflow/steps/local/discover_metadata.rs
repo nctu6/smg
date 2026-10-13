@@ -10,10 +10,16 @@ use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowRe
 
 use crate::{
     routers::grpc::client::{flat_labels, GrpcClient},
-    worker::{sampling_defaults::SamplingDefaults, ConnectionMode, DEFAULT_SAMPLING_PARAMS_LABEL},
+    worker::{
+        sampling_defaults::SamplingDefaults, ConnectionMode, DEFAULT_SAMPLING_PARAMS_LABEL,
+        UNKNOWN_MODEL_ID,
+    },
     workflow::{
         data::{WorkerKind, WorkerWorkflowData},
-        steps::util::{grpc_base_url, http_base_url},
+        steps::{
+            local::create_worker::resolve_model_id,
+            util::{grpc_base_url, http_base_url},
+        },
     },
 };
 
@@ -256,6 +262,30 @@ async fn fetch_vllm_http_metadata(
     labels
 }
 
+/// Re-read the KV transfer engine id a gRPC engine reports, for a PD worker
+/// that came back on the same address (#2491): a restarted engine process
+/// carries a new id, and a handoff minted for the old one strands the decode.
+///
+/// Unlike registration discovery, a server-info failure is an error here
+/// rather than a tolerated gap: the caller must tell a read that did not
+/// complete (retry later) from an engine that reports no id (nothing to
+/// retry).
+pub(crate) async fn discover_grpc_kv_engine_id(
+    url: &str,
+    runtime_type: &str,
+) -> Result<Option<String>, String> {
+    let client = GrpcClient::connect(&grpc_base_url(url), runtime_type)
+        .await
+        .map_err(|e| format!("Failed to connect to gRPC: {e}"))?;
+    let mut labels = client
+        .get_server_info()
+        .await
+        .map_err(|e| format!("Failed to fetch gRPC server info: {e}"))?
+        .to_labels();
+    normalize_grpc_keys(&mut labels);
+    Ok(labels.remove("kv_engine_id").filter(|id| !id.is_empty()))
+}
+
 async fn fetch_grpc_metadata(
     url: &str,
     runtime_type: &str,
@@ -281,13 +311,94 @@ async fn fetch_grpc_metadata(
     Ok((labels, runtime_type.to_string()))
 }
 
+/// The gateway's model (a directory or a Hub id), when this worker serves it: a
+/// worker with no identity of its own takes the gateway's (as registration
+/// does), one declaring a different model keeps its own defaults.
+fn zmq_model(router_model: Option<String>, declared_model: &str) -> Option<String> {
+    router_model.filter(|path| declared_model == UNKNOWN_MODEL_ID || declared_model == path)
+}
+
+/// Labels for a ZMQ worker from the gateway's model: the sampling defaults in
+/// its `generation_config.json`. A local directory is read in place; a Hub
+/// repo id is served from the HF cache the gateway's tokenizer loads from,
+/// fetched into it when absent, within a bound that keeps registration short
+/// on an offline gateway. A local file, a path that does not exist on this
+/// host, or a model without the file yields none.
+async fn zmq_model_labels(model: Option<&str>) -> HashMap<String, String> {
+    let Some(model) = model else {
+        return HashMap::new();
+    };
+    let local = std::path::Path::new(model);
+    let path = if local.is_dir() {
+        local.join("generation_config.json")
+    } else if local.exists() || !is_hub_repo_id(model) {
+        return HashMap::new();
+    } else {
+        let fetch = llm_tokenizer::hub::fetch_file(model, "generation_config.json");
+        match tokio::time::timeout(HUB_FETCH_TIMEOUT, fetch).await {
+            Ok(Ok(path)) => path,
+            Ok(Err(e)) => {
+                debug!("No generation_config.json for {model} via the Hub cache: {e}");
+                return HashMap::new();
+            }
+            Err(_) => {
+                warn!("Hub lookup of generation_config.json for {model} timed out; no sampling defaults");
+                return HashMap::new();
+            }
+        }
+    };
+    sampling_defaults_label(&path).await
+}
+
+/// Bound on fetching `generation_config.json` from the Hub, inside the step's
+/// own timeout so an unreachable Hub costs one wait, not the step's retries.
+const HUB_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// `owner/name`, or a bare legacy `name`: no leading `/`, `.` or `~` and at
+/// most one separator, so a path meant for another host is never sent to the
+/// Hub as a repo id.
+fn is_hub_repo_id(model: &str) -> bool {
+    !model.starts_with(['/', '.', '~'])
+        && model.matches('/').count() <= 1
+        && model.split('/').all(|part| {
+            !part.is_empty()
+                && part
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        })
+}
+
+/// The sampling-defaults label from one `generation_config.json`, or none.
+async fn sampling_defaults_label(path: &std::path::Path) -> HashMap<String, String> {
+    let mut labels = HashMap::new();
+    match tokio::fs::read_to_string(path).await {
+        Ok(raw) => match SamplingDefaults::canonical_json_from_str(&raw) {
+            Ok(Some(canonical)) => {
+                labels.insert(DEFAULT_SAMPLING_PARAMS_LABEL.to_string(), canonical);
+            }
+            Ok(None) => {}
+            Err(e) => warn!("Ignoring {}: {}", path.display(), e),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => warn!("Could not read {}: {}", path.display(), e),
+    }
+    labels
+}
+
 /// Rename gRPC-specific keys to canonical names and strip transient state.
 fn normalize_grpc_keys(labels: &mut HashMap<String, String>) {
     for &(from, to) in &[
         ("tensor_parallel_size", "tp_size"),
+        // TokenSpeed reports no `tp_size`: `attn_tp_size` is its attention
+        // TP width, the full width for a dense model and narrower than
+        // `world_size` only under attention DP or CP. A `tp_size` the engine
+        // does report wins, as for every canonical label below.
+        ("attn_tp_size", "tp_size"),
         ("pipeline_parallel_size", "pp_size"),
         ("context_parallel_size", "cp_size"),
         ("data_parallel_size", "dp_size"),
+        // vLLM's name for the KV page granularity SGLang calls `page_size`.
+        ("block_size", "page_size"),
     ] {
         if let Some(val) = labels.remove(from) {
             labels.entry(to.to_string()).or_insert(val);
@@ -386,11 +497,24 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverMetadataStep {
                     .await
                     .map(|(labels, rt)| (labels, Some(rt)))
             }
-            // An EngineCore worker does not report model/tokenizer metadata over
-            // ZMQ; it is configured at worker registration. Return `None` for the
-            // runtime so the explicitly configured / detected runtime is preserved
-            // (the handshake is shared across engines, so it cannot be probed here).
-            ConnectionMode::Zmq => Ok((HashMap::new(), None)),
+            // A ZMQ engine reports its geometry at the handshake, which runs
+            // after this step; the one fact worth having earlier is the
+            // model's own sampling defaults, read from the model the gateway
+            // was started with (a local directory, or a Hub id through the
+            // HF cache), for a worker that serves that model (one registered
+            // for another model, by spec or label, must not inherit them).
+            // The runtime stays `None`: the handshake is shared across
+            // engines, so it cannot be probed here and the configured or
+            // detected runtime is preserved.
+            ConnectionMode::Zmq => {
+                let router_model = context
+                    .data
+                    .app_context
+                    .as_ref()
+                    .and_then(|app| app.router_config.model_path.clone());
+                let model = zmq_model(router_model, resolve_model_id(config, &config.labels));
+                Ok((zmq_model_labels(model.as_deref()).await, None))
+            }
         }
         .unwrap_or_else(|e| {
             warn!("Failed to fetch metadata for {}: {}", config.url, e);
@@ -417,7 +541,107 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverMetadataStep {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn zmq_labels_carry_the_local_generation_config_sampling_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("generation_config.json"),
+            r#"{"temperature": 0.7, "top_p": 0.8, "top_k": 20, "repetition_penalty": 1.05, "max_new_tokens": 2048, "do_sample": true}"#,
+        )
+        .unwrap();
+        let labels = zmq_model_labels(Some(dir.path().to_str().unwrap())).await;
+        let defaults: serde_json::Value =
+            serde_json::from_str(&labels[DEFAULT_SAMPLING_PARAMS_LABEL]).unwrap();
+        assert_eq!(defaults["top_k"], 20);
+        assert_eq!(defaults["temperature"], 0.7);
+        assert!(
+            defaults.get("max_new_tokens").is_none(),
+            "length limits are not sampling defaults"
+        );
+        // Only a worker serving the gateway's model takes its defaults.
+        assert_eq!(
+            zmq_model(Some("/m/a".into()), UNKNOWN_MODEL_ID).as_deref(),
+            Some("/m/a")
+        );
+        assert_eq!(
+            zmq_model(Some("/m/a".into()), "/m/a").as_deref(),
+            Some("/m/a")
+        );
+        assert_eq!(zmq_model(Some("/m/a".into()), "org/other"), None);
+        assert_eq!(zmq_model(None, UNKNOWN_MODEL_ID), None);
+        // No model, or a directory without the file: no label.
+        assert!(zmq_model_labels(None).await.is_empty());
+        let bare = tempfile::tempdir().unwrap();
+        assert!(zmq_model_labels(Some(bare.path().to_str().unwrap()))
+            .await
+            .is_empty());
+        // A local file, or a path that is no repo id and does not exist here
+        // (an engine-side mount), never goes to the Hub: no label.
+        let file = tempfile::NamedTempFile::new().unwrap();
+        assert!(zmq_model_labels(Some(file.path().to_str().unwrap()))
+            .await
+            .is_empty());
+        assert!(zmq_model_labels(Some("/models/not/mounted/here"))
+            .await
+            .is_empty());
+        assert!(is_hub_repo_id("Qwen/Qwen3-0.6B"));
+        assert!(is_hub_repo_id("gpt2"));
+        for not_id in [
+            "/models/qwen",
+            "./qwen",
+            "~/qwen",
+            "a/b/c",
+            "models--Qwen--Qwen3-0.6B/snapshots/x",
+            "",
+            "org/",
+        ] {
+            assert!(!is_hub_repo_id(not_id), "{not_id}");
+        }
+    }
+
     use super::*;
+
+    /// Every engine's spelling of the parallelism widths folds into the
+    /// canonical labels, and an existing canonical label is never overwritten.
+    #[test]
+    fn normalize_grpc_keys_canonicalises_every_parallelism_spelling() {
+        let mut labels: HashMap<String, String> = [
+            ("attn_tp_size", "2"),
+            ("pipeline_parallel_size", "1"),
+            ("data_parallel_size", "4"),
+            ("context_parallel_size", "1"),
+            ("block_size", "16"),
+            ("uptime_seconds", "12.5"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        normalize_grpc_keys(&mut labels);
+        assert_eq!(labels.get("tp_size").map(String::as_str), Some("2"));
+        assert_eq!(labels.get("pp_size").map(String::as_str), Some("1"));
+        assert_eq!(labels.get("dp_size").map(String::as_str), Some("4"));
+        assert_eq!(labels.get("cp_size").map(String::as_str), Some("1"));
+        assert!(!labels.contains_key("attn_tp_size"));
+        assert_eq!(labels.get("page_size").map(String::as_str), Some("16"));
+        assert!(!labels.contains_key("block_size"));
+        assert!(!labels.contains_key("uptime_seconds"));
+
+        // An engine that reports both keeps its own `tp_size`.
+        let mut attn: HashMap<String, String> = [("tp_size", "8"), ("attn_tp_size", "2")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        normalize_grpc_keys(&mut attn);
+        assert_eq!(attn.get("tp_size").map(String::as_str), Some("8"));
+        assert!(!attn.contains_key("attn_tp_size"));
+
+        let mut both: HashMap<String, String> = [("tp_size", "8"), ("tensor_parallel_size", "2")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        normalize_grpc_keys(&mut both);
+        assert_eq!(both.get("tp_size").map(String::as_str), Some("8"));
+    }
 
     #[expect(clippy::print_stderr)]
     fn dump_labels(title: &str, labels: &HashMap<String, String>) {
@@ -432,7 +656,9 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_sglang_http_metadata() {
-        let labels = fetch_sglang_http_metadata(&Client::new(), "http://0.0.0.0:30000", None).await;
+        let labels =
+            fetch_sglang_http_metadata(&crate::http_client::client(), "http://0.0.0.0:30000", None)
+                .await;
         dump_labels("SGLang HTTP combined", &labels);
         assert!(labels.contains_key("model_path"));
         assert!(labels.contains_key("tokenizer_path"));
@@ -441,7 +667,9 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_vllm_http_metadata() {
-        let labels = fetch_vllm_http_metadata(&Client::new(), "http://0.0.0.0:20000", None).await;
+        let labels =
+            fetch_vllm_http_metadata(&crate::http_client::client(), "http://0.0.0.0:20000", None)
+                .await;
         dump_labels("vLLM HTTP", &labels);
         assert!(labels.contains_key("model_path"));
         assert!(labels.contains_key("version"));
@@ -534,8 +762,12 @@ mod tests {
                 .unwrap();
         });
 
-        let labels =
-            fetch_sglang_http_metadata(&Client::new(), &format!("http://{addr}"), None).await;
+        let labels = fetch_sglang_http_metadata(
+            &crate::http_client::client(),
+            &format!("http://{addr}"),
+            None,
+        )
+        .await;
         server.abort();
 
         assert_eq!(

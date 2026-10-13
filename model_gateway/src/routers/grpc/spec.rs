@@ -9,17 +9,20 @@
 
 use std::{collections::HashMap, sync::Arc};
 
+use llm_multimodal::registry::transcription::TranscriptionFamily;
+use llm_tokenizer::traits::Tokenizer;
 use openai_protocol::{
     chat::ChatCompletionRequest,
     common::{StreamOptions, StringOrArray, Tool, ToolChoice},
     completion::CompletionRequest,
     generate::GenerateRequest,
     messages::{self, CreateMessageRequest},
+    profile::ProviderProfile,
     responses::ResponsesRequest,
 };
 use serde_json::Value;
 
-use crate::routers::grpc::utils;
+use crate::routers::grpc::{regular::stages::decisions::scoring::DecisionScoring, utils};
 
 /// Response-phase contract for one request, produced by request building.
 #[derive(Clone)]
@@ -31,47 +34,127 @@ pub(crate) enum ResponseSpec {
     /// Embedding/classify response processing needs only dispatch metadata.
     Embedding,
     Classify,
+    Decisions(DecisionsResponseSpec),
     Harmony(HarmonyResponseSpec),
+    Transcription(TranscriptionResponseSpec),
+}
+
+#[derive(Clone)]
+pub(crate) struct DecisionsResponseSpec {
+    pub scoring: DecisionScoring,
+    pub questions: Vec<DecisionQuestionSpec>,
+    pub max_input_tokens: usize,
+}
+
+/// The candidate tokens and exact prompt size expected for one scoring RPC.
+#[derive(Clone)]
+pub(crate) struct DecisionQuestionSpec {
+    pub label_ids: Vec<u32>,
+    pub input_tokens: usize,
+}
+
+/// Wire format of a `/v1/audio/transcriptions` response body.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum TranscriptionResponseFormat {
+    Json,
+    Text,
+}
+
+/// Response-phase contract for a transcription request: the decoded text is
+/// post-processed by the resolved family and rendered in the chosen format.
+#[derive(Clone)]
+pub(crate) struct TranscriptionResponseSpec {
+    pub format: TranscriptionResponseFormat,
+    /// The resolved family, for output post-processing. `'static` — families
+    /// are registry constants.
+    pub family: &'static dyn TranscriptionFamily,
 }
 
 #[derive(Clone)]
 pub(crate) struct ChatResponseSpec {
+    /// Provider dialect of the model the client asked for, as request
+    /// validation selects it; picks provider-specific response behaviour.
+    pub provider: ProviderProfile,
     pub separate_reasoning: bool,
     pub tool_choice: Option<ToolChoice>,
     pub tools: Option<Vec<Tool>>,
     pub history_tool_calls_count: usize,
     pub stream_options: Option<StreamOptions>,
     pub chat_template_kwargs: Option<HashMap<String, Value>>,
+    /// The effective effort (`thinking.effort` else `reasoning_effort`).
     pub reasoning_effort: Option<String>,
+    /// The typed `thinking.type` toggle.
+    pub thinking: Option<bool>,
+    /// `continue_final_message` on a trailing assistant message.
+    pub continues_final_assistant: bool,
     /// `n`, normalized.
     pub expected_choices: u32,
     pub logprobs: bool,
+    /// Alternatives per token the client asked for; none when absent.
+    pub top_logprobs: Option<u32>,
     pub stop: Option<StringOrArray>,
     pub stop_token_ids: Option<Vec<u32>>,
     pub no_stop_trim: bool,
     pub ignore_eos: bool,
     /// Fallback when preparation derived no override.
     pub skip_special_tokens: bool,
+    /// Rendered prompt tokens the provider does not bill; set by request building.
+    pub unbilled_prompt_tokens: u32,
+    /// Native channel formats can derive the initial state from the rendered prompt.
+    pub reasoning_in_prefill: Option<bool>,
 }
 
 impl From<&ChatCompletionRequest> for ChatResponseSpec {
     fn from(request: &ChatCompletionRequest) -> Self {
         Self {
+            provider: ProviderProfile::for_model(&request.model),
             separate_reasoning: request.separate_reasoning,
             tool_choice: request.tool_choice.clone(),
-            tools: request.tools.clone(),
+            // Every tool the model may call, dynamic tools declared on messages
+            // included. `None` when the response is not scanned for tool calls:
+            // the request declares no tools anywhere and the provider does not
+            // parse tool calls without them.
+            tools: {
+                let tools: Vec<Tool> = request.effective_tools().cloned().collect();
+                let scanned = request.tools.is_some()
+                    || !tools.is_empty()
+                    || ProviderProfile::for_model(&request.model).parses_tool_calls_without_tools();
+                scanned.then_some(tools)
+            },
             history_tool_calls_count: utils::get_history_tool_calls_count(request),
             stream_options: request.stream_options.clone(),
             chat_template_kwargs: request.chat_template_kwargs.clone(),
-            reasoning_effort: request.reasoning_effort.clone(),
+            reasoning_effort: request.effective_reasoning_effort().map(str::to_string),
+            thinking: request.thinking_toggle(),
+            continues_final_assistant: utils::continues_final_assistant(request),
             expected_choices: request.n.unwrap_or(1).max(1),
             logprobs: request.logprobs,
+            top_logprobs: request.top_logprobs,
             stop: request.stop.clone(),
             stop_token_ids: request.stop_token_ids.clone(),
             no_stop_trim: request.no_stop_trim,
             ignore_eos: request.ignore_eos,
             skip_special_tokens: request.skip_special_tokens,
+            unbilled_prompt_tokens: 0,
+            reasoning_in_prefill: None,
         }
+    }
+}
+
+impl ChatResponseSpec {
+    /// Whether the reasoning parser starts in reasoning mode for this
+    /// request (see [`utils::reasoning_starts_in_prefill`]).
+    pub(crate) fn reasoning_starts_in_prefill(&self, tokenizer: &dyn Tokenizer) -> bool {
+        if let Some(in_prefill) = self.reasoning_in_prefill {
+            return in_prefill;
+        }
+        utils::reasoning_starts_in_prefill(
+            self.chat_template_kwargs.as_ref(),
+            self.reasoning_effort.as_deref(),
+            self.thinking,
+            self.continues_final_assistant,
+            tokenizer,
+        )
     }
 }
 
@@ -99,6 +182,8 @@ impl From<&GenerateRequest> for GenerateResponseSpec {
 #[derive(Clone)]
 pub(crate) struct MessagesResponseSpec {
     pub thinking: Option<messages::ThinkingConfig>,
+    /// Native channel formats can derive the initial state from the rendered prompt.
+    pub reasoning_in_prefill: Option<bool>,
     pub tool_choice: Option<messages::ToolChoice>,
     pub has_tools: bool,
     pub history_tool_calls_count: usize,
@@ -111,6 +196,7 @@ impl From<&CreateMessageRequest> for MessagesResponseSpec {
     fn from(request: &CreateMessageRequest) -> Self {
         Self {
             thinking: request.thinking.clone(),
+            reasoning_in_prefill: None,
             tool_choice: request.tool_choice.clone(),
             has_tools: request.tools.is_some(),
             history_tool_calls_count: utils::message_utils::get_history_tool_calls_count_messages(
@@ -123,6 +209,23 @@ impl From<&CreateMessageRequest> for MessagesResponseSpec {
                 .unwrap_or_default(),
             stop_sequences: request.stop_sequences.clone(),
         }
+    }
+}
+
+impl MessagesResponseSpec {
+    pub(crate) fn reasoning_starts_in_prefill(&self, tokenizer: &dyn Tokenizer) -> bool {
+        if let Some(in_prefill) = self.reasoning_in_prefill {
+            return in_prefill;
+        }
+        let user_thinking = match &self.thinking {
+            Some(
+                messages::ThinkingConfig::Enabled { .. }
+                | messages::ThinkingConfig::Adaptive { .. },
+            ) => Some(true),
+            Some(messages::ThinkingConfig::Disabled) => Some(false),
+            None => None,
+        };
+        utils::should_mark_reasoning_started(user_thinking, tokenizer)
     }
 }
 
@@ -180,4 +283,132 @@ impl From<&CompletionRequest> for CompletionResponseSpec {
 pub(crate) enum HarmonyResponseSpec {
     Chat(Arc<ChatCompletionRequest>),
     Responses(Arc<ResponsesRequest>),
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    fn chat_request(value: Value) -> ChatCompletionRequest {
+        serde_json::from_value(value).expect("request deserializes")
+    }
+
+    fn tool(name: &str) -> Value {
+        json!({
+            "type": "function",
+            "function": {"name": name, "parameters": {"type": "object", "properties": {}}}
+        })
+    }
+
+    fn tool_names(spec: &ChatResponseSpec) -> Vec<String> {
+        spec.tools
+            .iter()
+            .flatten()
+            .map(|tool| tool.function.name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn chat_spec_tools_include_dynamic_tools() {
+        let request = chat_request(json!({
+            "model": "kimi-k3",
+            "messages": [
+                {"role": "system", "content": "", "tools": [tool("get_weather")]},
+                {"role": "user", "content": "what is the weather in beijing?"}
+            ],
+            "tool_choice": "required"
+        }));
+
+        let spec = ChatResponseSpec::from(&request);
+
+        assert_eq!(tool_names(&spec), ["get_weather"]);
+    }
+
+    #[test]
+    fn chat_spec_tools_keep_request_tools_first() {
+        let request = chat_request(json!({
+            "model": "kimi-k3",
+            "messages": [
+                {"role": "system", "content": "", "tools": [tool("dynamic_a")]},
+                {"role": "user", "content": "hi"},
+                {"role": "developer", "content": "", "tools": [tool("dynamic_b")]}
+            ],
+            "tools": [tool("global")]
+        }));
+
+        let spec = ChatResponseSpec::from(&request);
+
+        assert_eq!(tool_names(&spec), ["global", "dynamic_a", "dynamic_b"]);
+    }
+
+    #[test]
+    fn gemma4_rendered_prompt_state_overrides_the_thinking_preference() {
+        let request = chat_request(json!({
+            "model": "vllm-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "chat_template_kwargs": {"enable_thinking": true}
+        }));
+        let tokenizer = llm_tokenizer::MockTokenizer::new();
+        let mut spec = ChatResponseSpec::from(&request);
+        assert_eq!(spec.reasoning_in_prefill, None);
+        for in_prefill in [false, true] {
+            spec.reasoning_in_prefill = Some(in_prefill);
+            assert_eq!(spec.reasoning_starts_in_prefill(&tokenizer), in_prefill);
+        }
+
+        let request: CreateMessageRequest = serde_json::from_value(json!({
+            "model":"vllm-model", "max_tokens":16, "messages":[],
+            "thinking":{"type":"enabled", "budget_tokens":1024}
+        }))
+        .unwrap();
+        let mut spec = MessagesResponseSpec::from(&request);
+        assert_eq!(spec.reasoning_in_prefill, None);
+        for in_prefill in [false, true] {
+            spec.reasoning_in_prefill = Some(in_prefill);
+            assert_eq!(spec.reasoning_starts_in_prefill(&tokenizer), in_prefill);
+        }
+    }
+
+    #[test]
+    fn chat_spec_tools_none_without_any_declaration() {
+        let request = chat_request(json!({
+            "model": "kimi-k3",
+            "messages": [{"role": "user", "content": "hi"}]
+        }));
+
+        assert!(ChatResponseSpec::from(&request).tools.is_none());
+    }
+
+    #[test]
+    fn chat_spec_provider_follows_the_requested_model() {
+        let minimax = chat_request(json!({
+            "model": "MiniMax-M3",
+            "messages": [{"role": "user", "content": "hi"}]
+        }));
+        let openai = chat_request(json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hi"}]
+        }));
+
+        assert_eq!(
+            ChatResponseSpec::from(&minimax).provider,
+            ProviderProfile::Minimax
+        );
+        assert_eq!(
+            ChatResponseSpec::from(&openai).provider,
+            ProviderProfile::OpenAi
+        );
+    }
+
+    #[test]
+    fn chat_spec_scans_minimax_responses_for_tool_calls_without_tools() {
+        let request = chat_request(json!({
+            "model": "MiniMax-M3",
+            "messages": [{"role": "user", "content": "try again"}]
+        }));
+
+        assert_eq!(ChatResponseSpec::from(&request).tools, Some(Vec::new()));
+    }
 }

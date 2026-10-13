@@ -12,16 +12,16 @@ use openai_protocol::{
     },
 };
 use serde_json::{from_value, to_string, Value};
-use smg_data_connector::{ResponseId, ResponseStorageError};
 use smg_mcp::McpToolSession;
-use tracing::{debug, error, warn};
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 use super::execution::ToolResult;
 use crate::routers::{
     common::openai_bridge::{self, FormatRegistry, ResponseFormat},
-    error,
-    grpc::common::responses::ResponsesContext,
+    grpc::common::responses::{
+        previous_response_chain, utils::resolve_function_identity, ResponsesContext,
+    },
 };
 
 /// Record of a single MCP tool call execution
@@ -120,10 +120,13 @@ pub(super) fn build_next_request_with_tools(
 
     // Add function tool calls (from commentary channel)
     for tool_call in tool_calls {
+        let (name, namespace) =
+            resolve_function_identity(request.tools.as_deref(), &tool_call.function.name);
         items.push(ResponseInputOutputItem::FunctionToolCall {
             id: Some(tool_call.id.clone()),
             call_id: tool_call.id.clone(),
-            name: tool_call.function.name.clone(),
+            name,
+            namespace,
             arguments: tool_call
                 .function
                 .arguments
@@ -192,51 +195,23 @@ pub(super) fn inject_mcp_metadata(
 /// Load previous conversation messages from storage
 ///
 /// If the request has `previous_response_id`, loads the response chain from storage
-/// and prepends the conversation history to the request input items.
+/// and prepends the conversation history to the request input items. `tenant` is
+/// the caller's tenant: a previous response of another tenant answers as a
+/// missing one does.
 pub(super) async fn load_previous_messages(
     ctx: &ResponsesContext,
     request: ResponsesRequest,
+    tenant: Option<&str>,
 ) -> Result<ResponsesRequest, Response> {
     let Some(ref prev_id_str) = request.previous_response_id else {
         // No previous_response_id, return request as-is
         return Ok(request);
     };
 
-    let prev_id = ResponseId::from(prev_id_str.as_str());
-
-    // Load response chain from storage
-    let chain = match ctx
-        .response_storage
-        .get_response_chain(&prev_id, None)
-        .await
-    {
-        Ok(chain) => chain,
-        Err(ResponseStorageError::ResponseNotFound(_)) => {
-            return Err(error::bad_request(
-                "previous_response_not_found",
-                format!("Previous response with id '{prev_id_str}' not found."),
-            ));
-        }
-        Err(e) => {
-            error!(
-                function = "load_previous_messages",
-                prev_id = %prev_id_str,
-                error = %e,
-                "Failed to load previous response chain from storage"
-            );
-            return Err(error::internal_error(
-                "load_previous_response_chain_failed",
-                format!("Failed to load previous response chain for {prev_id_str}: {e}"),
-            ));
-        }
-    };
-
-    if chain.responses.is_empty() {
-        return Err(error::bad_request(
-            "previous_response_not_found",
-            format!("Previous response with id '{prev_id_str}' not found."),
-        ));
-    }
+    // The chain behind the id, scoped to the caller's tenant, or the refusal
+    // shared with the other loaders (an unknown id, an empty or invisible
+    // chain, a record its client asked not to store).
+    let responses = previous_response_chain(&ctx.response_storage, prev_id_str, tenant).await?;
 
     // Build conversation history from stored responses
     let mut history_items = Vec::new();
@@ -259,7 +234,7 @@ pub(super) async fn load_previous_messages(
             .collect()
     };
 
-    for stored in &chain.responses {
+    for stored in &responses {
         history_items.extend(deserialize_items(&stored.input, "input"));
         history_items.extend(deserialize_items(
             stored
@@ -362,5 +337,26 @@ pub(super) fn strip_image_generation_from_request_tools(
                  MCP session exposes an image_generation-routed dispatcher",
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod namespace_tests {
+    use super::*;
+    use crate::routers::grpc::common::responses::utils::namespace_test_request;
+    #[test]
+    fn namespace_replay_preserves_structured_identity() {
+        let request: ResponsesRequest = namespace_test_request();
+        let call = from_value(serde_json::json!({"id":"call_test","type":"function","function":{"name":"weather.lookup","arguments":"{}"}})).unwrap();
+        let replay =
+            build_next_request_with_tools(request, vec![call], vec![], None, String::new());
+        let ResponseInput::Items(items) = replay.input else {
+            panic!("expected replay items");
+        };
+        let wire = serde_json::to_value(items.last().unwrap()).unwrap();
+
+        assert_eq!(wire["name"], "lookup");
+        assert_eq!(wire["namespace"], "weather");
+        assert_eq!(wire["call_id"], "call_test");
     }
 }

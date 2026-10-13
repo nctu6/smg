@@ -18,7 +18,7 @@ use crate::validated::Normalizable;
 #[derive(Debug, Clone, Deserialize, Serialize, Validate, schemars::JsonSchema)]
 #[validate(schema(function = "validate_completion_cross_parameters"))]
 pub struct CompletionRequest {
-    /// ID of the model to use (required for OpenAI, optional for some implementations, such as SGLang)
+    /// ID of the model to use (required for OpenAI, optional for some serving engines)
     pub model: String,
 
     /// The prompt(s) to generate completions for
@@ -41,7 +41,8 @@ pub struct CompletionRequest {
     pub logit_bias: Option<HashMap<String, f32>>,
 
     /// Include the log probabilities on the `logprobs` most likely tokens
-    #[validate(range(min = 0, max = 5))]
+    /// (0 to 20, as chat's `top_logprobs`)
+    #[validate(range(min = 0, max = 20))]
     pub logprobs: Option<u32>,
 
     /// The maximum number of tokens to generate
@@ -123,8 +124,9 @@ pub struct CompletionRequest {
     #[serde(default, skip_serializing_if = "is_false")]
     pub ignore_eos: bool,
 
-    /// Skip special tokens during detokenization
-    #[serde(default = "default_true")]
+    /// Skip special tokens during detokenization. Serialized only when
+    /// `false`: `true` is what the engine applies without the field.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub skip_special_tokens: bool,
 
     /// Path to LoRA adapter(s) for model customization
@@ -140,7 +142,7 @@ pub struct CompletionRequest {
     /// Sampling seed for deterministic outputs
     pub sampling_seed: Option<u64>,
 
-    /// Request ID forwarded to the backend for log correlation (SGLang extension)
+    /// Request ID forwarded to the backend for log correlation (an engine extension)
     pub rid: Option<String>,
 
     /// Additional fields including bootstrap info for PD routing
@@ -228,6 +230,16 @@ impl GenerationRequest for CompletionRequest {
         self.stream
     }
 
+    fn cache_partition(&self) -> CachePartition<'_> {
+        CachePartition {
+            // Engine extensions carried in the passthrough map, not typed
+            // fields: the engines' `cache_salt`, one engine's `extra_key`.
+            cache_salt: self.other.get("cache_salt").and_then(Value::as_str),
+            extra_key: self.other.get("extra_key").and_then(Value::as_str),
+            lora_path: self.lora_path.as_deref(),
+        }
+    }
+
     fn get_model(&self) -> Option<&str> {
         Some(&self.model)
     }
@@ -303,10 +315,75 @@ mod tests {
         serde_json::from_value(value).expect("request must deserialize")
     }
 
+    fn logprobs_body(logprobs: u32) -> Value {
+        serde_json::json!({
+            "model": "m",
+            "prompt": "hello",
+            "echo": true,
+            "logprobs": logprobs,
+            "max_tokens": 1
+        })
+    }
+
+    /// `logprobs` takes up to 20 alternatives, the bound of chat's
+    /// `top_logprobs`; 21 crosses it.
+    #[test]
+    fn logprobs_takes_up_to_20_alternatives() {
+        for logprobs in [0, 5, 20] {
+            let request: CompletionRequest =
+                serde_json::from_value(logprobs_body(logprobs)).expect("request");
+            assert!(request.validate().is_ok(), "logprobs {logprobs}");
+        }
+        let request: CompletionRequest =
+            serde_json::from_value(logprobs_body(21)).expect("request");
+        let errors = request.validate().expect_err("logprobs 21 must be refused");
+        let error = &errors.field_errors()["logprobs"][0];
+        assert_eq!(error.code, "range");
+        assert_eq!(error.params["max"], 20);
+        assert_eq!(error.params["value"], 21);
+    }
+
+    /// Above 20 the body gets the public API's error for a crossed bound.
+    #[cfg(feature = "axum")]
+    #[tokio::test]
+    async fn logprobs_above_20_is_refused_with_the_public_error() {
+        use axum::{
+            body::Body,
+            extract::{FromRequest, Request},
+            http::StatusCode,
+        };
+
+        use crate::validated::ValidatedJson;
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(logprobs_body(21).to_string()))
+            .expect("request");
+        let Err(response) = ValidatedJson::<CompletionRequest>::from_request(request, &()).await
+        else {
+            panic!("logprobs 21 must be refused");
+        };
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body: Value = serde_json::from_slice(&bytes).expect("JSON body");
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["code"], "integer_above_max_value");
+        assert_eq!(body["error"]["param"], "logprobs");
+    }
+
     #[test]
     fn default_sglang_flags_are_omitted_and_absent_reads_defaults() {
         let value = serde_json::to_value(req(serde_json::json!({}))).expect("serialize");
-        for field in ["no_stop_trim", "ignore_eos", "return_hidden_states"] {
+        for field in [
+            "no_stop_trim",
+            "ignore_eos",
+            "return_hidden_states",
+            "skip_special_tokens",
+        ] {
             assert!(value.get(field).is_none(), "{field} serialized at default");
         }
 
@@ -314,6 +391,7 @@ mod tests {
         assert!(!back.no_stop_trim);
         assert!(!back.ignore_eos);
         assert!(!back.return_hidden_states);
+        assert!(back.skip_special_tokens);
     }
 
     #[test]
@@ -321,16 +399,19 @@ mod tests {
         let value = serde_json::to_value(req(serde_json::json!({
             "no_stop_trim": true,
             "ignore_eos": true,
-            "return_hidden_states": true
+            "return_hidden_states": true,
+            "skip_special_tokens": false
         })))
         .expect("serialize");
         assert_eq!(value["no_stop_trim"], true);
         assert_eq!(value["ignore_eos"], true);
         assert_eq!(value["return_hidden_states"], true);
+        assert_eq!(value["skip_special_tokens"], false);
 
         let back: CompletionRequest = serde_json::from_value(value).expect("roundtrip");
         assert!(back.no_stop_trim);
         assert!(back.ignore_eos);
         assert!(back.return_hidden_states);
+        assert!(!back.skip_special_tokens);
     }
 }

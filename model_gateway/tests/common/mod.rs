@@ -1,7 +1,9 @@
 // These modules are used by tests and benchmarks
 #![allow(dead_code, clippy::allow_attributes, clippy::large_futures)]
 
+pub mod gateway_launch;
 pub mod mock_mcp_server;
+#[cfg(feature = "provider-openai")]
 pub mod mock_openai_server;
 pub mod mock_worker;
 pub mod streaming_helpers;
@@ -12,6 +14,7 @@ pub mod tls_mock_worker;
 
 // Re-export commonly used test builders
 use std::{
+    collections::HashMap,
     fs,
     future::Future,
     path::PathBuf,
@@ -29,7 +32,7 @@ use smg::{
     config::{RouterConfig, RoutingMode},
     middleware::TokenBucket,
     policies::PolicyRegistry,
-    routers::{router_manager::RouterManager, RouterFactory, RouterTrait},
+    routers::{gateway::Gateway, RouterFactory, RouterTrait},
     worker::{
         BasicWorkerBuilder, ModelCard, RuntimeType, Worker, WorkerMonitor, WorkerRegistry,
         WorkerType,
@@ -37,7 +40,7 @@ use smg::{
     workflow::Job,
 };
 use smg_data_connector::{
-    MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
+    MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage, StorageBundle,
 };
 #[allow(unused_imports)]
 pub use test_config::{TestRouterConfig, TestWorkerConfig};
@@ -84,7 +87,10 @@ impl WorkerTestContext {
         endpoint: &str,
         body: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        let client = reqwest::Client::new();
+        let client = smg::http_client::client_builder()
+            .no_proxy()
+            .build()
+            .map_err(|e| format!("test client: {e}"))?;
         let worker_url = self
             .first_worker_url()
             .ok_or_else(|| "No workers available".to_string())?;
@@ -113,7 +119,10 @@ impl WorkerTestContext {
     ) -> Result<Vec<String>, String> {
         use futures_util::StreamExt;
 
-        let client = reqwest::Client::new();
+        let client = smg::http_client::client_builder()
+            .no_proxy()
+            .build()
+            .map_err(|e| format!("test client: {e}"))?;
         let worker_url = self
             .first_worker_url()
             .ok_or_else(|| "No workers available".to_string())?;
@@ -171,6 +180,23 @@ pub struct AppTestContext {
     pub router: Arc<dyn RouterTrait>,
     pub config: RouterConfig,
     pub app_context: Arc<AppContext>,
+    /// The URL each worker bound, in the order the configs were given.
+    pub worker_urls: Vec<String>,
+    /// The port each worker's config named, parallel to `worker_urls`.
+    named_ports: Vec<u16>,
+}
+
+/// Rewrite a URL that names one of the started workers by its configured port
+/// to the address that worker actually bound; any other URL is left alone.
+fn rebind_url(url: &mut String, bound_by_named_port: &HashMap<u16, String>) {
+    let named = url
+        .trim_end_matches('/')
+        .rsplit(':')
+        .next()
+        .and_then(|port| port.parse::<u16>().ok());
+    if let Some(bound) = named.and_then(|port| bound_by_named_port.get(&port)) {
+        url.clone_from(bound);
+    }
 }
 
 impl AppTestContext {
@@ -211,10 +237,21 @@ impl AppTestContext {
         Box::pin(async move {
             let mut workers = Vec::new();
             let mut worker_urls = Vec::new();
+            let mut named_ports = Vec::new();
+            // Workers bind ephemeral ports (see `MockWorker::start`); the
+            // ports the configs name are identities. URLs the router config
+            // spells out with those names are rewritten to the bound
+            // addresses below.
+            let mut bound_by_named_port: HashMap<u16, String> = HashMap::new();
 
             for worker_config in worker_configs {
+                let named_port = worker_config.port;
                 let mut worker = MockWorker::new(worker_config);
                 let url = worker.start().await.unwrap();
+                if named_port != 0 {
+                    bound_by_named_port.insert(named_port, url.clone());
+                }
+                named_ports.push(named_port);
                 worker_urls.push(url);
                 workers.push(worker);
             }
@@ -229,10 +266,46 @@ impl AppTestContext {
                 }
                 | RoutingMode::OpenAI {
                     worker_urls: ref mut urls,
-                } if urls.is_empty() => {
-                    urls.clone_from(&worker_urls);
                 }
-                _ => {}
+                | RoutingMode::Anthropic {
+                    worker_urls: ref mut urls,
+                }
+                | RoutingMode::Gemini {
+                    worker_urls: ref mut urls,
+                } => {
+                    if urls.is_empty() {
+                        urls.clone_from(&worker_urls);
+                    } else {
+                        for url in urls.iter_mut() {
+                            rebind_url(url, &bound_by_named_port);
+                        }
+                    }
+                }
+                RoutingMode::PrefillDecode {
+                    prefill_urls,
+                    decode_urls,
+                    ..
+                } => {
+                    for (url, _) in prefill_urls.iter_mut() {
+                        rebind_url(url, &bound_by_named_port);
+                    }
+                    for url in decode_urls.iter_mut() {
+                        rebind_url(url, &bound_by_named_port);
+                    }
+                }
+                RoutingMode::EncodePrefillDecode {
+                    encode_urls,
+                    prefill_urls,
+                    decode_urls,
+                    ..
+                } => {
+                    for (url, _) in encode_urls.iter_mut().chain(prefill_urls.iter_mut()) {
+                        rebind_url(url, &bound_by_named_port);
+                    }
+                    for url in decode_urls.iter_mut() {
+                        rebind_url(url, &bound_by_named_port);
+                    }
+                }
             }
 
             let app_context = create_test_context(config.clone()).await;
@@ -275,12 +348,8 @@ impl AppTestContext {
             }
 
             let inner_router = RouterFactory::create_router(&app_context).await.unwrap();
-            let manager = RouterManager::new(
-                app_context.worker_registry.clone(),
-                app_context.client.clone(),
-            );
-            let router_id =
-                RouterManager::determine_router_id(&config.mode, config.connection_mode);
+            let manager = Gateway::new(app_context.worker_registry.clone());
+            let router_id = Gateway::determine_router_id(&config.mode, config.connection_mode);
             let manager = Arc::new(manager);
             manager.register_router(router_id, Arc::from(inner_router));
             let router: Arc<dyn RouterTrait> = manager;
@@ -290,8 +359,25 @@ impl AppTestContext {
                 router,
                 config,
                 app_context,
+                worker_urls,
+                named_ports,
             }
         })
+    }
+
+    /// The URL bound by the worker whose config named `port` (the port a
+    /// test spelled in its `MockWorkerConfig`, not the one actually bound).
+    #[expect(
+        clippy::expect_used,
+        reason = "test helper - panicking on failure is intentional"
+    )]
+    pub fn worker_url_for(&self, port: u16) -> &str {
+        let index = self
+            .named_ports
+            .iter()
+            .position(|named| *named == port)
+            .expect("a worker config named this port");
+        &self.worker_urls[index]
     }
 
     pub fn create_app(&self) -> axum::Router {
@@ -326,10 +412,15 @@ async fn build_test_app_context(
     tool_parser_factory: Option<ToolParserFactory>,
     rate_limit_manager: Option<Arc<smg::rate_limit::RateLimitManager>>,
     mcp_config: smg_mcp::McpConfig,
+    storages: Option<StorageBundle>,
 ) -> Arc<AppContext> {
     use smg_mcp::McpOrchestrator;
 
-    let client = reqwest::Client::new();
+    // See `test_app::create_test_app_context`: no environment proxy in a test's path.
+    let client = smg::http_client::client_builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     // Initialize rate limiter
     let rate_limiter = match config.max_concurrent_requests {
@@ -353,10 +444,17 @@ async fn build_test_app_context(
         config.routing_key_override.clone(),
     ));
 
-    // Initialize storage backends (Memory for tests).
-    let response_storage = Arc::new(MemoryResponseStorage::new());
-    let conversation_storage = Arc::new(MemoryConversationStorage::new());
-    let conversation_item_storage = Arc::new(MemoryConversationItemStorage::new());
+    // Initialize storage backends (Memory for tests, unless the caller brought
+    // its own: a history store that is down, for one).
+    let StorageBundle {
+        response_storage,
+        conversation_storage,
+        conversation_item_storage,
+    } = storages.unwrap_or_else(|| StorageBundle {
+        response_storage: Arc::new(MemoryResponseStorage::new()),
+        conversation_storage: Arc::new(MemoryConversationStorage::new()),
+        conversation_item_storage: Arc::new(MemoryConversationItemStorage::new()),
+    });
 
     // Initialize load monitor
     let worker_monitor = Some(Arc::new(WorkerMonitor::new(
@@ -501,6 +599,34 @@ pub fn create_test_context_with_tokenizer_registry(
             Some(ToolParserFactory::new()),
             tenant_rate_limit_manager,
             empty_mcp_config(),
+            None,
+        )
+        .await
+    })
+}
+
+/// `create_test_context_with_tokenizer_registry` over the caller's storage
+/// backends instead of the in-memory ones.
+#[expect(
+    clippy::expect_used,
+    reason = "test helper - panicking on failure is intentional"
+)]
+pub fn create_test_context_with_storages(
+    config: RouterConfig,
+    tokenizer_registry: Arc<TokenizerRegistry>,
+    storages: StorageBundle,
+) -> Pin<Box<dyn Future<Output = Arc<AppContext>> + Send>> {
+    Box::pin(async move {
+        let tenant_rate_limit_manager = smg::rate_limit::RateLimitManager::from_config(&config)
+            .expect("tenant rate limit config should be valid");
+        build_test_app_context(
+            config,
+            tokenizer_registry,
+            Some(ReasoningParserFactory::new()),
+            Some(ToolParserFactory::new()),
+            tenant_rate_limit_manager,
+            empty_mcp_config(),
+            Some(storages),
         )
         .await
     })
@@ -517,6 +643,7 @@ pub fn create_test_context_with_parsers(
         Some(ToolParserFactory::new()),
         None,
         empty_mcp_config(),
+        None,
     ))
 }
 
@@ -541,6 +668,7 @@ pub fn create_test_context_with_mcp_config(
             None,
             None,
             mcp_config,
+            None,
         )
         .await
     })
@@ -586,7 +714,7 @@ pub fn ensure_tokenizer_cached() -> PathBuf {
         println!("Downloading TinyLlama tokenizer from HuggingFace...");
 
         // Use blocking reqwest client since we're in tests/benchmarks
-        let client = reqwest::blocking::Client::new();
+        let client = smg::http_client::blocking_client();
         let response = client
             .get(TINYLLAMA_TOKENIZER_URL)
             .send()
@@ -647,6 +775,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                     }
                 }),
                 strict: None,
+                extra: Default::default(),
             },
         },
         Tool {
@@ -664,6 +793,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                     }
                 }),
                 strict: None,
+                extra: Default::default(),
             },
         },
         Tool {
@@ -679,6 +809,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                     }
                 }),
                 strict: None,
+                extra: Default::default(),
             },
         },
         Tool {
@@ -695,6 +826,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                     }
                 }),
                 strict: None,
+                extra: Default::default(),
             },
         },
         Tool {
@@ -710,6 +842,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                     }
                 }),
                 strict: None,
+                extra: Default::default(),
             },
         },
         Tool {
@@ -725,6 +858,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                     }
                 }),
                 strict: None,
+                extra: Default::default(),
             },
         },
         Tool {
@@ -740,6 +874,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                     }
                 }),
                 strict: None,
+                extra: Default::default(),
             },
         },
         Tool {
@@ -749,6 +884,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                 description: Some("Ping service".to_string()),
                 parameters: json!({"type": "object", "properties": {}}),
                 strict: None,
+                extra: Default::default(),
             },
         },
         Tool {
@@ -758,6 +894,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                 description: Some("Test function".to_string()),
                 parameters: json!({"type": "object", "properties": {}}),
                 strict: None,
+                extra: Default::default(),
             },
         },
         Tool {
@@ -776,6 +913,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                     }
                 }),
                 strict: None,
+                extra: Default::default(),
             },
         },
         Tool {
@@ -792,6 +930,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                     }
                 }),
                 strict: None,
+                extra: Default::default(),
             },
         },
         Tool {
@@ -806,6 +945,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                     }
                 }),
                 strict: None,
+                extra: Default::default(),
             },
         },
         Tool {
@@ -822,6 +962,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                     }
                 }),
                 strict: None,
+                extra: Default::default(),
             },
         },
         Tool {
@@ -838,6 +979,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                     }
                 }),
                 strict: None,
+                extra: Default::default(),
             },
         },
         Tool {
@@ -853,6 +995,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                     }
                 }),
                 strict: None,
+                extra: Default::default(),
             },
         },
         Tool {
@@ -868,6 +1011,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                     }
                 }),
                 strict: None,
+                extra: Default::default(),
             },
         },
         Tool {
@@ -882,6 +1026,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                     }
                 }),
                 strict: None,
+                extra: Default::default(),
             },
         },
         Tool {
@@ -891,6 +1036,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                 description: Some("Function 1".to_string()),
                 parameters: json!({"type": "object", "properties": {}}),
                 strict: None,
+                extra: Default::default(),
             },
         },
         Tool {
@@ -905,6 +1051,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                     }
                 }),
                 strict: None,
+                extra: Default::default(),
             },
         },
         Tool {
@@ -914,6 +1061,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                 description: Some("Tool 1".to_string()),
                 parameters: json!({"type": "object", "properties": {}}),
                 strict: None,
+                extra: Default::default(),
             },
         },
         Tool {
@@ -928,6 +1076,7 @@ pub fn create_test_tools() -> Vec<Tool> {
                     }
                 }),
                 strict: None,
+                extra: Default::default(),
             },
         },
     ]

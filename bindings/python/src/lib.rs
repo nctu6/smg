@@ -9,8 +9,26 @@ use pyo3::prelude::*;
 #[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
 #[global_allocator]
 static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+// The gateway's jemalloc options (`SERVER_MALLOC_CONF`). The extension is a
+// final artifact of its own, so it exports them as jemalloc's
+// application-provided `malloc_conf` like the `smg` executable does;
+// without this the router launched from Python ran jemalloc's stock decay
+// and kept a traffic burst's freed pages resident.
+#[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
+#[expect(
+    unsafe_code,
+    reason = "jemalloc reads its options from this exported symbol; a NUL-terminated byte string nothing in Rust dereferences"
+)]
+#[export_name = "_rjem_malloc_conf"]
+pub static MALLOC_CONF: &[u8; 72] = observability::metrics::SERVER_MALLOC_CONF;
 use smg::*;
 use smg_auth as auth;
+
+mod servicer;
+use servicer::{
+    init_servicer_tracing, PySglangGrpcServer, PyTokenSpeedGrpcServer, PyVllmGrpcServer,
+};
 
 // Define the enums with PyO3 bindings
 #[pyclass(eq, from_py_object)]
@@ -312,21 +330,30 @@ pub struct PyRedisConfig {
     pub pool_max: usize,
     #[pyo3(get, set)]
     pub retention_days: Option<u64>,
+    /// Bound in seconds on each call to the store (default 5).
+    #[pyo3(get, set)]
+    pub op_timeout_secs: u64,
 }
 
 #[pymethods]
 impl PyRedisConfig {
     #[new]
-    #[pyo3(signature = (url, pool_max = 16, retention_days = Some(30)))]
+    #[pyo3(signature = (url, pool_max = 16, retention_days = Some(30), op_timeout_secs = 5))]
     #[expect(
         clippy::unnecessary_wraps,
         reason = "PyO3 #[new] method signature requires PyResult"
     )]
-    fn new(url: String, pool_max: usize, retention_days: Option<u64>) -> PyResult<Self> {
+    fn new(
+        url: String,
+        pool_max: usize,
+        retention_days: Option<u64>,
+        op_timeout_secs: u64,
+    ) -> PyResult<Self> {
         Ok(PyRedisConfig {
             url,
             pool_max,
             retention_days,
+            op_timeout_secs,
         })
     }
 }
@@ -336,6 +363,7 @@ impl PyRedisConfig {
         config::RedisConfig {
             url: self.url.clone(),
             pool_max: self.pool_max,
+            op_timeout_secs: self.op_timeout_secs,
             retention_days: self.retention_days,
             schema: None,
         }
@@ -350,18 +378,26 @@ pub struct PyPostgresConfig {
 
     #[pyo3(get, set)]
     pub pool_max: usize,
+
+    /// Bound in seconds on each call to the store (default 5).
+    #[pyo3(get, set)]
+    pub op_timeout_secs: u64,
 }
 
 #[pymethods]
 impl PyPostgresConfig {
     #[new]
-    #[pyo3(signature = (db_url = None,pool_max = 16,))]
+    #[pyo3(signature = (db_url = None, pool_max = 16, op_timeout_secs = 5))]
     #[expect(
         clippy::unnecessary_wraps,
         reason = "PyO3 #[new] method signature requires PyResult"
     )]
-    fn new(db_url: Option<String>, pool_max: usize) -> PyResult<Self> {
-        Ok(PyPostgresConfig { db_url, pool_max })
+    fn new(db_url: Option<String>, pool_max: usize, op_timeout_secs: u64) -> PyResult<Self> {
+        Ok(PyPostgresConfig {
+            db_url,
+            pool_max,
+            op_timeout_secs,
+        })
     }
 }
 
@@ -370,6 +406,7 @@ impl PyPostgresConfig {
         config::PostgresConfig {
             db_url: self.db_url.clone().unwrap_or_default(),
             pool_max: self.pool_max,
+            op_timeout_secs: self.op_timeout_secs,
             schema: None,
         }
     }
@@ -423,6 +460,7 @@ struct Router {
     prometheus_port: Option<u16>,
     prometheus_host: Option<String>,
     prometheus_duration_buckets: Option<Vec<f64>>,
+    jemalloc_prof_dir: Option<String>,
     request_timeout_secs: u64,
     shutdown_grace_period_secs: u64,
     request_id_headers: Option<Vec<String>>,
@@ -459,6 +497,11 @@ struct Router {
     queue_size: usize,
     queue_timeout_secs: u64,
     rate_limit_tokens_per_second: Option<i32>,
+    max_background_responses: usize,
+    sse_keepalive_secs: u64,
+    history_memory_max_responses: usize,
+    history_memory_max_items: usize,
+    history_memory_retention_secs: u64,
     connection_mode: worker::ConnectionMode,
     model_path: Option<String>,
     tokenizer_path: Option<String>,
@@ -466,6 +509,7 @@ struct Router {
     disable_tokenizer_autoload: bool,
     tokenizer_cache_enable_l0: bool,
     tokenizer_cache_l0_max_entries: usize,
+    tokenizer_cache_l0_max_memory: usize,
     tokenizer_cache_enable_l1: bool,
     tokenizer_cache_l1_max_memory: usize,
     reasoning_parser: Option<String>,
@@ -518,6 +562,8 @@ struct Router {
     cache_boundaries: Vec<usize>,
     cache_index: String,
     cache_ttl_secs: u64,
+    header_read_timeout_secs: u64,
+    idle_connection_timeout_secs: u64,
     job_queue_capacity: usize,
     job_queue_concurrency: usize,
     worker_overload_waiting_requests: Option<usize>,
@@ -528,6 +574,68 @@ struct Router {
     kv_connector_annotation: String,
     kv_engine_id_annotation: String,
     mm_per_request_image_limit: Option<usize>,
+    pd_admission_wait_secs: u64,
+    /// New parameters MUST be appended here (not inserted mid-list) to avoid
+    /// breaking external Python callers that pass `_Router(...)` positionally.
+    enable_rl: bool,
+    rl_control_timeout_secs: u64,
+    rl_fanout_concurrency: usize,
+    multimodal_max_inflight_bytes: Option<usize>,
+    mm_processing: Option<String>,
+    mm_pixel_cache_mb: Option<usize>,
+    mm_pixel_rdma: bool,
+    rdma_listen_ip: Option<String>,
+    rdma_slot_ttl_s: Option<u64>,
+    log_mm_timing: bool,
+    prefill_max_inflight_requests_per_worker: i32,
+    prefill_queue_size: Option<usize>,
+    prefill_queue_timeout_secs: Option<u64>,
+    worker_overload_shed: bool,
+    kv_index: String,
+    worker_stall_secs: u64,
+    worker_wedge_secs: u64,
+    worker_stale_secs: u64,
+    worker_warmup_secs: u64,
+    worker_warmup_share: f32,
+    worker_warmup_blocks: usize,
+    worker_warmup_thin_ratio: f32,
+    worker_warmup_divert_every: u64,
+    selection_policy: String,
+    selection_accounting_ttl_ms: u64,
+    /// Per-tenant data-plane keys as `(tenant_id, key)` pairs; each resolves
+    /// to its own tenant identity (`auth:<tenant_id>`) on top of `api_key`.
+    tenant_api_keys: Vec<(String, String)>,
+    priority_scheduler_enabled: bool,
+    priority_scheduler_default_max_class: String,
+    priority_scheduler_config: Option<String>,
+    priority_scheduler_tenant_metric_top_n: u32,
+    tenant_rate_limit_enabled: bool,
+    tenant_rate_limit_config: Option<String>,
+    mm_allowed_media_domains: Option<Vec<String>>,
+    mm_allow_private_media_hosts: bool,
+    /// The keyword-only `discovery` mapping, read by the same rules as
+    /// `RouterConfig.discovery`.
+    discovery: Option<config::DiscoveryConfig>,
+    /// Keyword-only: the mesh CA, this node's certificate and key (PEM
+    /// paths); all three or none.
+    mesh_tls_ca_cert: Option<String>,
+    mesh_tls_cert: Option<String>,
+    mesh_tls_key: Option<String>,
+    power_of_two_load_metric: String,
+}
+
+/// Read the keyword-only `discovery` mapping by the same rules as
+/// `RouterConfig.discovery`. It goes through JSON, so nested mappings and
+/// lists convert without a hand-written walker.
+fn parse_discovery(mapping: &Bound<'_, PyAny>) -> PyResult<Option<config::DiscoveryConfig>> {
+    let invalid = |e: serde_json::Error| {
+        pyo3::exceptions::PyValueError::new_err(format!("Invalid discovery mapping: {e}"))
+    };
+    let json: String = PyModule::import(mapping.py(), "json")?
+        .call_method1("dumps", (mapping,))?
+        .extract()?;
+    let value: serde_json::Value = serde_json::from_str(&json).map_err(invalid)?;
+    config::deserialize_discovery(value).map_err(invalid)
 }
 
 impl Router {
@@ -544,15 +652,58 @@ impl Router {
             .unwrap_or(ConnectionMode::Http)
     }
 
+    /// The metrics bind host: `prometheus_host`, or the unspecified address
+    /// of `host`'s family when it is not given.
+    fn metrics_host(&self) -> String {
+        self.prometheus_host
+            .clone()
+            .unwrap_or_else(|| config::MetricsConfig::default_host_for(&self.host))
+    }
+
+    /// The mesh mTLS configuration from `mesh_tls_ca_cert`, `mesh_tls_cert`
+    /// and `mesh_tls_key`: all three or none, each a readable file.
+    fn mesh_mtls_config(&self) -> PyResult<Option<smg_mesh::MTLSConfig>> {
+        let (ca, cert, key) = match (
+            &self.mesh_tls_ca_cert,
+            &self.mesh_tls_cert,
+            &self.mesh_tls_key,
+        ) {
+            (None, None, None) => return Ok(None),
+            (Some(ca), Some(cert), Some(key)) => (ca, cert, key),
+            _ => {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "mesh_tls_ca_cert, mesh_tls_cert and mesh_tls_key come together: give all \
+                     three or none",
+                ))
+            }
+        };
+        for (field, path) in [
+            ("mesh_tls_ca_cert", ca),
+            ("mesh_tls_cert", cert),
+            ("mesh_tls_key", key),
+        ] {
+            std::fs::metadata(path).map_err(|e| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "Invalid value for {field}='{path}': cannot read the file: {e}"
+                ))
+            })?;
+        }
+        Ok(Some(smg_mesh::MTLSConfig {
+            ca_cert_path: ca.into(),
+            server_cert_path: cert.into(),
+            server_key_path: key.into(),
+            ..smg_mesh::MTLSConfig::default()
+        }))
+    }
+
     fn parse_mesh_socket_addr(
         host: &str,
         port: u16,
         field: &str,
     ) -> PyResult<std::net::SocketAddr> {
-        let addr = format!("{host}:{port}");
-        addr.parse::<std::net::SocketAddr>().map_err(|e| {
+        config::bind_socket_addr(host, port).map_err(|e| {
             pyo3::exceptions::PyValueError::new_err(format!(
-                "Invalid value for {field}='{host}': invalid mesh socket address '{addr}': {e}"
+                "Invalid value for {field}='{host}': invalid mesh socket address: {e}"
             ))
         })
     }
@@ -591,7 +742,8 @@ impl Router {
 
     pub fn to_router_config(&self) -> config::ConfigResult<config::RouterConfig> {
         use config::{
-            DiscoveryConfig, MetricsConfig, PolicyConfig as ConfigPolicyConfig, RoutingMode,
+            DiscoveryConfig, KubernetesDiscoveryConfig, MetricsConfig,
+            PolicyConfig as ConfigPolicyConfig, RoutingMode,
         };
 
         // Validate the transport mode up front. The CLI (value_parser) and the
@@ -610,6 +762,36 @@ impl Router {
                 })
             })
             .transpose()?;
+        let mm_processing = self
+            .mm_processing
+            .as_deref()
+            .map(|value| {
+                config::MmProcessingMode::parse(value).ok_or_else(|| {
+                    config::ConfigError::InvalidValue {
+                        field: "mm_processing".to_string(),
+                        value: value.to_string(),
+                        reason: "expected 'auto', 'router', or 'worker'".to_string(),
+                    }
+                })
+            })
+            .transpose()?;
+
+        let kv_index = config::KvIndexKind::parse(&self.kv_index).ok_or_else(|| {
+            config::ConfigError::InvalidValue {
+                field: "kv_index".to_string(),
+                value: self.kv_index.clone(),
+                reason: "expected 'positional' or 'chain'".to_string(),
+            }
+        })?;
+
+        let power_of_two_load_metric = config::PowerOfTwoLoadMetric::parse(
+            &self.power_of_two_load_metric,
+        )
+        .ok_or_else(|| config::ConfigError::InvalidValue {
+            field: "power_of_two_load_metric".to_string(),
+            value: self.power_of_two_load_metric.clone(),
+            reason: "expected expected_wait, requests or least_requests".to_string(),
+        })?;
 
         let convert_policy = |policy: &PolicyType| -> config::ConfigResult<ConfigPolicyConfig> {
             Ok(match policy {
@@ -630,9 +812,13 @@ impl Router {
                     cache_index: self.parse_cache_index()?,
                     cache_ttl_secs: self.cache_ttl_secs,
                     cache_boundaries: self.cache_boundaries.clone(),
+                    selection_policy: (self.selection_policy != policies::cost::DEFAULT_POLICY)
+                        .then(|| self.selection_policy.clone()),
+                    selection_accounting_ttl_ms: self.selection_accounting_ttl_ms,
                 },
                 PolicyType::PowerOfTwo => ConfigPolicyConfig::PowerOfTwo {
                     load_check_interval_secs: self.load_monitor_interval,
+                    load_metric: power_of_two_load_metric,
                 },
                 PolicyType::LeastLoad => ConfigPolicyConfig::LeastLoad {
                     load_check_interval_secs: self.load_monitor_interval,
@@ -721,8 +907,7 @@ impl Router {
         let policy = convert_policy(&self.policy)?;
 
         let discovery = if self.service_discovery {
-            Some(DiscoveryConfig {
-                enabled: true,
+            Some(DiscoveryConfig::Kubernetes(KubernetesDiscoveryConfig {
                 namespace: self.service_discovery_namespace.clone(),
                 port: self.service_discovery_port,
                 check_interval_secs: 60,
@@ -737,18 +922,16 @@ impl Router {
                 router_selector: self.router_selector.clone(),
                 router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
                 model_id_source: self.model_id_from.clone(),
-            })
+            }))
         } else {
-            None
+            self.discovery.clone()
         };
+        let has_discovery = discovery.is_some();
 
-        let metrics = match (self.prometheus_port, self.prometheus_host.as_ref()) {
-            (Some(port), Some(host)) => Some(MetricsConfig {
-                port,
-                host: host.clone(),
-            }),
-            _ => None,
-        };
+        let metrics = self.prometheus_port.map(|port| MetricsConfig {
+            port,
+            host: self.metrics_host(),
+        });
 
         let trace_config = Some(config::TraceConfig {
             enable_trace: self.enable_trace,
@@ -820,6 +1003,7 @@ impl Router {
                 match self.backend {
                     BackendType::Vllm => Some(worker::RuntimeType::Vllm),
                     BackendType::Tokenspeed => Some(worker::RuntimeType::TokenSpeed),
+                    BackendType::Sglang => Some(worker::RuntimeType::Sglang),
                     _ => None,
                 }
             } else {
@@ -846,11 +1030,33 @@ impl Router {
             .worker_overload_waiting_requests(self.worker_overload_waiting_requests)
             .worker_overload_token_usage(self.worker_overload_token_usage)
             .worker_overload_protection(self.worker_overload_protection)
+            .worker_overload_shed(self.worker_overload_shed)
+            .worker_stall_secs(self.worker_stall_secs)
+            .worker_wedge_secs(self.worker_wedge_secs)
+            .worker_stale_secs(self.worker_stale_secs)
+            .worker_warmup(
+                self.worker_warmup_secs,
+                self.worker_warmup_share,
+                self.worker_warmup_blocks,
+                self.worker_warmup_thin_ratio,
+                self.worker_warmup_divert_every,
+            )
+            .kv_index(kv_index)
             .disable_load_monitoring(self.disable_load_monitoring)
             .load_monitor_interval_secs(self.load_monitor_interval)
+            .pd_admission_wait_secs(self.pd_admission_wait_secs)
             .max_concurrent_requests(self.max_concurrent_requests)
             .queue_size(self.queue_size)
             .queue_timeout_secs(self.queue_timeout_secs)
+            .priority_scheduler_enabled(self.priority_scheduler_enabled)
+            .priority_scheduler_default_max_class(self.priority_scheduler_default_max_class.clone())
+            .priority_scheduler_config(self.priority_scheduler_config.clone())
+            .priority_scheduler_tenant_metric_top_n(self.priority_scheduler_tenant_metric_top_n)
+            .tenant_rate_limit_enabled(self.tenant_rate_limit_enabled)
+            .tenant_rate_limit_config(self.tenant_rate_limit_config.clone())
+            .prefill_max_inflight_requests_per_worker(self.prefill_max_inflight_requests_per_worker)
+            .prefill_queue_size(self.prefill_queue_size)
+            .prefill_queue_timeout_secs(self.prefill_queue_timeout_secs)
             .cors_allowed_origins(self.cors_allowed_origins.clone())
             .retry_config(config::RetryConfig {
                 max_retries: self.retry_max_retries,
@@ -876,23 +1082,40 @@ impl Router {
                 // service discovery, which is what re-adds a removed worker.
                 remove_unhealthy_workers: config::resolve_worker_auto_recovery(
                     self.remove_unhealthy_workers,
-                    self.service_discovery,
+                    has_discovery,
                 ),
                 drain_settle_secs: self.drain_settle_secs,
             })
             .tokenizer_cache(config::TokenizerCacheConfig {
                 enable_l0: self.tokenizer_cache_enable_l0,
                 l0_max_entries: self.tokenizer_cache_l0_max_entries,
+                l0_max_memory: self.tokenizer_cache_l0_max_memory,
                 enable_l1: self.tokenizer_cache_enable_l1,
                 l1_max_memory: self.tokenizer_cache_l1_max_memory,
             })
             .disable_tokenizer_autoload(self.disable_tokenizer_autoload)
             .history_backend(history_backend)
+            .memory_config(config::MemoryConfig {
+                max_responses: self.history_memory_max_responses,
+                max_items: self.history_memory_max_items,
+                retention_secs: (self.history_memory_retention_secs > 0)
+                    .then_some(self.history_memory_retention_secs),
+            })
             .maybe_api_key(self.api_key.as_ref())
+            .tenant_api_keys(
+                self.tenant_api_keys
+                    .iter()
+                    .map(|(tenant_id, key)| config::TenantApiKeyEntry {
+                        tenant_id: tenant_id.clone(),
+                        key: key.clone(),
+                    })
+                    .collect(),
+            )
             .maybe_discovery(discovery)
             .maybe_metrics(metrics)
             .maybe_trace(trace_config)
             .maybe_log_dir(self.log_dir.as_ref())
+            .maybe_jemalloc_prof_dir(self.jemalloc_prof_dir.as_ref())
             .maybe_log_level(self.log_level.as_ref())
             .maybe_request_id_headers(self.request_id_headers.clone())
             .trust_tenant_header(self.trust_tenant_header)
@@ -902,6 +1125,8 @@ impl Router {
                     .then(|| self.storage_context_headers.clone()),
             )
             .maybe_rate_limit_tokens_per_second(self.rate_limit_tokens_per_second)
+            .max_background_responses(self.max_background_responses)
+            .sse_keepalive_secs(self.sse_keepalive_secs)
             .maybe_model_path(self.model_path.as_ref())
             .maybe_tokenizer_path(self.tokenizer_path.as_ref())
             .maybe_chat_template(self.chat_template.as_ref())
@@ -919,9 +1144,20 @@ impl Router {
             .upstream_pool_idle_timeout_secs(self.upstream_pool_idle_timeout_secs)
             .max_buffered_request_bytes(self.max_buffered_request_bytes)
             .stream_body_stall_timeout_secs(self.stream_body_stall_timeout_secs)
+            .header_read_timeout_secs(self.header_read_timeout_secs)
+            .idle_connection_timeout_secs(self.idle_connection_timeout_secs)
             .multimodal_tensor_transport(multimodal_tensor_transport)
             .multimodal_shm_min_bytes(self.multimodal_shm_min_bytes)
+            .multimodal_max_inflight_bytes(self.multimodal_max_inflight_bytes)
             .mm_per_request_image_limit(self.mm_per_request_image_limit)
+            .mm_processing(mm_processing)
+            .mm_pixel_cache_mb(self.mm_pixel_cache_mb)
+            .mm_pixel_rdma(self.mm_pixel_rdma)
+            .mm_allowed_media_domains(self.mm_allowed_media_domains.clone())
+            .mm_allow_private_media_hosts(self.mm_allow_private_media_hosts)
+            .rdma_listen_ip(self.rdma_listen_ip.clone())
+            .rdma_slot_ttl_s(self.rdma_slot_ttl_s)
+            .log_mm_timing(self.log_mm_timing)
             .routing_key_override(config::RoutingKeyOverrideConfig {
                 enabled: self.routing_key_override,
                 eviction_interval_secs: self.eviction_interval_secs,
@@ -933,6 +1169,11 @@ impl Router {
             .retries(!self.disable_retries)
             .circuit_breaker(!self.disable_circuit_breaker)
             .igw(self.enable_igw)
+            .rl(smg_rl::RlConfig {
+                enabled: self.enable_rl,
+                control_timeout_secs: self.rl_control_timeout_secs,
+                fanout_concurrency: self.rl_fanout_concurrency,
+            })
             .maybe_client_cert_and_key(
                 self.client_cert_path.as_ref(),
                 self.client_key_path.as_ref(),
@@ -1090,20 +1331,70 @@ impl Router {
         cache_ttl_secs = 180,
         job_queue_capacity = 1000,
         job_queue_concurrency = 200,
-        worker_overload_waiting_requests = None,
-        worker_overload_token_usage = None,
-        worker_overload_protection = false,
+        worker_overload_waiting_requests = Some(8),
+        worker_overload_token_usage = Some(0.8),
+        worker_overload_protection = true,
         disable_load_monitoring = false,
         max_buffered_request_bytes = 1_048_576,
         kv_connector_annotation = String::from("smg.ai/kv-connector"),
         kv_engine_id_annotation = String::from("smg.ai/kv-engine-id"),
         mm_per_request_image_limit = None,
+        pd_admission_wait_secs = 30,
+        // Appended last (not inserted mid-list) so every pre-existing
+        // positional argument keeps its index for callers that construct
+        // `_Router(...)` positionally. See the struct-field note above.
+        enable_rl = false,
+        rl_control_timeout_secs = 600,
+        rl_fanout_concurrency = 32,
+        multimodal_max_inflight_bytes = None,
+        mm_processing = None,
+        mm_pixel_cache_mb = None,
+        mm_pixel_rdma = false,
+        rdma_listen_ip = None,
+        rdma_slot_ttl_s = None,
+        log_mm_timing = false,
+        prefill_max_inflight_requests_per_worker = -1,
+        prefill_queue_size = None,
+        prefill_queue_timeout_secs = None,
+        worker_overload_shed = false,
+        kv_index = String::from("positional"),
+        worker_stall_secs = 2,
+        worker_wedge_secs = 3,
+        worker_stale_secs = 15,
+        worker_warmup_secs = 60,
+        worker_warmup_share = 0.25,
+        worker_warmup_blocks = 1024,
+        worker_warmup_thin_ratio = 0.5,
+        worker_warmup_divert_every = 8,
+        selection_policy = String::from("cache-aware-default"),
+        selection_accounting_ttl_ms = 0,
+        tenant_api_keys = vec![],
+        priority_scheduler_enabled = false,
+        priority_scheduler_default_max_class = String::from("default"),
+        priority_scheduler_config = None,
+        priority_scheduler_tenant_metric_top_n = 32,
+        tenant_rate_limit_enabled = false,
+        tenant_rate_limit_config = None,
+        jemalloc_prof_dir = None,
+        tokenizer_cache_l0_max_memory = 268435456,
+        max_background_responses = 1024,
+        header_read_timeout_secs = 30,
+        idle_connection_timeout_secs = 90,
+        mm_allowed_media_domains = None,
+        mm_allow_private_media_hosts = false,
+        sse_keepalive_secs = 15,
+        history_memory_max_responses = 10000,
+        history_memory_max_items = 100000,
+        history_memory_retention_secs = 86400,
+        // Keyword-only, so it never takes a positional slot.
+        *,
+        mesh_tls_ca_cert = None,
+        mesh_tls_cert = None,
+        mesh_tls_key = None,
+        power_of_two_load_metric = String::from("expected_wait"),
+        discovery = None,
     ))]
     #[expect(clippy::too_many_arguments)]
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "PyO3 #[new] method signature requires PyResult"
-    )]
     fn new(
         worker_urls: Vec<String>,
         policy: PolicyType,
@@ -1251,7 +1542,70 @@ impl Router {
         kv_connector_annotation: String,
         kv_engine_id_annotation: String,
         mm_per_request_image_limit: Option<usize>,
+        pd_admission_wait_secs: u64,
+        // Appended last to match the `#[pyo3(signature)]` order above and
+        // preserve positional-argument compatibility.
+        enable_rl: bool,
+        rl_control_timeout_secs: u64,
+        rl_fanout_concurrency: usize,
+        multimodal_max_inflight_bytes: Option<usize>,
+        mm_processing: Option<String>,
+        mm_pixel_cache_mb: Option<usize>,
+        mm_pixel_rdma: bool,
+        rdma_listen_ip: Option<String>,
+        rdma_slot_ttl_s: Option<u64>,
+        log_mm_timing: bool,
+        prefill_max_inflight_requests_per_worker: i32,
+        prefill_queue_size: Option<usize>,
+        prefill_queue_timeout_secs: Option<u64>,
+        worker_overload_shed: bool,
+        kv_index: String,
+        worker_stall_secs: u64,
+        worker_wedge_secs: u64,
+        worker_stale_secs: u64,
+        worker_warmup_secs: u64,
+        worker_warmup_share: f32,
+        worker_warmup_blocks: usize,
+        worker_warmup_thin_ratio: f32,
+        worker_warmup_divert_every: u64,
+        selection_policy: String,
+        selection_accounting_ttl_ms: u64,
+        tenant_api_keys: Vec<(String, String)>,
+        priority_scheduler_enabled: bool,
+        priority_scheduler_default_max_class: String,
+        priority_scheduler_config: Option<String>,
+        priority_scheduler_tenant_metric_top_n: u32,
+        tenant_rate_limit_enabled: bool,
+        tenant_rate_limit_config: Option<String>,
+        jemalloc_prof_dir: Option<String>,
+        tokenizer_cache_l0_max_memory: usize,
+        max_background_responses: usize,
+        header_read_timeout_secs: u64,
+        idle_connection_timeout_secs: u64,
+        mm_allowed_media_domains: Option<Vec<String>>,
+        mm_allow_private_media_hosts: bool,
+        sse_keepalive_secs: u64,
+        history_memory_max_responses: usize,
+        history_memory_max_items: usize,
+        history_memory_retention_secs: u64,
+        mesh_tls_ca_cert: Option<String>,
+        mesh_tls_cert: Option<String>,
+        mesh_tls_key: Option<String>,
+        power_of_two_load_metric: String,
+        discovery: Option<Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
+        // Two spellings of one choice: refuse both rather than pick one.
+        if service_discovery && discovery.is_some() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "Pass service_discovery=True or a discovery mapping, not both",
+            ));
+        }
+        let discovery = discovery
+            .as_ref()
+            .map(parse_discovery)
+            .transpose()?
+            .flatten();
+
         let mut all_urls = worker_urls.clone();
 
         if let Some(ref encode_urls) = encode_urls {
@@ -1318,6 +1672,7 @@ impl Router {
             prometheus_port,
             prometheus_host,
             prometheus_duration_buckets,
+            jemalloc_prof_dir,
             request_timeout_secs,
             shutdown_grace_period_secs,
             request_id_headers,
@@ -1354,6 +1709,11 @@ impl Router {
             queue_size,
             queue_timeout_secs,
             rate_limit_tokens_per_second,
+            max_background_responses,
+            sse_keepalive_secs,
+            history_memory_max_responses,
+            history_memory_max_items,
+            history_memory_retention_secs,
             connection_mode,
             model_path,
             tokenizer_path,
@@ -1361,6 +1721,7 @@ impl Router {
             disable_tokenizer_autoload,
             tokenizer_cache_enable_l0,
             tokenizer_cache_l0_max_entries,
+            tokenizer_cache_l0_max_memory,
             tokenizer_cache_enable_l1,
             tokenizer_cache_l1_max_memory,
             reasoning_parser,
@@ -1408,6 +1769,8 @@ impl Router {
             cache_boundaries,
             cache_index,
             cache_ttl_secs,
+            header_read_timeout_secs,
+            idle_connection_timeout_secs,
             job_queue_capacity,
             job_queue_concurrency,
             worker_overload_waiting_requests,
@@ -1418,6 +1781,46 @@ impl Router {
             kv_connector_annotation,
             kv_engine_id_annotation,
             mm_per_request_image_limit,
+            pd_admission_wait_secs,
+            enable_rl,
+            rl_control_timeout_secs,
+            rl_fanout_concurrency,
+            multimodal_max_inflight_bytes,
+            mm_processing,
+            mm_pixel_cache_mb,
+            mm_pixel_rdma,
+            rdma_listen_ip,
+            rdma_slot_ttl_s,
+            log_mm_timing,
+            prefill_max_inflight_requests_per_worker,
+            prefill_queue_size,
+            prefill_queue_timeout_secs,
+            worker_overload_shed,
+            kv_index,
+            worker_stall_secs,
+            worker_wedge_secs,
+            worker_stale_secs,
+            worker_warmup_secs,
+            worker_warmup_share,
+            worker_warmup_blocks,
+            worker_warmup_thin_ratio,
+            worker_warmup_divert_every,
+            selection_policy,
+            selection_accounting_ttl_ms,
+            tenant_api_keys,
+            priority_scheduler_enabled,
+            priority_scheduler_default_max_class,
+            priority_scheduler_config,
+            priority_scheduler_tenant_metric_top_n,
+            tenant_rate_limit_enabled,
+            tenant_rate_limit_config,
+            mm_allowed_media_domains,
+            mm_allow_private_media_hosts,
+            discovery,
+            mesh_tls_ca_cert,
+            mesh_tls_cert,
+            mesh_tls_key,
+            power_of_two_load_metric,
         })
     }
 
@@ -1432,47 +1835,27 @@ impl Router {
             pyo3::exceptions::PyValueError::new_err(format!("Configuration validation failed: {e}"))
         })?;
 
-        let model_id_source = self
-            .model_id_from
-            .as_deref()
-            .map(|s| {
-                service_discovery::ModelIdSource::parse(s).map_err(|e| {
-                    pyo3::exceptions::PyValueError::new_err(format!(
-                        "Invalid --model-id-from value '{s}': {e}"
-                    ))
-                })
+        let service_discovery_config = router_config
+            .discovery
+            .as_ref()
+            .map(|discovery| {
+                service_discovery::RuntimeDiscoveryConfig::from_config(
+                    discovery,
+                    &router_config.mode,
+                )
             })
-            .transpose()?;
-
-        let service_discovery_config = if self.service_discovery {
-            Some(service_discovery::ServiceDiscoveryConfig {
-                enabled: true,
-                selector: self.selector.clone(),
-                check_interval: std::time::Duration::from_secs(60),
-                port: self.service_discovery_port,
-                namespace: self.service_discovery_namespace.clone(),
-                disaggregated_mode: self.pd_disaggregation || self.epd_disaggregation,
-                encode_selector: self.encode_selector.clone(),
-                prefill_selector: self.prefill_selector.clone(),
-                decode_selector: self.decode_selector.clone(),
-                bootstrap_port_annotation: self.bootstrap_port_annotation.clone(),
-                worker_ports_annotation: self.worker_ports_annotation.clone(),
-                kv_connector_annotation: self.kv_connector_annotation.clone(),
-                kv_engine_id_annotation: self.kv_engine_id_annotation.clone(),
-                router_selector: self.router_selector.clone(),
-                router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
-                model_id_source,
-            })
-        } else {
-            None
-        };
+            .transpose()
+            .map_err(|e| {
+                pyo3::exceptions::PyValueError::new_err(format!("Configuration error: {e}"))
+            })?;
+        let mesh_discovery_config = router_config
+            .discovery
+            .as_ref()
+            .and_then(mesh_discovery::MeshDiscoveryConfig::from_discovery);
 
         let prometheus_config = Some(PrometheusConfig {
             port: self.prometheus_port.unwrap_or(29000),
-            host: self
-                .prometheus_host
-                .clone()
-                .unwrap_or_else(|| "127.0.0.1".to_string()),
+            host: self.metrics_host(),
             duration_buckets: self.prometheus_duration_buckets.clone(),
         });
 
@@ -1493,6 +1876,7 @@ impl Router {
                 log_level: self.log_level.clone(),
                 log_json: self.log_json,
                 service_discovery_config,
+                mesh_discovery_config,
                 prometheus_config,
                 request_timeout_secs: self.request_timeout_secs,
                 request_id_headers: self.request_id_headers.clone(),
@@ -1520,6 +1904,16 @@ impl Router {
                             })
                         })
                         .transpose()?;
+                    // Mirrors the CLI check in `main.rs`: port 0 parses as a
+                    // socket address but is undialable once gossiped to peers,
+                    // and reaches router discovery as the fallback mesh port
+                    // for Pods with no usable annotation.
+                    if self.mesh_port == 0 {
+                        return Err(pyo3::exceptions::PyValueError::new_err(
+                            "Invalid value for mesh_port='0': mesh port cannot be 0; peers dial \
+                             the advertised port, so it must be a fixed, routable one",
+                        ));
+                    }
                     let bind_addr =
                         Self::parse_mesh_socket_addr(&self.mesh_host, self.mesh_port, "mesh_host")?;
                     let (advertise_host, advertise_field) =
@@ -1543,7 +1937,7 @@ impl Router {
                         bind_addr,
                         advertise_addr,
                         init_peer: peer,
-                        mtls_config: None,
+                        mtls_config: self.mesh_mtls_config()?,
                     })
                 } else {
                     None
@@ -1603,6 +1997,10 @@ fn get_available_reasoning_parsers() -> Vec<String> {
 #[pymodule]
 fn smg_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     observability::metrics::register_jemalloc_as_global_allocator();
+    // The process-level TLS crypto provider, installed once when the module
+    // is imported: every HTTP client a binding builds takes it, whether or
+    // not a router is started in this process.
+    tls::install_crypto_provider();
 
     m.add_class::<PolicyType>()?;
     m.add_class::<BackendType>()?;
@@ -1615,10 +2013,14 @@ fn smg_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyPostgresConfig>()?;
     m.add_class::<PyRedisConfig>()?;
     m.add_class::<Router>()?;
+    m.add_class::<PyVllmGrpcServer>()?;
+    m.add_class::<PyTokenSpeedGrpcServer>()?;
+    m.add_class::<PySglangGrpcServer>()?;
     m.add_function(wrap_pyfunction!(get_version_string, m)?)?;
     m.add_function(wrap_pyfunction!(get_verbose_version_string, m)?)?;
     m.add_function(wrap_pyfunction!(print_banner, m)?)?;
     m.add_function(wrap_pyfunction!(get_available_tool_call_parsers, m)?)?;
     m.add_function(wrap_pyfunction!(get_available_reasoning_parsers, m)?)?;
+    m.add_function(wrap_pyfunction!(init_servicer_tracing, m)?)?;
     Ok(())
 }

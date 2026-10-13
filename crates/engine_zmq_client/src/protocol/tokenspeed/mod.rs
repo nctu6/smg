@@ -16,12 +16,12 @@
 //! abort payload is a plain msgpack `list[str]` of request ids, not a tagged
 //! struct.
 
+pub mod multimodal;
 pub mod output;
 pub mod request;
 pub mod sampling;
 
 use bytes::Bytes;
-use serde::de::{Deserialize, Error as _, IgnoredAny, SeqAccess};
 
 use crate::{
     codec::{decode_msgpack, encode_msgpack},
@@ -34,49 +34,6 @@ use crate::{
         EngineBatch, EngineLoad, EngineProtocol,
     },
 };
-
-/// Read the next positional element, failing loudly when the array is shorter
-/// than the modeled prefix (every modeled field is required on decode).
-pub(crate) fn next_field<'de, A, T>(
-    seq: &mut A,
-    name: &'static str,
-) -> std::result::Result<T, A::Error>
-where
-    A: SeqAccess<'de>,
-    T: Deserialize<'de>,
-{
-    seq.next_element::<T>()?
-        .ok_or_else(|| A::Error::custom(format!("missing positional field `{name}`")))
-}
-
-/// Validate the msgspec tag string at element 0. A wrong tag means the payload
-/// is a different message type — fail loudly instead of misreading fields.
-pub(crate) fn expect_tag<'de, A>(
-    seq: &mut A,
-    expected: &'static str,
-) -> std::result::Result<(), A::Error>
-where
-    A: SeqAccess<'de>,
-{
-    let tag: String = next_field(seq, "_tag")?;
-    if tag != expected {
-        return Err(A::Error::custom(format!(
-            "wrong msgspec tag: expected `{expected}`, got `{tag}`"
-        )));
-    }
-    Ok(())
-}
-
-/// Drain positional elements beyond the modeled prefix. TokenSpeed appends new
-/// fields at the end of its structs, so unknown trailing elements are skipped
-/// rather than treated as a decode error.
-pub(crate) fn drain_trailing<'de, A>(seq: &mut A) -> std::result::Result<(), A::Error>
-where
-    A: SeqAccess<'de>,
-{
-    while seq.next_element::<IgnoredAny>()?.is_some() {}
-    Ok(())
-}
 
 /// The TokenSpeed engine protocol: drives [`TokenizedGenerateReqInput`] over
 /// the shared ZMQ transport and decodes [`BatchTokenIDOutSlim`] back.
@@ -92,6 +49,23 @@ impl EngineProtocol for TokenSpeedProtocol {
 
     fn abort_frame() -> Bytes {
         TokenSpeedRequestType::Abort.to_frame()
+    }
+
+    fn prompt_tokens(request: &Self::Request) -> u64 {
+        request.input_ids.len() as u64
+    }
+
+    fn reported_every_step(request: &Self::Request) -> bool {
+        // A request that does not stream is reported at its end (and at the
+        // scheduler's forced interval), a streaming one every
+        // `stream_interval` tokens (its own, else the server's, 1 unless
+        // raised); only a streaming request at an interval of one is
+        // reported every step.
+        request.stream
+            && request
+                .sampling_params
+                .stream_interval
+                .is_none_or(|interval| interval <= 1)
     }
 
     fn request_id(request: &Self::Request) -> &str {
@@ -165,6 +139,7 @@ impl EngineProtocol for TokenSpeedProtocol {
             finished_request_ids,
             load,
             wave: None,
+            utility: None,
         })
     }
 }
@@ -189,6 +164,44 @@ mod tests {
             kv_active_pages: 100,
             kv_total_pages: 400,
         }
+    }
+
+    /// Which requests the engine reports every step, for the silence count:
+    /// a streaming request at an interval of one (the request's own, or the
+    /// server's default when unset); one that does not stream, or streams
+    /// every so many tokens, is reported at intervals. Every prompt counts
+    /// as pending prefill.
+    #[test]
+    fn a_streaming_request_at_interval_one_is_reported_every_step() {
+        use crate::protocol::tokenspeed::sampling::SamplingParams;
+        let request = |stream: bool, stream_interval: Option<u32>| TokenizedGenerateReqInput {
+            input_ids: vec![1, 2, 3],
+            stream,
+            sampling_params: SamplingParams {
+                stream_interval,
+                ..SamplingParams::default()
+            },
+            ..TokenizedGenerateReqInput::default()
+        };
+        assert!(TokenSpeedProtocol::reported_every_step(&request(
+            true, None
+        )));
+        assert!(TokenSpeedProtocol::reported_every_step(&request(
+            true,
+            Some(1)
+        )));
+        assert!(!TokenSpeedProtocol::reported_every_step(&request(
+            true,
+            Some(8)
+        )));
+        assert!(!TokenSpeedProtocol::reported_every_step(&request(
+            false, None
+        )));
+        assert!(!TokenSpeedProtocol::reported_every_step(&request(
+            false,
+            Some(1)
+        )));
+        assert_eq!(TokenSpeedProtocol::prompt_tokens(&request(false, None)), 3);
     }
 
     #[test]

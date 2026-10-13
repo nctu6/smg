@@ -68,11 +68,14 @@ CRATES=(
     "smg-auth|crates/auth|smg-auth"
     "smg-mcp|crates/mcp|smg-mcp"
     "kv-index|crates/kv_index|kv-index"
+    "smg-radix-tree|crates/radix_tree|smg-radix-tree"
     "data-connector|crates/data_connector|smg-data-connector"
     "llm-multimodal|crates/multimodal|llm-multimodal"
     "smg-wasm|crates/wasm|smg-wasm"
     "smg-mesh|crates/mesh|smg-mesh"
     "smg-grpc-client|crates/grpc_client|smg-grpc-client"
+    "smg-external-router|crates/external_router|smg-external-router"
+    "smg-rl|crates/rl|smg-rl"
     "smg-client|clients/rust|-"
     "openapi-gen|clients/openapi-gen|-"
     "smg|model_gateway|-"
@@ -103,6 +106,7 @@ SMG_VERSION_SYNC=(
     "sglang-docker|.github/workflows/release-sglang-docker.yml|workflow"
     "vllm-docker|.github/workflows/release-vllm-docker.yml|workflow"
     "trtllm-docker|.github/workflows/release-trtllm-docker.yml|workflow"
+    "tokenspeed-docker|.github/workflows/release-tokenspeed-docker.yml|workflow"
 )
 
 # ---------------------------------------------------------------------------

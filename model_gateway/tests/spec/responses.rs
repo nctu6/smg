@@ -488,11 +488,11 @@ fn test_validate_repetition_penalty_range() {
     }
 }
 
-/// Test max_output_tokens minimum validation
+/// Test max_output_tokens minimum validation (the public API's minimum is 16)
 #[test]
 fn test_validate_max_output_tokens() {
     // Valid values
-    for val in [1, 100, 1000] {
+    for val in [16, 100, 1000] {
         let request = ResponsesRequest {
             input: ResponseInput::Text("test".to_string()),
             max_output_tokens: Some(val),
@@ -505,15 +505,17 @@ fn test_validate_max_output_tokens() {
     }
 
     // Invalid values
-    let request = ResponsesRequest {
-        input: ResponseInput::Text("test".to_string()),
-        max_output_tokens: Some(0),
-        ..Default::default()
-    };
-    assert!(
-        request.validate().is_err(),
-        "max_output_tokens 0 should be invalid"
-    );
+    for val in [0, 1, 15] {
+        let request = ResponsesRequest {
+            input: ResponseInput::Text("test".to_string()),
+            max_output_tokens: Some(val),
+            ..Default::default()
+        };
+        assert!(
+            request.validate().is_err(),
+            "max_output_tokens {val} should be invalid"
+        );
+    }
 }
 
 /// Test max_tool_calls minimum validation
@@ -816,6 +818,7 @@ fn test_validate_text_format_json_schema_empty_name() {
                 description: None,
                 strict: None,
             }),
+            verbosity: None,
         }),
         ..Default::default()
     };
@@ -823,6 +826,39 @@ fn test_validate_text_format_json_schema_empty_name() {
     assert!(
         result.is_err(),
         "JSON schema with empty name should be invalid"
+    );
+}
+
+/// Test text format validation (JSON schema must be a JSON object)
+#[test]
+fn test_validate_text_format_json_schema_schema_not_object() {
+    fn request(schema: serde_json::Value) -> ResponsesRequest {
+        ResponsesRequest {
+            input: ResponseInput::Text("test".to_string()),
+            text: Some(TextConfig {
+                format: Some(TextFormat::JsonSchema {
+                    name: "weather".to_string(),
+                    schema,
+                    description: None,
+                    strict: None,
+                }),
+                verbosity: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    let err = request(json!("x"))
+        .validate()
+        .expect_err("scalar schema should be invalid");
+    assert!(
+        format!("{err:?}").contains("json_schema_schema_not_object"),
+        "Expected error code json_schema_schema_not_object, got: {err:?}",
+    );
+
+    assert!(
+        request(json!({})).validate().is_ok(),
+        "empty object schema should stay valid"
     );
 }
 
@@ -842,6 +878,7 @@ fn test_validate_tool_choice_requires_tools() {
                 description: None,
                 parameters: json!({}),
                 strict: None,
+                extra: Default::default(),
             },
         })]),
         tool_choice: Some(ResponsesToolChoice::Options(ToolChoiceOptions::Auto)),
@@ -886,46 +923,28 @@ fn test_validate_tool_choice_requires_tools() {
     }
 }
 
-/// Test top_logprobs requires include field
+/// `top_logprobs` is accepted with or without the logprobs include entry, as
+/// the public API accepts it (without the include entry the logprobs are
+/// simply not attached to the output text).
 #[test]
-fn test_validate_top_logprobs_requires_include() {
-    // Valid: top_logprobs with correct include field
-    let request = ResponsesRequest {
-        input: ResponseInput::Text("test".to_string()),
-        top_logprobs: Some(5),
-        include: Some(vec![IncludeField::MessageOutputTextLogprobs]),
-        ..Default::default()
-    };
-    assert!(
-        request.validate().is_ok(),
-        "top_logprobs with include field should be valid"
-    );
-
-    // Invalid: top_logprobs without include field
-    let request = ResponsesRequest {
-        input: ResponseInput::Text("test".to_string()),
-        top_logprobs: Some(5),
-        include: None,
-        ..Default::default()
-    };
-    let result = request.validate();
-    assert!(
-        result.is_err(),
-        "top_logprobs without include field should be invalid"
-    );
-
-    // Invalid: top_logprobs with wrong include field
-    let request = ResponsesRequest {
-        input: ResponseInput::Text("test".to_string()),
-        top_logprobs: Some(5),
-        include: Some(vec![IncludeField::ReasoningEncryptedContent]),
-        ..Default::default()
-    };
-    let result = request.validate();
-    assert!(
-        result.is_err(),
-        "top_logprobs with wrong include field should be invalid"
-    );
+fn test_validate_top_logprobs_does_not_require_include() {
+    for include in [
+        Some(vec![IncludeField::MessageOutputTextLogprobs]),
+        None,
+        Some(vec![IncludeField::ReasoningEncryptedContent]),
+    ] {
+        let request = ResponsesRequest {
+            input: ResponseInput::Text("test".to_string()),
+            top_logprobs: Some(5),
+            include,
+            ..Default::default()
+        };
+        assert!(
+            request.validate().is_ok(),
+            "top_logprobs must validate regardless of include: {:?}",
+            request.include
+        );
+    }
 }
 
 /// Test previous_response_id format validation
@@ -1017,10 +1036,9 @@ fn test_validate_conversation_previous_response_mutual_exclusion() {
     }
 }
 
-/// Test input items structure validation
+/// A regular message remains a valid input item.
 #[test]
 fn test_validate_input_items_structure() {
-    // Valid: items with at least one message
     let request = ResponsesRequest {
         input: ResponseInput::Items(vec![ResponseInputOutputItem::SimpleInputMessage {
             content: StringOrContentParts::String("Hello".to_string()),
@@ -1034,22 +1052,95 @@ fn test_validate_input_items_structure() {
         request.validate().is_ok(),
         "Input items with message should be valid"
     );
+}
 
-    // Invalid: items with no messages (only function calls)
-    let request = ResponsesRequest {
-        input: ResponseInput::Items(vec![ResponseInputOutputItem::FunctionCallOutput {
-            id: None,
-            call_id: "call_123".to_string(),
-            output: "result".to_string(),
-            status: None,
-        }]),
-        ..Default::default()
-    };
-    let result = request.validate();
-    assert!(
-        result.is_err(),
-        "Input items without messages should be invalid"
-    );
+/// Stored history supplies the message and function call for a continuation.
+#[test]
+fn test_validate_tool_result_only_continuation() {
+    for (previous_response_id, conversation) in [
+        (Some("resp_123"), None),
+        (None, Some(json!("conv_123"))),
+        (None, Some(json!({"id": "conv_123"}))),
+    ] {
+        for stream in [false, true] {
+            let request: ResponsesRequest = serde_json::from_value(json!({
+                "model": "test-model",
+                "previous_response_id": previous_response_id,
+                "conversation": conversation,
+                "stream": stream,
+                "input": [{
+                    "type": "function_call_output",
+                    "call_id": "call_weather",
+                    "output": "sunny"
+                }]
+            }))
+            .unwrap();
+            assert!(
+                request.validate().is_ok(),
+                "Tool-result-only continuation should validate: {request:?}"
+            );
+        }
+    }
+}
+
+/// Stateless replay does not require a new message after the tool result.
+#[test]
+fn test_validate_stateless_function_history_without_new_message() {
+    for stream in [false, true] {
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "store": false,
+            "stream": stream,
+            "input": [
+                {"role": "user", "content": "What is the weather?"},
+                {"type": "reasoning", "id": "rs_weather", "summary": []},
+                {"type": "function_call", "call_id": "call_weather", "name": "weather", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_weather", "output": "sunny"}
+            ]
+        }))
+        .unwrap();
+        assert!(request.validate().is_ok());
+    }
+}
+
+/// Continuations retain input-item and cross-field validation.
+#[test]
+fn test_validate_tool_continuation_keeps_other_constraints() {
+    for input in [
+        json!(""),
+        json!([]),
+        json!([{"role": "user", "content": ""}]),
+        json!([{"role": "user", "content": []}]),
+    ] {
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model": "test-model", "previous_response_id": "resp_123", "input": input
+        }))
+        .unwrap();
+        assert!(request.validate().is_err(), "Invalid input: {input}");
+    }
+
+    let request: ResponsesRequest = serde_json::from_value(json!({
+        "model": "test-model",
+        "previous_response_id": "resp_123",
+        "conversation": "conv_123",
+        "input": [{"type": "function_call_output", "call_id": "call_weather", "output": "sunny"}]
+    }))
+    .unwrap();
+    let errors = request.validate().unwrap_err();
+    let field_errors = errors.field_errors();
+    assert!(field_errors.get("__all__").is_some_and(|errors| errors
+        .iter()
+        .any(|error| error.code == "mutually_exclusive_parameters")));
+
+    for item in [
+        json!({"type": "function_call_output", "output": "sunny"}),
+        json!({"type": "function_call_output", "call_id": "call_weather"}),
+    ] {
+        assert!(serde_json::from_value::<ResponsesRequest>(json!({
+            "model": "test-model", "previous_response_id": "resp_123", "input": [item]
+        }))
+        .is_err());
+    }
 }
 
 // ============================================================================
@@ -1069,6 +1160,7 @@ fn test_normalize_tool_choice_auto() {
                 description: None,
                 parameters: json!({}),
                 strict: None,
+                extra: Default::default(),
             },
         })]),
         tool_choice: None,
@@ -1130,6 +1222,7 @@ fn test_normalize_tool_choice_no_override() {
                 description: None,
                 parameters: json!({}),
                 strict: None,
+                extra: Default::default(),
             },
         })]),
         tool_choice: Some(ResponsesToolChoice::Options(ToolChoiceOptions::Required)),
@@ -1160,6 +1253,7 @@ fn test_normalize_parallel_tool_calls() {
                 description: None,
                 parameters: json!({}),
                 strict: None,
+                extra: Default::default(),
             },
         })]),
         parallel_tool_calls: None,
@@ -1212,6 +1306,7 @@ fn test_normalize_parallel_tool_calls_no_override() {
                 description: None,
                 parameters: json!({}),
                 strict: None,
+                extra: Default::default(),
             },
         })]),
         parallel_tool_calls: Some(false),

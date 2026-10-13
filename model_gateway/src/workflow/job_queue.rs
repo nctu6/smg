@@ -4,11 +4,12 @@
 //! them asynchronously in background worker tasks.
 
 use std::{
+    collections::HashMap,
     sync::{Arc, Weak},
     time::{Duration, SystemTime},
 };
 
-use dashmap::DashMap;
+use dashmap::{mapref::entry::Entry, DashMap};
 use openai_protocol::worker::{
     ConnectionMode, JobStatus, RuntimeType, WorkerSpec, WorkerType, WorkerUpdateRequest,
 };
@@ -24,9 +25,9 @@ use crate::{
         create_mcp_workflow_data, create_tokenizer_workflow_data,
         create_wasm_registration_workflow_data, create_wasm_removal_workflow_data,
         create_worker_removal_workflow_data, create_worker_update_workflow_data,
-        create_worker_workflow_data, McpServerConfigRequest, TokenizerConfigRequest,
-        TokenizerRemovalRequest, WasmModuleConfigRequest, WasmModuleRemovalRequest,
-        WorkerRegistrationMode,
+        create_worker_workflow_data, note_tokenizer_load_outcome, note_tokenizer_removed,
+        McpServerConfigRequest, TokenizerConfigRequest, TokenizerRemovalRequest,
+        WasmModuleConfigRequest, WasmModuleRemovalRequest, WorkerRegistrationMode,
     },
 };
 
@@ -43,7 +44,11 @@ pub enum Job {
     },
     RemoveWorker {
         url: String,
-        expected_revision: Option<u64>,
+        /// Per-worker revision guards keyed by registry worker id. A DP group
+        /// shares one canonical URL but each rank holds its own revision, so
+        /// one scalar cannot guard the group. `None` removes every match
+        /// unguarded.
+        expected_revisions: Option<HashMap<String, u64>>,
     },
     InitializeWorkersFromConfig {
         router_config: Box<RouterConfig>,
@@ -215,42 +220,87 @@ impl JobQueue {
         (queue_depth, available_permits)
     }
 
+    /// Submit unless a job for this URL is already pending or processing.
+    /// Returns `Ok(false)` when an earlier submission is still in flight. The
+    /// status-map entry is taken atomically, so concurrent callers enqueue
+    /// exactly one job per URL (#1533).
+    pub async fn submit_if_idle(&self, job: Job) -> Result<bool, String> {
+        let worker_url = job.worker_url().to_string();
+        if !Self::claim(&self.status_map, &worker_url, job.job_type()) {
+            return Ok(false);
+        }
+        self.submit(job).await.map(|()| true).inspect_err(|_| {
+            // A failed submission owns no job, so its claim must not block the next one.
+            self.status_map.remove(&worker_url);
+        })
+    }
+
+    /// Only an in-flight job of the same type counts: the status map is keyed
+    /// by name across job types, so an MCP server or WASM module named like a
+    /// worker URL must not block that worker's AddWorker.
+    fn claim(status_map: &DashMap<String, JobStatus>, url: &str, job_type: &'static str) -> bool {
+        match status_map.entry(url.to_string()) {
+            Entry::Occupied(e)
+                if e.get().job_type == job_type
+                    && matches!(e.get().status.as_str(), "pending" | "processing") =>
+            {
+                false
+            }
+            entry => {
+                entry.insert(JobStatus::pending(job_type, url));
+                true
+            }
+        }
+    }
+
     /// Submit a job with detailed queue status
     pub async fn submit(&self, job: Job) -> Result<(), String> {
         // Check if context is still alive before accepting jobs
-        if self.context.upgrade().is_none() {
+        let Some(context) = self.context.upgrade() else {
             return Err("Job queue shutting down: AppContext dropped".to_string());
-        }
+        };
 
         // Extract values before moving job
         let job_type = job.job_type();
         let worker_url = job.worker_url().to_string();
+        let tokenizer_load = match &job {
+            Job::AddTokenizer { config } => Some(config.name.clone()),
+            _ => None,
+        };
+
+        // A slot in the queue first: the wait for one (a full queue) can be
+        // cancelled with the caller and must leave nothing behind, so nothing
+        // is recorded before a slot is held; from the slot on, the hand-over
+        // is synchronous and cannot fail.
+        let Ok(permit) = self.tx.reserve().await else {
+            let (queue_depth, _) = self.get_load_info();
+            return Err(format!(
+                "Job queue full: {} jobs pending (capacity: {})",
+                queue_depth,
+                self.tx.max_capacity()
+            ));
+        };
 
         // Record pending status
         self.status_map.insert(
             worker_url.clone(),
             JobStatus::pending(job_type, &worker_url),
         );
-
-        match self.tx.send(job).await {
-            Ok(()) => {
-                let (queue_depth, available_permits) = self.get_load_info();
-                debug!(
-                    "Job submitted: type={}, worker={}, queue_depth={}, available_slots={}",
-                    job_type, worker_url, queue_depth, available_permits
-                );
-                Ok(())
-            }
-            Err(_) => {
-                self.status_map.remove(&worker_url);
-                let (queue_depth, _) = self.get_load_info();
-                Err(format!(
-                    "Job queue full: {} jobs pending (capacity: {})",
-                    queue_depth,
-                    self.tx.max_capacity()
-                ))
-            }
+        // A tokenizer load counts as in flight for its model from here (the
+        // model is pending until the job ends, whatever was recorded): with
+        // the slot held, the job is handed over right after the count, so a
+        // job that ends at once finds its count to release.
+        if let Some(model) = &tokenizer_load {
+            context.tokenizer_load_failures.load_started(model);
         }
+        permit.send(job);
+
+        let (queue_depth, available_permits) = self.get_load_info();
+        debug!(
+            "Job submitted: type={}, worker={}, queue_depth={}, available_slots={}",
+            job_type, worker_url, queue_depth, available_permits
+        );
+        Ok(())
     }
 
     /// Get job status by worker URL
@@ -293,6 +343,21 @@ impl JobQueue {
             Some(ctx) => {
                 let result = Self::execute_job(&job, &ctx).await;
                 let duration = start.elapsed();
+                // Only `POST /workers` (CreateOnly) reserves an id for its 202; a failed
+                // upsert from discovery or startup owns no reservation to drop. Release
+                // before the status turns terminal, so a retry cannot reserve the same
+                // mapping in between and have it deleted from under it (#1533).
+                if result.is_err()
+                    && matches!(
+                        job,
+                        Job::AddWorker {
+                            registration_mode: WorkerRegistrationMode::CreateOnly,
+                            ..
+                        }
+                    )
+                {
+                    ctx.worker_registry.release_reservation(&worker_url);
+                }
                 Self::record_job_completion(job_type, &worker_url, duration, &result, &status_map);
             }
             None => {
@@ -377,7 +442,7 @@ impl JobQueue {
             }
             Job::RemoveWorker {
                 url,
-                expected_revision,
+                expected_revisions,
             } => {
                 let engines = context
                     .workflow_engines
@@ -386,8 +451,7 @@ impl JobQueue {
 
                 let workflow_data = create_worker_removal_workflow_data(
                     url.to_string(),
-                    context.router_config.dp_aware,
-                    *expected_revision,
+                    expected_revisions.clone(),
                     Arc::clone(context),
                 );
 
@@ -649,39 +713,58 @@ impl JobQueue {
                     .await
             }
             Job::AddTokenizer { config } => {
-                let engines = context
-                    .workflow_engines
-                    .get()
-                    .ok_or_else(|| "Workflow engines not initialized".to_string())?;
+                // The load was counted in flight at submission; its end is
+                // noted for the model (a failure of the model's last load
+                // answers its requests 503 tokenizer_load_failed).
+                let result = async {
+                    let engines = context
+                        .workflow_engines
+                        .get()
+                        .ok_or_else(|| "Workflow engines not initialized".to_string())?;
 
-                let workflow_data =
-                    create_tokenizer_workflow_data(*config.clone(), Arc::clone(context));
+                    let workflow_data =
+                        create_tokenizer_workflow_data(*config.clone(), Arc::clone(context));
 
-                let instance_id = engines
-                    .tokenizer
-                    .start_workflow(WorkflowId::new("tokenizer_registration"), workflow_data)
-                    .await
-                    .map_err(|e| {
-                        format!("Failed to start tokenizer registration workflow: {e:?}")
-                    })?;
+                    let instance_id = engines
+                        .tokenizer
+                        .start_workflow(WorkflowId::new("tokenizer_registration"), workflow_data)
+                        .await
+                        .map_err(|e| {
+                            format!("Failed to start tokenizer registration workflow: {e:?}")
+                        })?;
 
-                debug!(
-                    "Started tokenizer registration workflow for '{}' id={} (instance: {})",
-                    config.name, config.id, instance_id
+                    debug!(
+                        "Started tokenizer registration workflow for '{}' id={} (instance: {})",
+                        config.name, config.id, instance_id
+                    );
+
+                    // Allow up to 10 minutes for HuggingFace downloads
+                    let timeout_duration = Duration::from_secs(600);
+
+                    engines
+                        .tokenizer
+                        .wait_for_completion(instance_id, &config.id, timeout_duration)
+                        .await
+                }
+                .await;
+                note_tokenizer_load_outcome(
+                    &context.tokenizer_load_failures,
+                    &context.tokenizer_registry,
+                    &context.worker_registry,
+                    &config.name,
+                    &result,
                 );
-
-                // Allow up to 10 minutes for HuggingFace downloads
-                let timeout_duration = Duration::from_secs(600);
-
-                engines
-                    .tokenizer
-                    .wait_for_completion(instance_id, &config.id, timeout_duration)
-                    .await
+                result
             }
             Job::RemoveTokenizer { request } => {
                 // Tokenizer removal is synchronous and fast
                 if let Some(entry) = context.tokenizer_registry.remove_by_id(&request.id) {
                     context.multimodal_config_registry.remove(&entry.id);
+                    note_tokenizer_removed(
+                        &context.tokenizer_load_failures,
+                        &context.worker_registry,
+                        &entry.name,
+                    );
                     info!(
                         "Successfully removed tokenizer '{}' (id: {})",
                         entry.name, entry.id
@@ -929,6 +1012,50 @@ mod tests {
             failed.timestamp + 300,
             300
         ));
+    }
+
+    /// Concurrent creates for one URL must enqueue exactly one AddWorker, and a
+    /// terminal status must not block the next attempt (#1533).
+    #[test]
+    fn claim_admits_one_in_flight_job_per_url() {
+        let map = Arc::new(DashMap::new());
+        let won: Vec<bool> = (0..16)
+            .map(|_| {
+                let map = Arc::clone(&map);
+                std::thread::spawn(move || JobQueue::claim(&map, "http://w:8000", "AddWorker"))
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect();
+        assert_eq!(won.iter().filter(|&&w| w).count(), 1);
+
+        map.insert(
+            "http://w:8000".to_string(),
+            JobStatus::failed("AddWorker", "http://w:8000", "boom".to_string()),
+        );
+        assert!(JobQueue::claim(&map, "http://w:8000", "AddWorker"));
+
+        // A different job type under the same key is not a competing claim.
+        map.insert(
+            "http://w:8000".to_string(),
+            JobStatus::pending("RegisterMcpServer", "http://w:8000"),
+        );
+        assert!(JobQueue::claim(&map, "http://w:8000", "AddWorker"));
+    }
+
+    /// A submission that fails must not leave its claim behind, or the next
+    /// create for the URL would be told a job is in flight when none is (#1533).
+    #[tokio::test]
+    async fn failed_submit_if_idle_releases_its_claim() {
+        let queue = JobQueue::new(JobQueueConfig::default(), Weak::new());
+        let job = || Job::AddWorker {
+            config: Box::new(WorkerSpec::new("http://w:8000")),
+            registration_mode: WorkerRegistrationMode::CreateOnly,
+        };
+        assert!(queue.submit_if_idle(job()).await.is_err());
+        // Before the rollback this returned Ok(false): a 202 with no job behind it.
+        assert!(queue.submit_if_idle(job()).await.is_err());
     }
 
     /// The queue channel and dispatch semaphore are sized from the config,

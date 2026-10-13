@@ -50,7 +50,7 @@ async fn create_test_context_with_wasm() -> Arc<AppContext> {
     let wasm_manager = Arc::new(WasmModuleManager::with_default_config());
 
     // Create AppContext with wasm_manager from the start
-    let client = reqwest::Client::new();
+    let client = smg::http_client::client();
 
     let tokenizer_registry = Arc::new(TokenizerRegistry::new());
     let worker_registry = Arc::new(WorkerRegistry::new());
@@ -194,7 +194,7 @@ async fn create_test_app_with_wasm() -> (axum::Router, Arc<AppContext>, TempDir)
         probe_state: ProbeState::new(app_context.inflight_tracker.clone()),
         context: app_context.clone(),
         admission_queue: None,
-        router_manager: None,
+        gateway: None,
         mesh_handler: None,
         mesh_adapters: None,
     });

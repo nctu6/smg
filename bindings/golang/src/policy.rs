@@ -32,7 +32,7 @@ use smg::{
         circuit_breaker::{CircuitBreaker, CircuitState},
         resilience::ResolvedResilience,
         worker::{RuntimeType, WorkerMetadata, WorkerRoutingKeyLoad},
-        ConnectionMode, OverloadThresholds, Worker, WorkerResult, WorkerType,
+        ConnectionMode, OverloadThresholds, PdPairing, Worker, WorkerResult, WorkerType,
     },
 };
 use smg_grpc_client::sglang_scheduler::{SglangGenerateRequestOptions, SglangSchedulerClient};
@@ -71,6 +71,7 @@ impl GrpcWorker {
         spec.runtime_type = RuntimeType::Sglang;
 
         let metadata = WorkerMetadata {
+            pd_pairing: PdPairing::derive(&spec),
             spec: Arc::new(spec),
             health_config: HealthCheckConfig::default(),
             health_endpoint: "/health".to_string(),
@@ -87,7 +88,7 @@ impl GrpcWorker {
             circuit_breaker: CircuitBreaker::new(),
             metadata,
             api_key: None,
-            http_client: Arc::new(reqwest::Client::new()),
+            http_client: Arc::new(smg::http_client::client()),
             resilience: ResolvedResilience::default(),
         }
     }
@@ -169,6 +170,14 @@ impl Worker for GrpcWorker {
 
     fn increment_load(&self) {
         self.load.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn try_increment_load(&self, max: usize) -> bool {
+        self.load
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1).filter(|next| *next <= max)
+            })
+            .is_ok()
     }
 
     fn decrement_load(&self) {
@@ -290,6 +299,9 @@ pub unsafe extern "C" fn sgl_multi_client_create(
     policy_name: *const c_char,
     error_out: *mut *mut c_char,
 ) -> *mut MultiWorkerClientHandle {
+    // The workers' HTTP clients use the process-level TLS provider the
+    // gateway binary installs at start-up; this library has no start-up.
+    smg::tls::install_crypto_provider();
     if endpoints.is_null() || tokenizer_path.is_null() || policy_name.is_null() {
         set_error_message(error_out, "Invalid arguments: null pointer");
         return ptr::null_mut();
@@ -609,7 +621,9 @@ pub unsafe extern "C" fn sgl_multi_client_chat_completion_stream(
         chat_request.tools.as_ref(),
         chat_request.tool_choice.as_ref(),
     ) {
-        match registry.generate_tool_constraint(None, tools, tool_choice) {
+        // No parser is configured here, so the registry falls back to a JSON
+        // schema, which carries no reasoning prefix.
+        match registry.generate_tool_constraint(None, tools, tool_choice, false) {
             Ok(Some(c)) => Some(c.to_tuple()),
             Ok(None) => None,
             Err(e) => {

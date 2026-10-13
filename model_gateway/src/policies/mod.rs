@@ -1,4 +1,4 @@
-//! Load balancing policies for SGLang router
+//! Load balancing policies for the router
 //!
 //! This module provides a unified abstraction for routing policies that work
 //! across both regular and prefill-decode (PD) routing modes.
@@ -14,7 +14,9 @@ use crate::{
 
 mod bucket;
 mod cache_aware;
+mod cache_namespace;
 mod consistent_hashing;
+pub mod cost;
 mod dp_min_token;
 mod factory;
 mod least_load;
@@ -29,6 +31,7 @@ pub(crate) mod utils;
 
 pub use bucket::BucketPolicy;
 pub use cache_aware::{CacheAwarePolicy, TreeHandle, TreeKind};
+pub use cache_namespace::{CacheNamespace, TEXT_MARKER_LEN, TOKEN_MARKER_LEN};
 pub use consistent_hashing::ConsistentHashingPolicy;
 pub use dp_min_token::MinimumTokensPolicy;
 pub use factory::PolicyFactory;
@@ -97,6 +100,19 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         // Default: no-op for policies that don't cache per-worker state
     }
 
+    /// Reconcile the state this policy booked on `worker_url` against the
+    /// router's live count of requests in flight there.
+    ///
+    /// Every request end reaches [`Self::on_request_complete`] through the
+    /// worker's load guard; this is the safety net behind it. The worker
+    /// monitor calls it once per load poll with the requests the router still
+    /// holds on the worker. A dispatch books once and a completion releases
+    /// once, so whatever a policy holds beyond `in_flight` is a completion
+    /// that never arrived (a worker that moved under another policy, a sink
+    /// never installed) and is released here rather than kept for good.
+    /// Default: no-op for policies that book nothing.
+    fn reconcile_in_flight(&self, _worker_url: &str, _in_flight: usize) {}
+
     /// Reset any internal state
     ///
     /// This is useful for policies that maintain state (e.g., round-robin counters).
@@ -134,7 +150,11 @@ pub struct CacheAwareConfig {
     /// mean by this many requests AND by `balance_rel_threshold`. Requiring
     /// both keeps the gate quiet on steady-state variance at low means
     /// (absolute) without going blind to a deep queue at high means
-    /// (relative).
+    /// (relative). The margin is capped at the in-flight count's natural
+    /// swing at the pool's current mean (two standard deviations, never
+    /// under four requests unless this value is lower), so a pool whose
+    /// per-worker in-flight count
+    /// stays below this value can still spill.
     pub balance_abs_threshold: usize,
     /// Relative load margin (multiple of the healthy-fleet mean) for the
     /// per-request candidate gate; fires only together with
@@ -144,7 +164,7 @@ pub struct CacheAwareConfig {
     pub max_tree_size: usize,
     /// Backend KV cache block size (tokens per block) for event-driven routing.
     /// Used by `compute_request_content_hashes` to chunk request tokens into blocks.
-    /// Must match the backend's block size. Default: 16 (SGLang page size).
+    /// Must match the backend's block size. Default: 16 (one engine's page size).
     pub block_size: usize,
     /// KV-usage **spread** (hottest minus coldest backend, 0.0–1.0) above which
     /// the pool is treated as imbalanced and cache affinity is abandoned for
@@ -185,6 +205,14 @@ pub struct CacheAwareConfig {
     /// Ascending token positions at which serving engines retain reusable
     /// prefix state; the hash index keys request heads at these boundaries.
     pub cache_boundaries: Vec<usize>,
+    /// Worker selection policy run over the gathered per-worker inputs, by
+    /// name from [`cost::POLICY_NAMES`]. `None` is [`cost::DEFAULT_POLICY`],
+    /// the affinity-group decision this policy has always made.
+    pub selection_policy: Option<String>,
+    /// Lifetime of optimistic dispatch bookings (predicted prefill and prefix
+    /// placement charged to the chosen worker before the engine reports it).
+    /// `0` disables (default); set a little above the engine's event lag.
+    pub selection_accounting_ttl_ms: u64,
 }
 
 impl Default for CacheAwareConfig {
@@ -207,6 +235,8 @@ impl Default for CacheAwareConfig {
             cache_index: CacheIndexKind::Tree,
             cache_ttl_secs: 180,
             cache_boundaries: Vec::new(),
+            selection_policy: None,
+            selection_accounting_ttl_ms: 0,
         }
     }
 }
@@ -297,9 +327,13 @@ pub struct SelectWorkerInfo<'a> {
     /// consistent_hashing and prefix_hash prefer it over their other keying
     /// input.
     pub routing_key: Option<&'a str>,
+    /// The request's cache partition (cache salt / extra key / LoRA), when
+    /// set. Cache-aware routing keys its affinity under it so requests the
+    /// engine cannot serve from the same cache never match each other.
+    pub cache_namespace: Option<CacheNamespace>,
     /// Session key derived from the request body's `rid` (routers with typed
-    /// body access populate it); consumed by the routing-key override when
-    /// its key source includes rid.
+    /// body access populate it); used when no valid routing-key header is
+    /// present under the routing-key override.
     pub rid_key: Option<&'a str>,
     /// Pre-computed hash ring for O(log n) consistent hashing
     /// Built and cached by WorkerRegistry, passed through to avoid per-request rebuilds

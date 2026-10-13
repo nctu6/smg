@@ -3,13 +3,17 @@
 //! This module provides Rust types for the Anthropic Messages API.
 //! See: https://docs.anthropic.com/en/api/messages
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use validator::Validate;
 
-use crate::{common::GenerationRequest, validated::Normalizable};
+use crate::{
+    common::{CachePartition, GenerationRequest},
+    model_card::ModelCard,
+    validated::Normalizable,
+};
 
 // ============================================================================
 // Request Types
@@ -30,8 +34,9 @@ pub struct CreateMessageRequest {
     #[validate(length(min = 1, message = "messages array is required and cannot be empty"))]
     pub messages: Vec<InputMessage>,
 
-    /// The maximum number of tokens to generate before stopping.
-    #[validate(range(min = 1, message = "max_tokens must be greater than 0"))]
+    /// The maximum number of tokens to generate before stopping. `0` is
+    /// accepted as the public API accepts it: the answer is an empty message
+    /// that reports the prompt's token count and generates nothing.
     pub max_tokens: u32,
 
     /// An object describing metadata about the request.
@@ -74,7 +79,7 @@ pub struct CreateMessageRequest {
     /// MCP servers to be utilized in this request (beta).
     pub mcp_servers: Option<Vec<McpServerConfig>>,
 
-    /// Request ID forwarded to the backend for log correlation (SGLang extension)
+    /// Request ID forwarded to the backend for log correlation (an engine extension)
     pub rid: Option<String>,
 
     /// Additional fields not explicitly defined above (e.g. beta features like
@@ -114,6 +119,16 @@ impl CreateMessageRequest {
 }
 
 impl GenerationRequest for CreateMessageRequest {
+    fn cache_partition(&self) -> CachePartition<'_> {
+        CachePartition {
+            // Engine extensions in the passthrough map, forwarded to the
+            // backend as-is.
+            cache_salt: self.other.get("cache_salt").and_then(Value::as_str),
+            extra_key: self.other.get("extra_key").and_then(Value::as_str),
+            lora_path: self.other.get("lora_path").and_then(Value::as_str),
+        }
+    }
+
     fn rid(&self) -> Option<&str> {
         self.rid.as_deref()
     }
@@ -127,47 +142,52 @@ impl GenerationRequest for CreateMessageRequest {
     }
 
     fn extract_text_for_routing(&self) -> String {
-        let mut buffer = String::new();
-        let mut has_content = false;
+        routing_text(self.system.as_ref(), &self.messages)
+    }
+}
 
-        let push = |s: &str, has_content: &mut bool, buffer: &mut String| {
-            if s.is_empty() {
-                return;
-            }
-            if *has_content {
-                buffer.push(' ');
-            }
-            buffer.push_str(s);
-            *has_content = true;
-        };
+/// The system and message text a Messages request routes on.
+fn routing_text(system: Option<&SystemContent>, messages: &[InputMessage]) -> String {
+    let mut buffer = String::new();
+    let mut has_content = false;
 
-        if let Some(system) = &self.system {
-            match system {
-                SystemContent::String(s) => push(s, &mut has_content, &mut buffer),
-                SystemContent::Blocks(blocks) => {
-                    for block in blocks {
-                        let SystemContentBlock::Text(text_block) = block;
+    let push = |s: &str, has_content: &mut bool, buffer: &mut String| {
+        if s.is_empty() {
+            return;
+        }
+        if *has_content {
+            buffer.push(' ');
+        }
+        buffer.push_str(s);
+        *has_content = true;
+    };
+
+    if let Some(system) = system {
+        match system {
+            SystemContent::String(s) => push(s, &mut has_content, &mut buffer),
+            SystemContent::Blocks(blocks) => {
+                for block in blocks {
+                    let SystemContentBlock::Text(text_block) = block;
+                    push(&text_block.text, &mut has_content, &mut buffer);
+                }
+            }
+        }
+    }
+
+    for msg in messages {
+        match &msg.content {
+            InputContent::String(s) => push(s, &mut has_content, &mut buffer),
+            InputContent::Blocks(blocks) => {
+                for block in blocks {
+                    if let InputContentBlock::Text(text_block) = block {
                         push(&text_block.text, &mut has_content, &mut buffer);
                     }
                 }
             }
         }
-
-        for msg in &self.messages {
-            match &msg.content {
-                InputContent::String(s) => push(s, &mut has_content, &mut buffer),
-                InputContent::Blocks(blocks) => {
-                    for block in blocks {
-                        if let InputContentBlock::Text(text_block) = block {
-                            push(&text_block.text, &mut has_content, &mut buffer);
-                        }
-                    }
-                }
-            }
-        }
-
-        buffer
     }
+
+    buffer
 }
 
 impl Tool {
@@ -197,6 +217,8 @@ impl Tool {
 }
 /// Validate cross-field constraints for Messages API requests.
 fn validate_message_request(req: &CreateMessageRequest) -> Result<(), validator::ValidationError> {
+    crate::messages_validation::validate(req)?;
+
     if req.has_mcp_toolset() && req.mcp_server_configs().is_none() {
         let mut e = validator::ValidationError::new("mcp_servers_required");
         e.message = Some("mcp_servers is required when mcp_toolset tools are present".into());
@@ -270,8 +292,10 @@ pub enum SystemContentBlock {
     Text(TextBlock),
 }
 
-/// A single input message in a conversation
+/// A single input message in a conversation: a role and content, nothing
+/// else (the public API refuses any other field).
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct InputMessage {
     /// The role of the message sender (user or assistant)
     pub role: Role,
@@ -701,6 +725,11 @@ pub struct CustomTool {
 
     /// Cache control for this tool
     pub cache_control: Option<CacheControl>,
+
+    /// The public API's further tool fields (`strict`, `input_examples`, ...),
+    /// forwarded as written; validation refuses any other field.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 /// JSON Schema for tool input
@@ -871,8 +900,16 @@ pub struct Message {
     /// Which custom stop sequence was generated (if any)
     pub stop_sequence: Option<String>,
 
+    /// Details of the stop when the stop reason carries any; null otherwise
+    /// (the public API always writes the key).
+    pub stop_details: Option<Value>,
+
     /// Billing and rate-limit usage
     pub usage: Usage,
+
+    /// The code-execution container of the turn when one ran; null otherwise
+    /// (the public API always writes the key).
+    pub container: Option<Value>,
 }
 
 /// Output content block types
@@ -890,6 +927,10 @@ pub enum ContentBlock {
         id: String,
         name: String,
         input: Value,
+        /// Who issued the call, as the public API reports it on every
+        /// `tool_use` block (the model itself for a call the gateway builds).
+        #[serde(default)]
+        caller: ToolUseCaller,
     },
     /// Thinking content
     Thinking { thinking: String, signature: String },
@@ -932,6 +973,24 @@ pub enum ContentBlock {
     },
 }
 
+/// The caller of a `tool_use` block, as the public API reports it: the model
+/// itself (`{"type": "direct"}`) or a server tool that issued the call.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ToolUseCaller {
+    /// The model issued the call.
+    #[default]
+    Direct,
+    /// A code-execution server tool issued the call.
+    #[serde(rename = "code_execution_20250825")]
+    CodeExecution20250825 { tool_id: String },
+    /// A caller kind this build does not know, kept as the upstream sent it:
+    /// a `tool_use` block of an upstream answer must parse whatever caller the
+    /// public API adds later, and leave with the same object.
+    #[serde(untagged)]
+    Other(Value),
+}
+
 /// Stop reasons
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -950,7 +1009,13 @@ pub enum StopReason {
     Refusal,
 }
 
-/// Billing and rate-limit usage
+/// Billing and rate-limit usage.
+///
+/// The public API writes the cache counters, the cache-creation breakdown,
+/// the service tier and the inference geography on every message (zero,
+/// "standard" and "not_available" when nothing else applies), so those keys
+/// are always serialized; `output_tokens_details` comes with thinking and
+/// `server_tool_use` with a server tool, as the public API sends them.
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[schemars(rename = "MessagesUsage")]
@@ -962,27 +1027,81 @@ pub struct Usage {
     pub output_tokens: u32,
 
     /// The number of input tokens used to create the cache entry
+    #[serialize_always]
     pub cache_creation_input_tokens: Option<u32>,
 
     /// The number of input tokens read from the cache
+    #[serialize_always]
     pub cache_read_input_tokens: Option<u32>,
 
     /// Breakdown of cached tokens by TTL
+    #[serialize_always]
     pub cache_creation: Option<CacheCreation>,
 
     /// Server tool usage information
     pub server_tool_use: Option<ServerToolUsage>,
 
     /// Service tier used for the request
+    #[serialize_always]
     pub service_tier: Option<String>,
+
+    /// Where the request was served (`not_available` when the deployment
+    /// does not say)
+    #[serialize_always]
+    pub inference_geo: Option<String>,
+
+    /// Breakdown of the output tokens, present when thinking ran
+    pub output_tokens_details: Option<OutputTokensDetails>,
 }
 
-/// Cache creation breakdown
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+/// Cache creation breakdown by cache lifetime
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CacheCreation {
-    #[serde(flatten)]
-    pub tokens_by_ttl: HashMap<String, u32>,
+    /// Input tokens written to the five-minute cache
+    #[serde(default)]
+    pub ephemeral_5m_input_tokens: u32,
+
+    /// Input tokens written to the one-hour cache
+    #[serde(default)]
+    pub ephemeral_1h_input_tokens: u32,
 }
+
+/// Breakdown of the output tokens
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct OutputTokensDetails {
+    /// Output tokens spent on thinking
+    pub thinking_tokens: u32,
+}
+
+impl Usage {
+    /// The usage of a message served from a deployment of this gateway:
+    /// the counts, no cache hits, the standard tier, no geography.
+    pub fn from_counts(input_tokens: u32, output_tokens: u32) -> Self {
+        Self {
+            input_tokens,
+            output_tokens,
+            cache_creation_input_tokens: Some(0),
+            cache_read_input_tokens: Some(0),
+            cache_creation: Some(CacheCreation::default()),
+            server_tool_use: None,
+            service_tier: Some(SERVICE_TIER_STANDARD.to_owned()),
+            inference_geo: Some(INFERENCE_GEO_NOT_AVAILABLE.to_owned()),
+            output_tokens_details: None,
+        }
+    }
+
+    /// Report the thinking tokens of a turn that ran with thinking.
+    pub fn with_thinking_tokens(mut self, thinking_tokens: u32) -> Self {
+        self.output_tokens_details = Some(OutputTokensDetails { thinking_tokens });
+        self
+    }
+}
+
+/// The service tier of a message nobody prioritized or batched.
+pub const SERVICE_TIER_STANDARD: &str = "standard";
+
+/// The inference geography of a deployment that reports none.
+pub const INFERENCE_GEO_NOT_AVAILABLE: &str = "not_available";
 
 /// Server tool usage information
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -1025,28 +1144,41 @@ pub enum MessageStreamEvent {
     Error { error: ErrorResponse },
 }
 
-/// Message delta for streaming updates
-#[serde_with::skip_serializing_none]
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+/// Message delta for streaming updates: the public API writes all four
+/// keys on the final `message_delta`, null where nothing applies.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MessageDelta {
     pub stop_reason: Option<StopReason>,
 
     pub stop_sequence: Option<String>,
+
+    #[serde(default)]
+    pub stop_details: Option<Value>,
+
+    #[serde(default)]
+    pub container: Option<Value>,
 }
 
-/// Usage delta for streaming updates
+/// Usage delta for streaming updates. The token counts are always written
+/// (`input_tokens` null until the engine's count is known), `output_tokens_details`
+/// comes with thinking and `server_tool_use` with a server tool.
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct MessageDeltaUsage {
     pub output_tokens: u32,
 
+    #[serialize_always]
     pub input_tokens: Option<u32>,
 
+    #[serialize_always]
     pub cache_creation_input_tokens: Option<u32>,
 
+    #[serialize_always]
     pub cache_read_input_tokens: Option<u32>,
 
     pub server_tool_use: Option<ServerToolUsage>,
+
+    pub output_tokens_details: Option<OutputTokensDetails>,
 }
 
 /// Content block delta for streaming updates
@@ -1083,6 +1215,31 @@ pub struct ErrorResponse {
     pub message: String,
 }
 
+/// The body of an error on the Messages API:
+/// `{"type": "error", "error": {"type", "message"}, "request_id": "..."}`.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[schemars(rename = "MessagesErrorEnvelope")]
+pub struct ErrorEnvelope {
+    /// Always `"error"`.
+    #[serde(rename = "type")]
+    pub envelope_type: String,
+
+    pub error: ErrorResponse,
+
+    /// The id of the request the error answers (also the `x-request-id` header).
+    pub request_id: String,
+}
+
+impl ErrorEnvelope {
+    pub fn new(error: ErrorResponse, request_id: impl Into<String>) -> Self {
+        Self {
+            envelope_type: "error".to_string(),
+            error,
+            request_id: request_id.into(),
+        }
+    }
+}
+
 /// API error types
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -1108,12 +1265,14 @@ pub enum ApiError {
 
 /// Request to count tokens in a message
 #[serde_with::skip_serializing_none]
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, Validate, schemars::JsonSchema)]
 pub struct CountMessageTokensRequest {
     /// The model to use for token counting
+    #[validate(length(min = 1, message = "model field is required and cannot be empty"))]
     pub model: String,
 
     /// Input messages
+    #[validate(length(min = 1, message = "at least one message is required"))]
     pub messages: Vec<InputMessage>,
 
     /// System prompt
@@ -1127,6 +1286,28 @@ pub struct CountMessageTokensRequest {
 
     /// Tool definitions
     pub tools: Option<Vec<Tool>>,
+
+    /// Additional backend-specific token counting options.
+    #[serde(flatten)]
+    pub other: Map<String, Value>,
+}
+
+impl Normalizable for CountMessageTokensRequest {
+    // Use default no-op implementation
+}
+
+impl GenerationRequest for CountMessageTokensRequest {
+    fn is_stream(&self) -> bool {
+        false
+    }
+
+    fn get_model(&self) -> Option<&str> {
+        Some(&self.model)
+    }
+
+    fn extract_text_for_routing(&self) -> String {
+        routing_text(self.system.as_ref(), &self.messages)
+    }
 }
 
 /// Response from token counting
@@ -1156,6 +1337,24 @@ pub struct ModelInfo {
     pub created_at: String,
 }
 
+impl ModelInfo {
+    /// The entry a self-hosted model card makes in the Anthropic-shaped
+    /// inventory. The display name falls back to the id; a card carries no
+    /// creation time, so `created_at` is the epoch, the counterpart of the
+    /// OpenAI-shaped list's `created: 0`.
+    pub fn from_model_card(card: &ModelCard) -> Self {
+        Self {
+            model_type: "model".to_owned(),
+            id: card.id.clone(),
+            display_name: card.display_name.clone().unwrap_or_else(|| card.id.clone()),
+            created_at: UNKNOWN_CREATED_AT.to_owned(),
+        }
+    }
+}
+
+/// `created_at` of a model whose creation time nobody recorded.
+const UNKNOWN_CREATED_AT: &str = "1970-01-01T00:00:00Z";
+
 /// List of models response
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ListModelsResponse {
@@ -1163,6 +1362,25 @@ pub struct ListModelsResponse {
     pub has_more: bool,
     pub first_id: Option<String>,
     pub last_id: Option<String>,
+}
+
+impl ListModelsResponse {
+    /// The whole inventory in one page, deduplicated by model id (the first
+    /// card of an id wins), with the page markers the public list carries.
+    pub fn from_model_cards(cards: impl IntoIterator<Item = ModelCard>) -> Self {
+        let mut seen = HashSet::new();
+        let data: Vec<ModelInfo> = cards
+            .into_iter()
+            .filter(|card| seen.insert(card.id.clone()))
+            .map(|card| ModelInfo::from_model_card(&card))
+            .collect();
+        Self {
+            first_id: data.first().map(|m| m.id.clone()),
+            last_id: data.last().map(|m| m.id.clone()),
+            has_more: false,
+            data,
+        }
+    }
 }
 
 // ============================================================================
@@ -1923,6 +2141,54 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tool_use_block_carries_the_caller_the_public_api_reports() {
+        // A block built without a caller (every engine-issued call) leaves
+        // with the model as its caller, as the public API's blocks do.
+        let block: ContentBlock = serde_json::from_value(json!({
+            "type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {"q": "x"}
+        }))
+        .expect("a block without a caller still parses");
+        let value = serde_json::to_value(&block).expect("serialize");
+        assert_eq!(value["caller"], json!({"type": "direct"}), "{value}");
+        assert_eq!(value["input"], json!({"q": "x"}));
+
+        // A caller an upstream reported is kept as it came.
+        let block: ContentBlock = serde_json::from_value(json!({
+            "type": "tool_use", "id": "toolu_2", "name": "lookup", "input": {},
+            "caller": {"type": "code_execution_20250825", "tool_id": "srvtoolu_1"}
+        }))
+        .expect("parse");
+        assert!(matches!(
+            &block,
+            ContentBlock::ToolUse { caller: ToolUseCaller::CodeExecution20250825 { tool_id }, .. }
+                if tool_id == "srvtoolu_1"
+        ));
+        let value = serde_json::to_value(&block).expect("serialize");
+        assert_eq!(value["caller"]["type"], "code_execution_20250825");
+    }
+
+    /// A caller kind this build does not know (one the public API adds later)
+    /// must not fail the parse of an upstream answer: it is kept as sent.
+    #[test]
+    fn an_unknown_caller_kind_of_an_upstream_block_is_kept_as_sent() {
+        let caller =
+            json!({"type": "some_future_tool_20270101", "tool_id": "srvtoolu_9", "extra": 1});
+        let block: ContentBlock = serde_json::from_value(json!({
+            "type": "tool_use", "id": "toolu_3", "name": "lookup", "input": {}, "caller": caller
+        }))
+        .expect("an unknown caller kind still parses");
+        assert!(matches!(
+            &block,
+            ContentBlock::ToolUse {
+                caller: ToolUseCaller::Other(_),
+                ..
+            }
+        ));
+        let value = serde_json::to_value(&block).expect("serialize");
+        assert_eq!(value["caller"], caller, "{value}");
+    }
+
+    #[test]
     fn test_system_blocks_preserve_type_field() {
         let input = json!({
             "model": "test",
@@ -2042,6 +2308,7 @@ mod tests {
             },
             defer_loading: None,
             cache_control: None,
+            extra: Map::new(),
         })
     }
 
@@ -2462,5 +2729,81 @@ mod tests {
         assert_eq!(req.messages.len(), 2);
         assert_eq!(req.messages[0].role, Role::User);
         assert_eq!(req.messages[1].role, Role::System); // preserved in place
+    }
+
+    #[test]
+    fn cache_partition_reads_passthrough_fields() {
+        use crate::common::GenerationRequest;
+
+        let request: CreateMessageRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hi"}],
+            "cache_salt": "tenant-a"
+        }))
+        .unwrap();
+        let partition = request.cache_partition();
+        assert_eq!(partition.cache_salt, Some("tenant-a"));
+        assert!(partition.extra_key.is_none());
+        assert!(partition.lora_path.is_none());
+    }
+
+    #[test]
+    fn max_tokens_zero_validates_as_the_public_api_accepts_it() {
+        let zero: CreateMessageRequest = serde_json::from_value(json!({
+            "model": "m",
+            "max_tokens": 0,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+        assert!(zero.validate().is_ok());
+    }
+
+    #[test]
+    fn count_tokens_request_is_validated_like_a_message_request() {
+        let empty: CountMessageTokensRequest =
+            serde_json::from_value(json!({"model": "m", "messages": []})).unwrap();
+        let err = empty.validate().unwrap_err().to_string();
+        assert!(err.contains("at least one message"), "{err}");
+
+        let ok: CountMessageTokensRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+        assert!(ok.validate().is_ok());
+    }
+
+    #[test]
+    fn anthropic_model_list_is_built_from_model_cards() {
+        let mut named = ModelCard::new("m1");
+        named.display_name = Some("Model One".to_owned());
+        let list = ListModelsResponse::from_model_cards(vec![
+            named,
+            ModelCard::new("m2"),
+            ModelCard::new("m1"),
+        ]);
+        let v = serde_json::to_value(&list).unwrap();
+        assert_eq!(v["has_more"], false);
+        assert_eq!(v["first_id"], "m1");
+        assert_eq!(v["last_id"], "m2");
+        assert_eq!(
+            v["data"].as_array().unwrap().len(),
+            2,
+            "duplicates collapse"
+        );
+        assert_eq!(
+            v["data"][0],
+            json!({
+                "type": "model",
+                "id": "m1",
+                "display_name": "Model One",
+                "created_at": "1970-01-01T00:00:00Z"
+            })
+        );
+        assert_eq!(
+            v["data"][1]["display_name"], "m2",
+            "the id stands in for a missing name"
+        );
     }
 }

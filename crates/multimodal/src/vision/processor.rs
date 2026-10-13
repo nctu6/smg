@@ -69,6 +69,23 @@ impl PreprocessedEncoderInputs {
 /// Each vision model (LLaVA, Qwen-VL, Phi3-Vision, etc.) implements this trait
 /// to provide the correct preprocessing pipeline.
 pub trait VisionPreProcessor: Send + Sync {
+    /// Whether preprocessing individual images and concatenating their outputs
+    /// is equivalent to preprocessing the whole batch, including metadata.
+    ///
+    /// Opt in only when resize, padding and normalization are independent of
+    /// other images. An output field layout alone does not guarantee this.
+    fn supports_per_image_preprocessing(&self) -> bool {
+        false
+    }
+
+    /// Whether this processor produces the image's own bytes
+    /// ([`EncoderInput::U8`](crate::encoder_inputs::EncoderInput::U8)), so
+    /// a destination that normalizes on device can be served raw pixels
+    /// exactly; `false` means it produces normalized floats.
+    fn emits_pixel_bytes(&self) -> bool {
+        false
+    }
+
     /// Default normalization mean for this model family.
     fn default_mean(&self) -> [f64; 3];
 
@@ -156,7 +173,10 @@ impl VisionProcessorRegistry {
 
     /// Register a processor for a model pattern.
     pub fn register(&mut self, pattern: impl Into<String>, processor: Box<dyn VisionPreProcessor>) {
-        self.processors.insert(pattern.into(), processor);
+        // Matching is case-insensitive on both sides; lowercase the pattern
+        // once here rather than every pattern on every lookup.
+        self.processors
+            .insert(pattern.into().to_lowercase(), processor);
     }
 
     /// Find a processor for the given model ID, falling back to model_type.
@@ -173,12 +193,10 @@ impl VisionProcessorRegistry {
 
     fn find_in_candidate(&self, candidate: &str) -> Option<&dyn VisionPreProcessor> {
         let candidate = candidate.to_lowercase();
-        for (pattern, processor) in &self.processors {
-            if candidate.contains(&pattern.to_lowercase()) {
-                return Some(processor.as_ref());
-            }
-        }
-        None
+        self.processors
+            .iter()
+            .find(|(pattern, _)| candidate.contains(pattern.as_str()))
+            .map(|(_, processor)| processor.as_ref())
     }
 
     /// Get list of supported model patterns.
@@ -197,6 +215,8 @@ impl VisionProcessorRegistry {
     /// Create a registry with all built-in processors registered.
     ///
     /// Currently registers:
+    /// - `deepseek_v41` / `deepseek-v4.1` -> DeepseekV41Processor (gray-padded contain fit)
+    /// - `gemma4` / `gemma-4` -> Gemma4Processor (block-aligned resize, padded patches)
     /// - `glm-5.3-flash` / `glm5_next` -> Glm53FlashProcessor
     /// - `llava-next` -> LlavaNextProcessor
     /// - `llava-1.5` / `llava-v1.5` -> LlavaProcessor
@@ -208,6 +228,21 @@ impl VisionProcessorRegistry {
     /// - `phi-3-vision` -> Phi3VisionProcessor (HD transform with 336x336 tiles)
     pub fn with_defaults() -> Self {
         let mut registry = Self::new();
+
+        // DeepSeek-V4.1 vision variant (patch=14, 3x3 aligner downsample,
+        // gray-padded contain fit); registered under the HF model_type and
+        // the marketing id.
+        for pattern in ["deepseek_v41", "deepseek-v4.1"] {
+            registry.register(
+                pattern,
+                Box::new(super::processors::DeepseekV41Processor::new()),
+            );
+        }
+
+        // Gemma 4 (the HF model_type and the released ids' spelling).
+        for pattern in ["gemma4", "gemma-4"] {
+            registry.register(pattern, Box::new(super::processors::Gemma4Processor::new()));
+        }
 
         for pattern in [
             "glm-5.3-flash",
@@ -447,6 +482,23 @@ mod tests {
                 .expect("GLM-5.3-Flash processor");
             assert_eq!(processor.model_name(), "glm-5.3-flash");
         }
+    }
+
+    #[test]
+    fn test_registry_finds_gemma4_by_id_and_model_type() {
+        let registry = VisionProcessorRegistry::with_defaults();
+        for (model_id, model_type) in [
+            ("google/gemma-4-26B-A4B-it", None),
+            ("/models/local-checkpoint", Some("gemma4")),
+        ] {
+            let processor = registry
+                .find(model_id, model_type)
+                .expect("Gemma 4 vision processor");
+            assert_eq!(processor.model_name(), "gemma4", "{model_id}");
+        }
+        assert!(registry
+            .find("/models/local-checkpoint", Some("gemma3"))
+            .is_none());
     }
 
     #[test]

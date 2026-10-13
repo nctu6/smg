@@ -8,22 +8,17 @@ Implements the VllmEngine gRPC service on top of vLLM's EngineClient.
 import asyncio
 import hashlib
 import itertools
-import json
 import time
-from collections.abc import AsyncGenerator, AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 
 import grpc
-import msgspec
 import torch
-import zmq
-import zmq.asyncio
 from smg_grpc_proto import vllm_engine_pb2, vllm_engine_pb2_grpc
 from smg_grpc_proto.generated import common_pb2
 from transformers import BatchFeature
 from vllm import PoolingParams, SamplingParams, TokensPrompt
-from vllm.distributed.kv_events import KVEventBatch
 from vllm.engine.protocol import EngineClient
 from vllm.inputs.engine import MultiModalInput as VllmMultiModalInput
 from vllm.inputs.engine import mm_input, tokens_input
@@ -37,57 +32,109 @@ from vllm.multimodal.inputs import (
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import RequestOutputKind, StructuredOutputsParams
 
-from smg_grpc_servicer import mm_shm
+from smg_grpc_servicer.kv_relay import Engine, relay
 from smg_grpc_servicer.tokenizer_bundle import CHUNK_SIZE, build_tokenizer_zip
+from smg_grpc_servicer.trace_context import trace_headers
+from smg_grpc_servicer.vllm import attach_vllm_logging
+from smg_grpc_servicer.vllm.admin import flush_cache
+from smg_grpc_servicer.vllm.errors import grpc_code_for
 from smg_grpc_servicer.vllm.kv_events import (
-    endpoint_for_rank,
+    rank_sources_for,
     resolve_kv_events_config,
-    stream_kv_events,
 )
-from smg_grpc_servicer.vllm.kv_transfer import params_from_request, params_to_response_fields
-from smg_grpc_servicer.vllm.mm_salt import has_preprocessed_mm_payload, mm_identity_cache_salt
+from smg_grpc_servicer.vllm.kv_transfer import (
+    params_from_request,
+    params_to_response_fields,
+)
+
+# The launcher imports this module before it defines serve_grpc: the moment
+# the servicer switch has to be in place (see launcher_switch).
+from smg_grpc_servicer.vllm.launcher_switch import install_launcher_switch
+from smg_grpc_servicer.vllm.loads import LoadTracker, load_record, scheduler_load_fields
+from smg_grpc_servicer.vllm.media_identity import build_media_identity, media_identity_supported
+from smg_grpc_servicer.vllm.media_refs import parse_media_refs, validate_schemes
+from smg_grpc_servicer.vllm.mm_processor import (
+    ENV_PROCESSOR,
+    PROCESSOR_FLAG,
+    MmProcessorUnavailable,
+    MmSettings,
+    build_mm_processor,
+    launcher_settings,
+)
+from smg_grpc_servicer.vllm.mm_salt import (
+    engine_accepts_mm_inputs,
+    has_preprocessed_mm_payload,
+    mm_identity_cache_salt,
+)
+from smg_grpc_servicer.vllm.mm_tensors import tensor_from_proto
+from smg_grpc_servicer.vllm.model_info import (
+    engine_reasoning_parser,
+    mm_device_do_normalize,
+    mm_item_limits,
+    model_facts,
+    running_window,
+    server_facts,
+    structured_outputs_start,
+)
+
+from .mm_keys import (
+    batches_missing_pixels,
+    describes_media_twice,
+    mm_batches,
+    mm_identity_hashes,
+    modality_key,
+    modality_name,
+    primary_encoder_key,
+)
+
+install_launcher_switch()
 
 logger = init_logger(__name__)
-SAMPLING_DEFAULT_KEYS = (
-    "temperature",
-    "top_p",
-    "top_k",
-    "min_p",
-    "repetition_penalty",
-)
-
-
-def _filtered_sampling_defaults(params: dict | None) -> dict:
-    if not params:
-        return {}
-    return {
-        key: params[key]
-        for key in SAMPLING_DEFAULT_KEYS
-        if key in params and params[key] is not None
-    }
-
-
-# Proto dtype string → torch dtype
-_PROTO_DTYPE_MAP: dict[str, torch.dtype] = {
-    "float32": torch.float32,
-    "int64": torch.int64,
-    "uint32": torch.uint32,
-}
-
-
-def _tensor_from_proto(td: vllm_engine_pb2.TensorData) -> torch.Tensor:
-    """Deserialize a TensorData proto message into a torch.Tensor."""
-    torch_dtype = _PROTO_DTYPE_MAP.get(td.dtype)
-    if torch_dtype is None:
-        raise ValueError(f"Unsupported proto tensor dtype: {td.dtype!r}")
-    payload = mm_shm.tensor_payload_bytes(td)
-    return torch.frombuffer(bytearray(payload), dtype=torch_dtype).reshape(*td.shape)
-
-
+attach_vllm_logging()
 try:
     from vllm.version import __version__ as VLLM_VERSION
 except Exception:  # pragma: no cover - version lookup is best-effort
     VLLM_VERSION = ""
+
+
+def _prompt_length(prompt) -> int:
+    """The token count of an engine prompt (0 when it is text the engine tokenizes)."""
+    if isinstance(prompt, dict):
+        ids = prompt.get("prompt_token_ids")
+        return len(ids) if ids is not None else 0
+    return 0
+
+
+def _kv_capacity_tokens(engine) -> int:
+    """The KV cache's token capacity, when the engine config exposes it."""
+    cache = getattr(getattr(engine, "vllm_config", None), "cache_config", None)
+    blocks = getattr(cache, "num_gpu_blocks", None)
+    block_size = getattr(cache, "block_size", None)
+    if isinstance(blocks, int) and isinstance(block_size, int) and blocks > 0 and block_size > 0:
+        return blocks * block_size
+    return 0
+
+
+def _max_running_requests(engine) -> int:
+    """The scheduler's running window (``max_num_seqs``), when exposed."""
+    return running_window(getattr(engine, "vllm_config", None))
+
+
+def _first_rank(engine) -> int:
+    """The lowest data-parallel rank this servicer serves: the first of the
+    engine client's managed ranks (a slice of all the ranks under external or
+    hybrid load balancing, from ``data_parallel_rank`` on), else that start
+    rank from the config, else 0. ``GetLoads`` reports this rank, and its
+    pushed record is the one that carries the servicer's estimate, as the
+    first entry of the Rust servicer's ``GetLoads`` does."""
+    managed = getattr(getattr(engine, "engine_core", None), "engine_ranks_managed", None)
+    if isinstance(managed, (list, tuple, range)):
+        ranks = [rank for rank in managed if isinstance(rank, int)]
+        if ranks:
+            return min(ranks)
+    parallel = getattr(getattr(engine, "vllm_config", None), "parallel_config", None)
+    start = getattr(parallel, "data_parallel_rank", 0)
+    return start if isinstance(start, int) and start > 0 else 0
 
 
 def _latest_scheduler_stats(engine, engine_idx: int = 0):
@@ -98,7 +145,8 @@ def _latest_scheduler_stats(engine, engine_idx: int = 0):
     reaches into ``engine.logger_manager.stat_loggers`` and returns the freshest
     snapshot, handling the logger-shape variants:
 
-    - ``LoggingStatLogger``                  -> ``.last_scheduler_stats``
+    - ``LoggingStatLogger``                  -> ``.last_scheduler_stats`` (its own
+      engine's, ``engine_index``; another index reads nothing from it)
     - ``AggregatedLoggingStatLogger`` (DP)   -> ``.last_scheduler_stats_dict[idx]``
     - ``PerEngineStatLoggerAdapter``         -> ``.per_engine_stat_loggers[idx]``
     - ``PrometheusStatLogger``               -> skipped (no cached snapshot)
@@ -114,7 +162,7 @@ def _latest_scheduler_stats(engine, engine_idx: int = 0):
         if isinstance(per, dict) and engine_idx in per:
             return per[engine_idx]
         stats = getattr(sl, "last_scheduler_stats", None)
-        if stats is not None:
+        if stats is not None and getattr(sl, "engine_index", 0) == engine_idx:
             return stats
         per_engine = getattr(sl, "per_engine_stat_loggers", None)
         if isinstance(per_engine, dict) and engine_idx in per_engine:
@@ -139,20 +187,111 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
     - GetTokenizer: Stream tokenizer artifacts
     """
 
-    def __init__(self, async_llm: EngineClient, start_time: float):
+    def __init__(
+        self,
+        async_llm: EngineClient,
+        start_time: float,
+        mm_settings: MmSettings | None = None,
+    ):
         """
         Initialize the servicer.
 
         Args:
             async_llm: The EngineClient instance (e.g. AsyncLLM)
             start_time: The server start time, in seconds since epoch
+            mm_settings: The launcher's `--mm-*` flags; None takes the
+                settings the plugin kept from this process's launcher parse
+                (upstream's launcher builds the servicer without its
+                namespace), else an older launcher resolves everything from
+                the environment
         """
+        # The Rust path takes the process before this class exists; reaching
+        # here with the flag set means the launcher never consulted it.
+        from smg_grpc_servicer.vllm.rust import require_python_impl
+
+        require_python_impl()
+        # vLLM 0.31+ configures logging after this module is imported; attach again.
+        attach_vllm_logging()
         self.engine = async_llm
         self.start_time = start_time
         # Resolve KV-event publishing config from the engine. Non-None only when
         # vLLM was started with --kv-events-config enabling the ZMQ publisher.
         self._kv_events_config = resolve_kv_events_config(async_llm)
-        logger.info("VllmEngineServicer initialized")
+        # Queued token-work, generation throughput and hit rate for GetLoads,
+        # from the requests this servicer forwards (vLLM's stats carry none).
+        self._loads = LoadTracker()
+        # Flag > env > default, resolved once so each value names its source.
+        self._mm_settings = (mm_settings or launcher_settings() or MmSettings()).resolve()
+        # Worker-side media processing (media_refs); None keeps refs rejected.
+        self._mm_processor = build_mm_processor(async_llm, settings=self._mm_settings)
+        # One cap over all the multimodal work this servicer runs off the event
+        # loop, whether it fetches the media itself or converts tensors the
+        # router already prepared. Both are sized by the same setting, so a
+        # worker's memory ceiling does not depend on which path a request takes.
+        self._mm_limit = (
+            self._mm_processor.max_inflight
+            if self._mm_processor is not None
+            else self._mm_settings.max_inflight
+        )
+        self._mm_inflight = asyncio.Semaphore(self._mm_limit)
+        self._mm_waiting = 0
+        self._unhealthy_logged = False
+        logger.info(
+            "VllmEngineServicer initialized (mm_processor=%s, source=%s)",
+            self._mm_processor.name if self._mm_processor is not None else "off",
+            self._mm_settings.source,
+        )
+
+    async def _acquire_mm_slot(self) -> None:
+        """Take one multimodal slot, shedding load instead of queueing forever.
+
+        Once as many requests are waiting as the worker can run at once, the
+        ones behind them will not be reached before their callers give up. A
+        retryable refusal now sends them to a worker that can take them, rather
+        than a deadline later that tells the caller nothing about where to go.
+        """
+        if self._mm_waiting >= self._mm_limit:
+            raise MmProcessorUnavailable(
+                f"worker is saturated: {self._mm_limit} multimodal requests in flight "
+                f"and as many waiting"
+            )
+        self._mm_waiting += 1
+        try:
+            await self._mm_inflight.acquire()
+        finally:
+            self._mm_waiting -= 1
+
+    async def _off_the_event_loop(self, work, *args):
+        """Run one piece of blocking multimodal work under the in-flight cap.
+
+        A worker thread cannot be interrupted, so the slot is handed back when
+        the thread itself finishes rather than when the caller stops waiting.
+        A caller that goes away while the work is still running therefore does
+        not let the next one start against memory that is still held.
+        """
+        await self._acquire_mm_slot()
+        running = asyncio.ensure_future(asyncio.to_thread(work, *args))
+        # Kept so the callback below can tell whether a caller is still waiting.
+        shielded = asyncio.shield(running)
+
+        def finished(done: asyncio.Future) -> None:
+            self._mm_inflight.release()
+            if done.cancelled():
+                return
+            # Nobody may be left to read a failure; take it here so the
+            # loop does not report it as never retrieved.
+            error = done.exception()
+            if error is not None and shielded.cancelled():
+                # A cancelled caller has no RPC left to fail, so the log is the
+                # only place this failure can still be seen.
+                logger.error(
+                    "Multimodal work %s failed after its caller went away",
+                    getattr(work, "__name__", work),
+                    exc_info=error,
+                )
+
+        running.add_done_callback(finished)
+        return await shielded
 
     async def Generate(
         self,
@@ -174,31 +313,91 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         """
         request_id = request.request_id
         input_type = request.WhichOneof("input")
-        # A pixel-less mm payload with grid tensors is the PD decode leg's
-        # form: enough to rebuild mm features (positions + block hashing).
-        has_preprocessed_mm = request.HasField("mm_inputs") and has_preprocessed_mm_payload(
-            request.mm_inputs
-        )
+        # One batch per modality: `mm_inputs`, then `extra_mm_inputs` for a
+        # request that mixes image and video. A pixel-less mm payload with
+        # grid tensors is the PD decode leg's form: enough to rebuild mm
+        # features (positions + block hashing).
+        preprocessed_batches = [
+            batch for batch in mm_batches(request) if has_preprocessed_mm_payload(batch)
+        ]
+        has_preprocessed_mm = bool(preprocessed_batches)
+        media_ref_count = len(request.media_refs.items) if request.HasField("media_refs") else 0
         logger.info(
-            "Generate request %s: input_type=%s, stream=%s, preprocessed_mm=%s, dp_rank=%s",
+            "Generate request %s: input_type=%s, stream=%s, preprocessed_mm=%s, "
+            "media_refs=%d, dp_rank=%s",
             request_id,
             input_type,
             request.stream,
             has_preprocessed_mm,
+            media_ref_count,
             request.data_parallel_rank if request.HasField("data_parallel_rank") else None,
         )
 
         kv_transfer_params: dict | None = None
+        # What a PD prefill leg learned about its media, for the decode leg.
+        media_identity = None
         engine_started = False
         try:
             arrival_time = time.time()
             kv_transfer_params = params_from_request(request)
 
-            if has_preprocessed_mm and input_type == "tokenized":
+            if request.HasField("media_refs"):
+                # Media references from the router: the worker fetches and runs
+                # vLLM's own processor over the unexpanded placeholder anchors.
+                if input_type != "tokenized" or describes_media_twice(request):
+                    raise ValueError(
+                        "media_refs requires tokenized input and cannot be combined with "
+                        "preprocessed multimodal inputs"
+                    )
+                if self._mm_processor is None:
+                    raise ValueError(
+                        f"media_refs sent but {PROCESSOR_FLAG} ({ENV_PROCESSOR}) is off on this "
+                        "worker; check the router's --mm-processing and this worker's "
+                        "mm_processor label"
+                    )
+                items = parse_media_refs(request.media_refs)
+                validate_schemes(items, self._mm_processor.accepted_schemes)
+                await self._acquire_mm_slot()
+                try:
+                    prompt = await self._mm_processor.process(
+                        list(request.tokenized.input_ids),
+                        request.tokenized.original_text or None,
+                        items,
+                        arrival_time,
+                        request_id=request_id,
+                    )
+                finally:
+                    self._mm_inflight.release()
+                # A PD prefill leg answers with the identity so decode is
+                # served without pixels or references. The identity is an
+                # optimisation with a fallback (decode reprocesses), so a
+                # shape it cannot read must not fail a served request.
+                if kv_transfer_params is not None:
+                    if media_identity_supported():
+                        try:
+                            media_identity = build_media_identity(prompt)
+                        except Exception as e:  # noqa: BLE001 - any failure falls back
+                            logger.warning(
+                                "Request %s: media identity not built (%s); the decode leg "
+                                "will reprocess the media",
+                                request_id,
+                                e,
+                            )
+                            media_identity = None
+                    else:
+                        logger.warning(
+                            "Request %s: the installed smg-grpc-proto has no media_identity; "
+                            "the decode leg will reprocess the media",
+                            request_id,
+                        )
+            elif has_preprocessed_mm and input_type == "tokenized":
                 # A pixel-less payload (PD decode leg) is only decodable with
                 # remote KV: a local recompute would schedule the vision
                 # encoder with no pixels and crash the engine.
-                if not request.mm_inputs.HasField("pixel_values") and kv_transfer_params is None:
+                # Every batch needs its own, not just one of them: a batch left
+                # out contributes no encoder tensor, and the engine would run
+                # that modality's encoder with nothing to encode.
+                if batches_missing_pixels(preprocessed_batches) and kv_transfer_params is None:
                     logger.warning(
                         "Request %s: pixel-less multimodal payload with no kv_transfer_params; "
                         "rejecting (prefill worker did not hand off KV?)",
@@ -210,8 +409,13 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                     )
                 # Preprocessed multimodal from Rust router.
                 # Token IDs already have expanded placeholders; tensors are
-                # ready for the model. Bypass the renderer entirely.
-                prompt = self._build_preprocessed_mm_inputs(request.tokenized, request.mm_inputs)
+                # ready for the model. Bypass the renderer entirely. The tensor
+                # copies and dtype casts scale with the payload (hundreds of
+                # megabytes for a many-image request), so they run off the
+                # event loop and health checks keep being answered meanwhile.
+                prompt = await self._off_the_event_loop(
+                    self._build_preprocessed_mm_inputs, request.tokenized, preprocessed_batches
+                )
                 prompt["arrival_time"] = arrival_time
             elif input_type == "tokenized":
                 prompt: TokensPrompt = {"prompt_token_ids": list(request.tokenized.input_ids)}
@@ -220,8 +424,9 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 # Tensor-less mm payload (grid-less PD decode leg): fold the
                 # kept mm hashes into cache_salt so different images cannot
                 # alias. Grid-carrying legs took the preprocessed path above.
-                if request.HasField("mm_inputs"):
-                    cache_salt = mm_identity_cache_salt(request.mm_inputs.mm_hashes)
+                batches = mm_batches(request)
+                if batches:
+                    cache_salt = mm_identity_cache_salt(mm_identity_hashes(batches))
                     if cache_salt is not None:
                         prompt["cache_salt"] = cache_salt
                     model_config = getattr(self.engine, "model_config", None)
@@ -250,16 +455,25 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             # Track which indices have sent their first chunk
             seen_indices: set[int] = set()
 
+            self._loads.submitted(request_id, _prompt_length(prompt))
             async for output in self.engine.generate(
                 prompt=prompt,
                 sampling_params=sampling_params,
                 request_id=request_id,
                 tokenization_kwargs=tokenization_kwargs,
+                trace_headers=trace_headers(context.invocation_metadata()),
                 data_parallel_rank=(
                     request.data_parallel_rank if request.HasField("data_parallel_rank") else None
                 ),
             ):
+                if not engine_started:
+                    self._loads.first_output(
+                        request_id,
+                        len(output.prompt_token_ids or ()),
+                        getattr(output, "num_cached_tokens", 0) or 0,
+                    )
                 engine_started = True
+                self._loads.generated(sum(len(c.token_ids) for c in output.outputs))
                 # For streaming, send chunks for EACH completion output (n outputs)
                 if request.stream:
                     for completion in output.outputs:
@@ -283,6 +497,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                                 completion=completion,
                                 num_logprobs=num_logprobs,
                                 num_prompt_logprobs=num_prompt_logprobs,
+                                media_identity=media_identity,
                             )
 
                 # For non-streaming, send complete response when finished
@@ -293,16 +508,32 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                             completion=completion,
                             num_logprobs=num_logprobs,
                             num_prompt_logprobs=num_prompt_logprobs,
+                            media_identity=media_identity,
                         )
 
-        except ValueError as e:
-            # Invalid request error (equiv to 400).
+        except asyncio.CancelledError:
+            # A caller that gives up while media is still being fetched leaves
+            # the same blocks pinned as any other pre-admission failure, and the
+            # cleanup has to outlive a second cancellation to land.
+            await asyncio.shield(
+                self._notify_kv_transfer_rejected(request_id, kv_transfer_params, engine_started)
+            )
+            raise
+        except MmProcessorUnavailable as e:
+            # Retryable: the router re-selects a worker on UNAVAILABLE.
+            logger.warning("Media processing unavailable for request %s: %s", request_id, e)
             await self._notify_kv_transfer_rejected(request_id, kv_transfer_params, engine_started)
-            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(e))
+            await context.abort(grpc.StatusCode.UNAVAILABLE, str(e))
         except Exception as e:
-            logger.exception("Error in Generate for request %s", request_id)
+            code = grpc_code_for(e)
+            if code is grpc.StatusCode.INTERNAL:
+                logger.exception("Error in Generate for request %s", request_id)
+            else:
+                logger.warning("Generate request %s rejected (%s): %s", request_id, code.name, e)
             await self._notify_kv_transfer_rejected(request_id, kv_transfer_params, engine_started)
-            await context.abort(grpc.StatusCode.INTERNAL, str(e))
+            await context.abort(code, str(e))
+        finally:
+            self._loads.finished(request_id)
 
     async def _notify_kv_transfer_rejected(
         self,
@@ -387,12 +618,13 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
 
         except grpc.aio.AbortError:
             raise
-        except ValueError as e:
-            logger.warning("Embed invalid request %s: %s", request_id, e)
-            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(e))
         except Exception as e:
-            logger.exception("Embed failed for request %s", request_id)
-            await context.abort(grpc.StatusCode.INTERNAL, str(e))
+            code = grpc_code_for(e)
+            if code is grpc.StatusCode.INTERNAL:
+                logger.exception("Embed failed for request %s", request_id)
+            else:
+                logger.warning("Embed request %s rejected (%s): %s", request_id, code.name, e)
+            await context.abort(code, str(e))
 
     async def HealthCheck(
         self,
@@ -412,9 +644,21 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         is_healthy = not self.engine.errored
         message = "Health" if is_healthy else "Engine is not alive"
 
-        logger.info("HealthCheck request: healthy=%s, message=%s", is_healthy, message)
+        # Probes arrive on a fixed interval and the answer is engine state the
+        # caller already receives, so only the turn for the worse is worth a
+        # line, and only the first one: the engine does not come back.
+        if not is_healthy and not self._unhealthy_logged:
+            self._unhealthy_logged = True
+            logger.error("HealthCheck is now reporting unhealthy: %s", message)
 
         return vllm_engine_pb2.HealthCheckResponse(healthy=is_healthy, message=message)
+
+    async def FlushCache(
+        self,
+        request: common_pb2.FlushCacheRequest,
+        context: grpc.aio.ServicerContext,
+    ) -> common_pb2.FlushCacheResponse:
+        return await flush_cache(self.engine, request, context)
 
     async def Abort(
         self,
@@ -434,7 +678,15 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         request_ids = request.request_ids
         logger.info("Abort requests: %s", request_ids)
 
-        await self.engine.abort(request_ids)
+        try:
+            await self.engine.abort(request_ids)
+        except Exception as e:
+            code = grpc_code_for(e)
+            if code is grpc.StatusCode.INTERNAL:
+                logger.exception("Abort failed for requests %s", request_ids)
+            else:
+                logger.warning("Abort rejected (%s) for requests %s: %s", code.name, request_ids, e)
+            await context.abort(code, str(e))
         return vllm_engine_pb2.AbortResponse()
 
     async def GetModelInfo(
@@ -452,39 +704,9 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         Returns:
             GetModelInfoResponse protobuf
         """
-        model_config = self.engine.model_config
-        hf_config = model_config.hf_config
-
-        # eos_token_id can be int or list[int]
-        eos = getattr(hf_config, "eos_token_id", None)
-        if isinstance(eos, int):
-            eos_token_ids = [eos]
-        elif isinstance(eos, list):
-            eos_token_ids = eos
-        else:
-            eos_token_ids = []
-
-        sampling_defaults = _filtered_sampling_defaults(
-            model_config.get_diff_sampling_param() or {}
-        )
-
+        facts = model_facts(self.engine.model_config)
         return vllm_engine_pb2.GetModelInfoResponse(
-            model_path=model_config.model,
-            is_generation=model_config.runner_type == "generate",
-            max_context_length=model_config.max_model_len,
-            vocab_size=model_config.get_vocab_size(),
-            supports_vision=model_config.is_multimodal_model,
-            served_model_name=model_config.served_model_name or model_config.model,
-            tokenizer_path=model_config.tokenizer or "",
-            model_type=getattr(hf_config, "model_type", "") or "",
-            architectures=model_config.architectures or [],
-            eos_token_ids=eos_token_ids,
-            pad_token_id=getattr(hf_config, "pad_token_id", None) or 0,
-            bos_token_id=getattr(hf_config, "bos_token_id", None) or 0,
-            max_req_input_len=model_config.max_model_len,
-            default_sampling_params_json=(
-                json.dumps(sampling_defaults, separators=(",", ":")) if sampling_defaults else ""
-            ),
+            max_req_input_len=facts["max_context_length"], **facts
         )
 
     async def GetServerInfo(
@@ -502,25 +724,52 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         Returns:
             GetServerInfoResponse protobuf
         """
-        kv_connector = ""
-        kv_role = ""
-        kv_engine_id = ""
-        parallel = self.engine.vllm_config.parallel_config
-        kv_transfer_config = self.engine.vllm_config.kv_transfer_config
-        if kv_transfer_config is not None:
-            kv_connector = kv_transfer_config.kv_connector or ""
-            kv_role = kv_transfer_config.kv_role or ""
-            # Base engine_id; with DP the engine cores serve `{id}_dp{rank}` and
-            # the router derives the suffix from the rank it pins per request
-            kv_engine_id = getattr(kv_transfer_config, "engine_id", "") or ""
+        facts = server_facts(self.engine.vllm_config)
+        # Older proto packages omit newer metadata fields; set them below
+        # only when their descriptors support them.
+        max_num_seqs = facts.pop("max_num_seqs", 0)
+        encoder_dtype = facts.pop("multimodal_encoder_dtype", "")
+        mm_processor = ""
+        mm_media_ref_schemes = ""
+        # A --language-model-only engine accepts no multimodal inputs, so it
+        # must not advertise worker-side media processing either: the router
+        # would send media references this worker cannot expand.
+        if (
+            self._mm_processor is not None
+            and engine_accepts_mm_inputs(self.engine.model_config)
+            and await self._mm_processor.probe()
+        ):
+            mm_processor = self._mm_processor.name
+            mm_media_ref_schemes = self._mm_processor.schemes
 
-        return vllm_engine_pb2.GetServerInfoResponse(
-            kv_connector=kv_connector,
-            kv_role=kv_role,
-            kv_engine_id=kv_engine_id,
-            data_parallel_size=parallel.data_parallel_size,
-            shm_namespace_id=mm_shm.shm_namespace_id(),
+        info = vllm_engine_pb2.GetServerInfoResponse(
+            mm_processor=mm_processor,
+            mm_media_ref_schemes=mm_media_ref_schemes,
+            **facts,
         )
+        # Where the processor mode came from, for the gateway's /workers; a
+        # proto package predating the field simply leaves it out.
+        if mm_processor and "mm_processor_source" in info.DESCRIPTOR.fields_by_name:
+            info.mm_processor_source = self._mm_settings.source
+        # Whether pixels are normalized on device, so the Router sends this
+        # engine raw pixels; likewise absent from an older proto package.
+        if "mm_device_do_normalize" in info.DESCRIPTOR.fields_by_name:
+            info.mm_device_do_normalize = mm_device_do_normalize(self.engine.vllm_config)
+        if "multimodal_encoder_dtype" in info.DESCRIPTOR.fields_by_name:
+            info.multimodal_encoder_dtype = encoder_dtype
+        if max_num_seqs and "max_num_seqs" in info.DESCRIPTOR.fields_by_name:
+            info.max_num_seqs = max_num_seqs
+        # The engine's own per-prompt media limits, for the Router's media
+        # pipeline to hold requests to; likewise absent from an older package.
+        if "mm_item_limits" in info.DESCRIPTOR.fields_by_name:
+            info.mm_item_limits = mm_item_limits(self.engine.vllm_config)
+        # The engine's reasoning parser and where it starts a grammar on a
+        # thinking prompt, for the Router to shape a forced tool call's
+        # grammar by; likewise absent from an older package.
+        if "structured_outputs_start" in info.DESCRIPTOR.fields_by_name:
+            info.engine_reasoning_parser = engine_reasoning_parser(self.engine.vllm_config)
+            info.structured_outputs_start = structured_outputs_start(self.engine.vllm_config)
+        return info
 
     async def GetLoads(
         self,
@@ -533,7 +782,10 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         Reads the latest SchedulerStats snapshot cached on the engine's stat
         loggers and maps it onto a single-DP-rank SchedulerLoad: ``token_usage``
         carries KV-cache utilization ([0,1)) and ``num_running_reqs`` /
-        ``num_waiting_reqs`` report queue depth.
+        ``num_waiting_reqs`` report queue depth. ``num_waiting_uncached_tokens``,
+        ``gen_throughput`` and ``cache_hit_rate`` come from this servicer's own
+        bookkeeping of the requests it forwards (``smg_grpc_servicer.vllm.loads``),
+        since vLLM's stats do not carry them.
 
         Always returns exactly one SchedulerLoad entry (zero-filled when no
         snapshot is available yet, e.g. with --disable-log-stats or before the
@@ -541,9 +793,10 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         dropping the poll.
 
         Note: ``request.dp_rank`` and ``request.include`` are accepted but not yet
-        applied — vLLM reports a single DP rank (``dp_rank_count=1``) with only
-        core metrics, so there is nothing to filter. They are reserved for future
-        multi-DP / sectioned-metrics support.
+        applied — vLLM reports a single DP rank (the servicer's first, see
+        ``_first_rank``; ``dp_rank_count=1``) with only core metrics, so there is
+        nothing to filter. They are reserved for future multi-DP /
+        sectioned-metrics support.
 
         Args:
             request: The GetLoadsRequest protobuf
@@ -552,22 +805,18 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         Returns:
             GetLoadsResponse protobuf
         """
-        stats = _latest_scheduler_stats(self.engine)
-        if stats is not None:
-            num_running = int(getattr(stats, "num_running_reqs", 0) or 0)
-            num_waiting = int(getattr(stats, "num_waiting_reqs", 0) or 0)
-            kv_usage = float(getattr(stats, "kv_cache_usage", 0.0) or 0.0)
-        else:
-            num_running = 0
-            num_waiting = 0
-            kv_usage = 0.0
-
+        first_rank = _first_rank(self.engine)
+        num_running, num_waiting, kv_usage = self._scheduler_counts(first_rank) or (0, 0, 0.0)
         load = vllm_engine_pb2.SchedulerLoad(
-            dp_rank=0,
-            num_running_reqs=num_running,
-            num_waiting_reqs=num_waiting,
-            num_total_reqs=num_running + num_waiting,
-            token_usage=max(0.0, kv_usage),
+            **scheduler_load_fields(
+                num_running,
+                num_waiting,
+                kv_usage,
+                self._loads.estimate(num_waiting),
+                dp_rank=first_rank,
+                max_total_num_tokens=_kv_capacity_tokens(self.engine),
+                max_running_requests=_max_running_requests(self.engine),
+            )
         )
 
         return vllm_engine_pb2.GetLoadsResponse(
@@ -576,6 +825,51 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             dp_rank_count=1,
             loads=[load],
         )
+
+    def _scheduler_counts(self, engine_idx: int = 0) -> tuple[int, int, float] | None:
+        """Running, waiting and KV usage from the latest ``SchedulerStats``
+        snapshot of the engine at ``engine_idx`` (the data-parallel rank),
+        what ``GetLoads`` and the pushed load record both report; ``None``
+        when there is none to read (no engine step yet, stats logging off,
+        or a rank the stat loggers do not keep apart)."""
+        stats = _latest_scheduler_stats(self.engine, engine_idx)
+        if stats is None:
+            return None
+        return (
+            int(getattr(stats, "num_running_reqs", 0) or 0),
+            int(getattr(stats, "num_waiting_reqs", 0) or 0),
+            float(getattr(stats, "kv_cache_usage", 0.0) or 0.0),
+        )
+
+    def _load_record(self, dp_rank: int | None) -> common_pb2.EngineLoad | None:
+        """The load record the KV-event stream carries for the batch's rank
+        (the servicer's first rank when it names none, see ``_first_rank``):
+        that rank's own scheduler counts, with this servicer's queued-work
+        estimate on the first rank only, as the Rust servicer stamps its
+        batches. A rank whose snapshot the servicer cannot read gets no
+        record rather than another rank's figures; the first rank reports
+        zeros before its first snapshot, as ``GetLoads`` does."""
+        try:
+            first_rank = _first_rank(self.engine)
+            rank = first_rank if dp_rank is None else dp_rank
+            counts = self._scheduler_counts(rank)
+            if counts is None:
+                if rank != first_rank:
+                    return None
+                counts = (0, 0, 0.0)
+            num_running, num_waiting, kv_usage = counts
+            return load_record(
+                num_running,
+                num_waiting,
+                kv_usage,
+                self._loads.estimate(num_waiting) if rank == first_rank else None,
+                dp_rank=rank,
+                max_total_num_tokens=_kv_capacity_tokens(self.engine),
+                max_running_requests=_max_running_requests(self.engine),
+            )
+        except Exception:  # noqa: BLE001 - a record that cannot be read leaves the batch without one
+            logger.debug("load record unavailable", exc_info=True)
+            return None
 
     async def GetTokenizer(
         self,
@@ -601,15 +895,16 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         # For now, GetTokenizer only works when vLLM is started with a local path.
         tokenizer_dir = Path(tokenizer_path)
 
-        # Build ZIP archive in memory
+        # Reading and compressing the tokenizer directory is file I/O and CPU
+        # measured in hundreds of milliseconds, so it stays off the event loop
+        # and the engine keeps answering everything else meanwhile.
         try:
-            zip_buffer = build_tokenizer_zip(tokenizer_dir)
+            zip_buffer, sha256 = await asyncio.to_thread(self._tokenizer_bundle, tokenizer_dir)
         except Exception as e:
             logger.exception("Failed to build tokenizer ZIP")
             await context.abort(grpc.StatusCode.INTERNAL, str(e))
 
         zip_data = zip_buffer.getbuffer()
-        sha256 = hashlib.sha256(zip_data).hexdigest()
 
         logger.info(
             "Streaming tokenizer bundle: %d bytes, sha256=%s",
@@ -631,10 +926,16 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
 
     # ========== Helper methods ==========
 
+    @staticmethod
+    def _tokenizer_bundle(tokenizer_dir: Path):
+        """The tokenizer archive and its fingerprint, built in one pass."""
+        zip_buffer = build_tokenizer_zip(tokenizer_dir)
+        return zip_buffer, hashlib.sha256(zip_buffer.getbuffer()).hexdigest()
+
     def _build_preprocessed_mm_inputs(
         self,
         tokenized: vllm_engine_pb2.TokenizedInput,
-        mm_proto: vllm_engine_pb2.MultimodalInputs,
+        mm_protos: Sequence[vllm_engine_pb2.MultimodalInputs],
     ) -> VllmMultiModalInput:
         """Build vLLM MultiModalInput from preprocessed proto data.
 
@@ -643,94 +944,109 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         only the grid tensors (positions + block hashing need no pixels).
         Field layouts (batched / flat / shared) are also determined by the
         router via ``batched_keys`` and ``flat_keys`` proto fields.
+
+        Each batch is one modality; a request mixing image and video brings
+        one batch each, and their tensors, hashes and placeholders are keyed
+        by modality the way vLLM's own processors lay them out.
         """
         prompt_token_ids = list(tokenized.input_ids)
-        num_items = len(mm_proto.mm_placeholders)
-
-        # Image vs video: vLLM routes each modality to a different encoder and
-        # expects the pixel tensor under a modality-specific key. The router sends
-        # the generic ``pixel_values`` field; rename it to ``pixel_values_videos``
-        # for the video path (grid/size tensors already carry video-specific keys).
-        is_video = mm_proto.modality == common_pb2.VIDEO
-        mm_modality = "video" if is_video else "image"
-
-        def mm_key(key: str) -> str:
-            if is_video and key == "pixel_values":
-                return "pixel_values_videos"
-            return key
-
-        # Deserialize all tensors from proto. The PD decode leg carries no
-        # pixel_values (KV arrives via the P/D transfer), only grid tensors.
-        hf_dict: dict[str, torch.Tensor] = {}
-        if mm_proto.HasField("pixel_values"):
-            hf_dict[mm_key("pixel_values")] = _tensor_from_proto(mm_proto.pixel_values)
-        for key, td in mm_proto.model_specific_tensors.items():
-            hf_dict[mm_key(key)] = _tensor_from_proto(td)
-
+        prompt_ids_tensor: torch.Tensor | None = None
         # Cast floating-point tensors to model dtype (e.g. bfloat16).
         # This mirrors _postprocess_output in multimodal/processing/context.py
         # which is skipped when bypassing the HF processor.
         model_dtype = self.engine.model_config.dtype
-        for key in hf_dict:
-            if hf_dict[key].is_floating_point():
-                hf_dict[key] = hf_dict[key].to(dtype=model_dtype)
 
-        cpu_keys = {mm_key(k) for k in mm_proto.keep_on_cpu_keys}
-
-        # Field configs are fully determined by the Rust router.
-        batched = {mm_key(k) for k in mm_proto.batched_keys}
-        flat = {mm_key(k): mm_key(v) for k, v in mm_proto.flat_keys.items()}
+        hf_dict: dict[str, torch.Tensor] = {}
         fields_config: dict[str, MultiModalFieldConfig] = {}
-        flat_sizes_cache: dict[str, torch.Tensor] = {}
-        for key in hf_dict:
-            on_cpu = key in cpu_keys
-            if key in batched:
-                fields_config[key] = MultiModalFieldConfig.batched(mm_modality, keep_on_cpu=on_cpu)
-            elif key in flat:
-                sizes_key = flat[key]
-                if sizes_key not in flat_sizes_cache:
-                    flat_sizes_cache[sizes_key] = hf_dict[sizes_key].flatten().to(torch.int64)
-                fields_config[key] = MultiModalFieldConfig.flat_from_sizes(
-                    mm_modality, flat_sizes_cache[sizes_key], keep_on_cpu=on_cpu
+        mm_hashes: dict[str, list[str]] = {}
+        mm_placeholders: dict[str, list[PlaceholderRange]] = {}
+
+        for mm_proto in mm_protos:
+            # Image vs video: vLLM routes each modality to a different encoder and
+            # expects the pixel tensor under a modality-specific key. The router
+            # sends the generic ``pixel_values`` field; rename it to
+            # ``pixel_values_videos`` for video (grid/size tensors already carry
+            # video-specific keys).
+            mm_modality = modality_name(mm_proto)
+            is_video = mm_modality == "video"
+
+            def mm_key(key: str, is_video: bool = is_video) -> str:
+                return modality_key(key, is_video)
+
+            num_items = len(mm_proto.mm_placeholders)
+
+            # Deserialize all tensors from proto. The PD decode leg carries no
+            # pixel_values (KV arrives via the P/D transfer), only grid tensors.
+            # The primary tensor is registered under the model's forward kwarg
+            # (``encoder_input_key``; DeepSeek-V4.1 takes ``patches``), the same
+            # name the router uses in ``batched_keys`` / ``flat_keys``.
+            batch: dict[str, torch.Tensor] = {}
+            if mm_proto.HasField("pixel_values"):
+                primary_key = mm_key(primary_encoder_key(mm_proto))
+                batch[primary_key] = tensor_from_proto(mm_proto.pixel_values)
+            for key, td in mm_proto.model_specific_tensors.items():
+                batch[mm_key(key)] = tensor_from_proto(td)
+            for key, tensor in batch.items():
+                if tensor.is_floating_point():
+                    batch[key] = tensor.to(dtype=model_dtype)
+            shared_keys = batch.keys() & hf_dict.keys()
+            if shared_keys:
+                raise ValueError(
+                    "multimodal batches carry the same tensor keys "
+                    f"{sorted(shared_keys)}; one batch per modality is expected"
                 )
-            else:
-                fields_config[key] = MultiModalFieldConfig.shared(mm_modality, num_items)
+            hf_dict.update(batch)
+
+            cpu_keys = {mm_key(k) for k in mm_proto.keep_on_cpu_keys}
+
+            # Field configs are fully determined by the Rust router.
+            batched = {mm_key(k) for k in mm_proto.batched_keys}
+            flat = {mm_key(k): mm_key(v) for k, v in mm_proto.flat_keys.items()}
+            flat_sizes_cache: dict[str, torch.Tensor] = {}
+            for key in batch:
+                on_cpu = key in cpu_keys
+                if key in batched:
+                    fields_config[key] = MultiModalFieldConfig.batched(
+                        mm_modality, keep_on_cpu=on_cpu
+                    )
+                elif key in flat:
+                    sizes_key = flat[key]
+                    if sizes_key not in flat_sizes_cache:
+                        flat_sizes_cache[sizes_key] = batch[sizes_key].flatten().to(torch.int64)
+                    fields_config[key] = MultiModalFieldConfig.flat_from_sizes(
+                        mm_modality, flat_sizes_cache[sizes_key], keep_on_cpu=on_cpu
+                    )
+                else:
+                    fields_config[key] = MultiModalFieldConfig.shared(mm_modality, num_items)
+
+            if mm_proto.mm_hashes:
+                mm_hashes.setdefault(mm_modality, []).extend(mm_proto.mm_hashes)
+
+            # When structural tokens (e.g. <|image_start|>, separators) are
+            # present in the placeholder range, we must set is_embed so vLLM
+            # only scatters encoder embeddings into patch-token positions
+            # (im_token_id).
+            if mm_proto.mm_placeholders:
+                im_token_id = mm_proto.im_token_id if mm_proto.HasField("im_token_id") else None
+                if im_token_id is not None and prompt_ids_tensor is None:
+                    # Pre-convert to tensor for vectorized mask building
+                    prompt_ids_tensor = torch.tensor(prompt_token_ids, dtype=torch.int64)
+                placeholders = mm_placeholders.setdefault(mm_modality, [])
+                for p in mm_proto.mm_placeholders:
+                    is_embed = None
+                    if im_token_id is not None:
+                        mask = prompt_ids_tensor[p.offset : p.offset + p.length] == im_token_id
+                        # Only set is_embed when there are non-embed positions,
+                        # otherwise None means "all positions are embeds" which
+                        # is both correct and avoids unnecessary overhead.
+                        if not mask.all():
+                            is_embed = mask
+                    placeholders.append(
+                        PlaceholderRange(offset=p.offset, length=p.length, is_embed=is_embed)
+                    )
 
         batch_feature = BatchFeature(hf_dict, tensor_type="pt")
         mm_kwargs = MultiModalKwargsItems.from_hf_inputs(batch_feature, fields_config)
-
-        # Build mm_hashes: dict[str, list[str]]
-        mm_hashes: dict[str, list[str]] = {}
-        if mm_proto.mm_hashes:
-            mm_hashes[mm_modality] = list(mm_proto.mm_hashes)
-
-        # Build mm_placeholders: dict[str, list[PlaceholderRange]]
-        # When structural tokens (e.g. <|image_start|>, separators) are present
-        # in the placeholder range, we must set is_embed so vLLM only scatters
-        # encoder embeddings into patch-token positions (im_token_id).
-        mm_placeholders: dict[str, list[PlaceholderRange]] = {}
-        if mm_proto.mm_placeholders:
-            im_token_id = mm_proto.im_token_id if mm_proto.HasField("im_token_id") else None
-            # Pre-convert to tensor for vectorized mask building
-            prompt_ids_tensor = (
-                torch.tensor(prompt_token_ids, dtype=torch.int64)
-                if im_token_id is not None
-                else None
-            )
-            placeholders = []
-            for p in mm_proto.mm_placeholders:
-                is_embed = None
-                if prompt_ids_tensor is not None:
-                    mask = prompt_ids_tensor[p.offset : p.offset + p.length] == im_token_id
-                    # Only set is_embed when there are non-embed positions,
-                    # otherwise None means "all positions are embeds" which is
-                    # both correct and avoids unnecessary overhead.
-                    if not mask.all():
-                        is_embed = mask
-                placeholders.append(
-                    PlaceholderRange(offset=p.offset, length=p.length, is_embed=is_embed)
-                )
-            mm_placeholders[mm_modality] = placeholders
 
         return mm_input(
             prompt_token_ids=prompt_token_ids,
@@ -984,6 +1300,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         completion: "CompletionOutput | None" = None,
         num_logprobs: int | None = None,
         num_prompt_logprobs: int | None = None,
+        media_identity: "vllm_engine_pb2.MediaIdentity | None" = None,
     ) -> vllm_engine_pb2.GenerateResponse:
         """
         Build a final completion response from vLLM output.
@@ -997,6 +1314,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                        If None, uses output.outputs[0] for backwards compatibility.
             num_logprobs: Number of top logprobs for output tokens
             num_prompt_logprobs: Number of top logprobs for prompt tokens
+            media_identity: A PD prefill leg's processed media, for the decode leg
 
         Returns:
             GenerateResponse with complete field set
@@ -1039,11 +1357,21 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
 
         # Build matched_stop kwargs from stop_reason (int token ID or str stop sequence)
         stop_kwargs = {}
+        # A proto package predating the field cannot carry the identity.
+        if (
+            media_identity is not None
+            and "media_identity" in vllm_engine_pb2.GenerateComplete.DESCRIPTOR.fields_by_name
+        ):
+            stop_kwargs["media_identity"] = media_identity
         if completion.stop_reason is not None:
             if isinstance(completion.stop_reason, int):
                 stop_kwargs["matched_token_id"] = completion.stop_reason
             else:
                 stop_kwargs["matched_stop_str"] = str(completion.stop_reason)
+
+        # Per-request speculative counts; needs vLLM's --per-request-spec-decode-metrics.
+        spec = getattr(completion, "spec_decode_metrics", None)
+        spec_accepted = sum(j * n for j, n in enumerate(spec.histogram)) if spec else 0
 
         # Build complete response
         # When streaming (DELTA mode): completion.token_ids will be empty/last delta
@@ -1053,6 +1381,8 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             complete=vllm_engine_pb2.GenerateComplete(
                 output_ids=completion.token_ids,
                 finish_reason=completion.finish_reason or "stop",
+                spec_accepted_tokens=spec_accepted,
+                spec_draft_tokens=spec.num_draft_tokens if spec else 0,
                 prompt_tokens=len(output.prompt_token_ids) if output.prompt_token_ids else 0,
                 completion_tokens=len(completion.token_ids),
                 cached_tokens=output.num_cached_tokens,
@@ -1070,11 +1400,8 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         request: common_pb2.SubscribeKvEventsRequest,
         context: grpc.aio.ServicerContext,
     ) -> AsyncIterator[common_pb2.KvEventBatch]:
-        """Bridge vLLM's in-process ZMQ KV cache events to a gRPC stream.
-
-        The ZMQ publisher's sequence numbers are used directly as the gRPC
-        batch sequence numbers.
-        """
+        """Relay vLLM's ZMQ KV cache events, every DP rank's publisher, as one
+        gRPC stream (see ``smg_grpc_servicer.kv_relay``)."""
         if self._kv_events_config is None:
             await context.abort(
                 grpc.StatusCode.UNIMPLEMENTED,
@@ -1084,34 +1411,13 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             )
 
         config = self._kv_events_config
-
-        # For DP attention each rank publishes on port + rank with independent
-        # sequence counters; subscribing to several on one socket interleaves
-        # them and breaks gap detection. Subscribe to rank 0 only for now.
-        # TODO(phase3): per-rank virtual workers or merged renumbering.
-        pub_endpoint = endpoint_for_rank(config.endpoint, 0)
-
-        zmq_ctx = zmq.asyncio.Context.instance()
-        sub_socket = zmq_ctx.socket(zmq.SUB)
-        sub_socket.subscribe(config.topic.encode("utf-8"))
-        sub_socket.connect(pub_endpoint)
-        logger.info("SubscribeKvEvents: connected to ZMQ endpoint %s", pub_endpoint)
-
-        decoder = msgspec.msgpack.Decoder(KVEventBatch)
-
-        try:
-            async for proto_batch in stream_kv_events(
-                sub_socket,
-                decoder.decode,
-                lambda: context.send_initial_metadata(()),
-                context.cancelled,
-            ):
-                yield proto_batch
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            logger.exception("SubscribeKvEvents failed")
-            await context.abort(grpc.StatusCode.INTERNAL, str(e))
-        finally:
-            sub_socket.close(linger=0)
-            logger.info("SubscribeKvEvents: stream closed")
+        async for proto_batch in relay(
+            rank_sources_for(config, self.engine),
+            Engine.VLLM,
+            request.start_sequence_number,
+            context,
+            topic=str(getattr(config, "topic", "") or ""),
+            hwm=getattr(config, "hwm", None),
+            load_source=self._load_record,
+        ):
+            yield proto_batch

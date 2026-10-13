@@ -13,39 +13,53 @@ use openai_protocol::{
     chat::ChatCompletionRequest,
     classify::ClassifyRequest,
     completion::CompletionRequest,
+    decisions::DecisionsRequest,
     embedding::EmbeddingRequest,
     generate::GenerateRequest,
     interactions::InteractionsRequest,
-    messages::CreateMessageRequest,
+    messages::{CountMessageTokensRequest, CreateMessageRequest},
     realtime_session::{
         RealtimeClientSecretCreateRequest, RealtimeSessionCreateRequest,
         RealtimeTranscriptionSessionCreateRequest,
     },
     rerank::RerankRequest,
     responses::ResponsesRequest,
+    systemone::SystemOneRequest,
     transcription::{AudioFile, TranscriptionRequest},
 };
 
 use crate::middleware::TenantRequestMeta;
 
-pub mod anthropic;
 pub mod common;
-pub mod conversations;
-pub mod error;
+pub use smg_external_router::error;
+pub mod external;
 pub mod factory;
-pub mod gemini;
+pub mod gateway;
 pub mod grpc;
 pub mod http;
-pub mod openai;
-pub mod parse;
-pub mod responses;
-pub mod router_manager;
-pub mod tokenize;
+pub(crate) mod provider_support;
 
 pub use common::body_policy::BodyPolicy;
 pub use factory::RouterFactory;
 // Re-export HTTP routers for convenience
 pub use http::{pd_router, pd_types, router};
+
+pub(crate) const PD_PREFILL_QUEUE_FULL: &str = "pd_prefill_queue_full";
+pub(crate) const PD_PREFILL_QUEUE_TIMEOUT: &str = "pd_prefill_queue_timeout";
+
+/// The client answer when the Prefill admission queue has no room.
+pub(crate) fn prefill_queue_full() -> Response {
+    error::too_many_requests(PD_PREFILL_QUEUE_FULL, "Prefill admission queue is full")
+}
+
+/// The client answer when a queued request waited out its Prefill admission
+/// timeout.
+pub(crate) fn prefill_queue_timeout() -> Response {
+    error::too_many_requests(
+        PD_PREFILL_QUEUE_TIMEOUT,
+        "Timed out waiting for Prefill admission",
+    )
+}
 
 /// Core trait for all router implementations
 ///
@@ -74,11 +88,6 @@ pub trait RouterTrait: Send + Sync + Debug {
     /// Get server information
     async fn get_server_info(&self, _req: Request<Body>) -> Response {
         (StatusCode::NOT_IMPLEMENTED, "Server info not implemented").into_response()
-    }
-
-    /// Get available models
-    async fn get_models(&self, _req: Request<Body>) -> Response {
-        (StatusCode::NOT_IMPLEMENTED, "Get models not implemented").into_response()
     }
 
     /// Get model information
@@ -154,8 +163,14 @@ pub trait RouterTrait: Send + Sync + Debug {
             .into_response()
     }
 
-    /// Cancel a background response by id
-    async fn cancel_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
+    /// Cancel a background response by id, for the caller `tenant_meta`
+    /// describes (a response of another tenant answers as an unknown id does).
+    async fn cancel_response(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _tenant_meta: &TenantRequestMeta,
+        _response_id: &str,
+    ) -> Response {
         (
             StatusCode::NOT_IMPLEMENTED,
             "Cancel response not implemented",
@@ -183,6 +198,34 @@ pub trait RouterTrait: Send + Sync + Debug {
         _model_id: &str,
     ) -> Response {
         (StatusCode::NOT_IMPLEMENTED, "Classify not implemented").into_response()
+    }
+
+    /// Route OpenAI Decisions requests on regular HTTP workers.
+    async fn route_decisions(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _tenant_meta: &TenantRequestMeta,
+        _body: DecisionsRequest,
+        _model_id: &str,
+    ) -> Response {
+        error::not_implemented(
+            "decisions_not_supported",
+            "Decisions is supported by regular HTTP and SGLang gRPC routers",
+        )
+    }
+
+    /// Route native SystemOne requests on regular HTTP workers.
+    async fn route_systemone(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _tenant_meta: &TenantRequestMeta,
+        _body: SystemOneRequest,
+        _model_id: &str,
+    ) -> Response {
+        error::not_implemented(
+            "systemone_not_supported",
+            "SystemOne is supported only by the regular HTTP router",
+        )
     }
 
     /// Route audio transcription requests (OpenAI-compatible /v1/audio/transcriptions).
@@ -228,6 +271,21 @@ pub trait RouterTrait: Send + Sync + Debug {
         (
             StatusCode::NOT_IMPLEMENTED,
             "Messages API not yet implemented for this router",
+        )
+            .into_response()
+    }
+
+    /// Route Anthropic Messages token counting (/v1/messages/count_tokens)
+    async fn route_messages_count_tokens(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _tenant_meta: &TenantRequestMeta,
+        _body: CountMessageTokensRequest,
+        _model_id: &str,
+    ) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Messages token counting not implemented for this router",
         )
             .into_response()
     }

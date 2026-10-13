@@ -93,8 +93,8 @@ as of `tokenizer/src/*`.
 
 ## Chat Template Support (`chat_template.rs`)
 - Detects whether a template expects raw string content or the structured OpenAI-style `content`
-  list by walking the minijinja AST. This matches the Python-side detection logic used elsewhere in
-  SGLang.
+  list by walking the minijinja AST. This matches the Python-side detection logic of the serving
+  engines.
 - `ChatTemplateProcessor` (constructed per call) renders templates against JSON `messages` and
   `ChatTemplateParams` (system prompt, tools, EOS token handling, etc.). Errors surface as
   `anyhow::Error`, keeping parity with Hugging Face error messages.
@@ -208,3 +208,32 @@ let prompt = hf.apply_chat_template(
 ```
 
 Set `HF_TOKEN` in the environment if you need to download private models from the Hugging Face Hub.
+
+## Prometheus cache activity
+
+The gateway exports process-lifetime totals across tokenizer instances on `/metrics`:
+
+| Metric | Labels | Meaning |
+| --- | --- | --- |
+| `smg_tokenizer_cache_lookups_total` | `layer=l0` or `l1`, `result=hit` or `miss` | One outcome per lookup, including L1 misses without special-token boundaries |
+| `smg_tokenizer_cache_evictions_total` | `layer=l0` or `l1` | Entries actually removed for capacity, excluding clear, drop and replacement |
+| `smg_tokenizer_cache_reused_bytes_total` | `layer=l0` or `l1` | UTF-8 input bytes served by hits: whole input for L0, matched prefix for L1 |
+
+Labels are fixed; no model IDs or prompt text are retained. L0 hits bypass L1,
+so each layer's hit ratio uses its own lookup count. Disabled layers have no
+activity. Totals survive cache clear/drop and are available even if the metrics
+recorder starts after tokenization. Scraping reads atomics without scanning caches.
+Reused bytes measure reuse volume, not resident memory or CPU time saved; in
+particular, a prefix hit can still do suffix tokenization and cache population.
+
+Per-layer hit ratio (undefined until that layer receives lookups):
+
+```promql
+sum by (layer) (rate(smg_tokenizer_cache_lookups_total{result="hit"}[5m]))
+/
+sum by (layer) (rate(smg_tokenizer_cache_lookups_total[5m]))
+```
+
+Compare this with `rate(smg_tokenizer_cache_evictions_total[5m])` when tuning
+capacity, and `rate(smg_tokenizer_cache_reused_bytes_total[5m])` to distinguish
+small prefix hits from reuse of large prompts.

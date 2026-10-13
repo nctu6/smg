@@ -17,7 +17,10 @@ use super::{
         WorkerType,
     },
 };
-use crate::{observability::metrics::Metrics, routers::grpc::backend_client::BackendClient};
+use crate::{
+    observability::metrics::Metrics, routers::grpc::backend_client::BackendClient,
+    worker::pd_pairing::PdPairing,
+};
 
 /// Builder for creating BasicWorker instances with fluent API.
 ///
@@ -319,6 +322,7 @@ impl BasicWorkerBuilder {
 
         let metadata = WorkerMetadata {
             overload: OverloadThresholds::resolve(&self.spec.overload, self.overload_defaults),
+            pd_pairing: PdPairing::derive(&self.spec),
             spec: Arc::new(self.spec),
             health_config,
             health_endpoint: self.health_endpoint,
@@ -359,6 +363,10 @@ impl BasicWorkerBuilder {
         let resilience = self.resilience.unwrap_or_default();
 
         BasicWorker {
+            kv_engine_id: Arc::new(ArcSwapOption::new(
+                metadata.spec.kv_engine_id.clone().map(Arc::new),
+            )),
+            kv_engine_id_unconfirmed: Arc::new(AtomicBool::new(false)),
             runtime: ArcSwap::from_pointee(WorkerRuntime::new(&metadata.spec.url, initial_status)),
             circuit_breaker: ArcSwap::from_pointee(CircuitBreaker::with_config_and_label(
                 self.circuit_breaker_config,
@@ -372,6 +380,7 @@ impl BasicWorkerBuilder {
             models_override: Arc::new(ArcSwap::from_pointee(WorkerModels::Wildcard)),
             http_client,
             resilience,
+            completion_sink: Arc::new(std::sync::RwLock::new(None)),
         }
     }
 }
@@ -462,7 +471,7 @@ mod tests {
     #[test]
     fn provided_http_client_is_used_as_is() {
         let worker = BasicWorkerBuilder::new("http://localhost:8080")
-            .http_client(Arc::new(reqwest::Client::new()))
+            .http_client(Arc::new(crate::http_client::client()))
             .build();
         assert!(!worker.http_client.cell_is_empty());
     }

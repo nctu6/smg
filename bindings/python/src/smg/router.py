@@ -96,6 +96,14 @@ def build_control_plane_auth_config(
     jwt_audience = args_dict.get("jwt_audience")
     audit_enabled = args_dict.get("control_plane_audit_enabled", False)
 
+    # Half a JWT configuration is an error, not a silently disabled JWT auth:
+    # the control plane would start open where authentication was asked for.
+    if (jwt_issuer is None) != (jwt_audience is None):
+        raise ValueError(
+            "--jwt-issuer and --jwt-audience are required together: "
+            "control-plane JWT authentication would otherwise be silently disabled"
+        )
+
     # Check if any auth is configured
     has_api_keys = bool(api_keys)
     has_jwt = jwt_issuer is not None and jwt_audience is not None
@@ -191,12 +199,18 @@ class Router:
             a worker must also exceed before prefix_hash treats it as
             overloaded. Guards the load factor against sampling noise when each
             router replica sees only a share of a worker's load. Default: 10
-        balance_abs_threshold: Load balancing is triggered when (max_load - min_load) >
-            abs_threshold AND max_load > min_load * rel_threshold. Otherwise, use cache
-            aware. Default: 32
-        balance_rel_threshold: Load balancing is triggered when (max_load - min_load) >
-            abs_threshold AND max_load > min_load * rel_threshold. Otherwise, use cache
-            aware. Default: 1.0001
+        balance_abs_threshold: Spill gate, absolute part: a matched worker is skipped
+            for the least-loaded one when its load exceeds the healthy-fleet mean by
+            this many requests AND by balance_rel_threshold; the margin is capped at
+            the in-flight count's natural swing at the pool's current mean (two
+            standard deviations, never under four requests unless this value is
+            lower), so a small pool can spill at all; with the bucket policy the
+            pair keeps its own rule (balancing when (max_load - min_load) exceeds
+            this value and max_load exceeds min_load times the relative
+            threshold). Default: 64
+        balance_rel_threshold: Spill gate, relative part: the multiple of the
+            healthy-fleet mean a matched worker's load must exceed, together with
+            the absolute part. Default: 1.5
         eviction_interval_secs: Interval in seconds between cache eviction operations
             in cache-aware routing. Default: 60
         overlap_decay: Cache-aware anti-hotspot decay: each candidate's overlap score
@@ -228,6 +242,10 @@ class Router:
         service_discovery: Enable Kubernetes service discovery. When enabled, the
             router will automatically discover worker pods based on the selector.
             Default: False
+        discovery: The worker discovery provider's configuration, keyword-only:
+            a mapping with a ``provider`` key and that provider's fields, read
+            like ``RouterConfig.discovery`` (no ``provider`` means Kubernetes).
+            Mutually exclusive with ``service_discovery``. Default: None
         selector: Dictionary mapping of label keys to values for Kubernetes pod
             selection. Example: {"app": "sglang-worker"}. Default: {}
         service_discovery_port: Port to use for service discovery. The router will
@@ -241,7 +259,11 @@ class Router:
             selection for decode servers (PD mode only). Default: {}
         prometheus_port: Port to expose Prometheus metrics. Default: None
         prometheus_host: Host address to bind the Prometheus metrics server. Default:
-            None
+            None, which binds the unspecified address of host's family (:: for an IPv6
+            host, 0.0.0.0 otherwise)
+        jemalloc_prof_dir: Directory where POST /heap_profile writes a jemalloc heap
+            profile of the router (a build with the jemalloc-profiling feature, started
+            with _RJEM_MALLOC_CONF=prof:true,prof_active:true). Default: None
         pd_disaggregation: Enable PD (Prefill-Decode) disaggregated mode. Default:
             False
         prefill_urls: List of (url, bootstrap_port) tuples for prefill servers (PD
@@ -251,6 +273,15 @@ class Router:
             only). If not specified, uses the main policy. Default: None
         decode_policy: Specific load balancing policy for decode nodes (PD mode only).
             If not specified, uses the main policy. Default: None
+        prefill_max_inflight_requests_per_worker: Maximum in-flight Prefill requests
+            per worker in PD or EPD mode. A non-positive value disables the limit.
+            Default: -1
+        prefill_queue_size: Maximum number of requests waiting for Prefill admission.
+            Defaults to 100 when Prefill admission is enabled. Set to 0 to disable
+            waiting. Default: None
+        prefill_queue_timeout_secs: Maximum time in seconds a request may wait for
+            Prefill admission. Defaults to 60 when Prefill admission is enabled.
+            Default: None
         request_id_headers: List of HTTP headers to check for request IDs. If not
             specified, uses common defaults: ['x-request-id', 'x-correlation-id',
             'x-trace-id', 'request-id']. Example: ['x-my-request-id',
@@ -269,14 +300,16 @@ class Router:
         kv_engine_id_annotation: Kubernetes annotation containing KV engine IDs,
             aligned with worker_ports_annotation. Default: 'smg.ai/kv-engine-id'
         request_timeout_secs: Request timeout in seconds. Default: 600
-        max_concurrent_requests: Maximum number of concurrent requests allowed for
-            rate limiting. Default: 256
+        max_concurrent_requests: Maximum standing concurrent requests. -1 derives
+            the bound from the host (1024 per available core, at least 4096); 0
+            disables it. Default: -1
         queue_size: Queue size for pending requests when max concurrent limit reached
             (0 = no queue, return 429 immediately). Default: 100
         queue_timeout_secs: Maximum time (in seconds) a request can wait in queue
             before timing out. Default: 60
-        rate_limit_tokens_per_second: Token bucket refill rate (tokens per second). If
-            not set, defaults to max_concurrent_requests. Default: None
+        rate_limit_tokens_per_second: Sustained admission rate (requests per
+            second), bursting up to max_concurrent_requests, which keeps bounding
+            standing concurrency. Unset or 0 = no rate limit. Default: None
         cors_allowed_origins: List of allowed origins for CORS. Empty list allows all
             origins. Default: []
         health_failure_threshold: Number of consecutive health check failures before
@@ -304,11 +337,38 @@ class Router:
         """Create a router from a RouterArgs instance."""
 
         args_dict = vars(args).copy()
+        # Kubernetes, by either spelling, reaches Rust as service_discovery;
+        # the file provider as the tagged `discovery` mapping. A provider this
+        # cannot pass on fails here instead of quietly starting the router
+        # without discovery.
+        provider = args.selected_discovery_provider()
+        file_flags = (
+            args.discovery_file is not None or args.discovery_check_interval_secs is not None
+        )
+        if file_flags and provider != "file":
+            raise ValueError(
+                "discovery_file and discovery_check_interval_secs apply only to"
+                " discovery_provider='file'"
+            )
+        if provider == "file":
+            if not args.discovery_file:
+                raise ValueError("discovery_provider='file' needs discovery_file")
+            discovery: dict[str, str | int] = {"provider": "file", "path": args.discovery_file}
+            if args.discovery_check_interval_secs is not None:
+                discovery["check_interval_secs"] = args.discovery_check_interval_secs
+            args_dict["discovery"] = discovery
+        elif provider not in (None, "kubernetes"):
+            raise ValueError(
+                f"Router.from_args cannot pass discovery provider {provider!r} to Rust"
+            )
+        args_dict["service_discovery"] = provider == "kubernetes"
+        for key in ("discovery_provider", "discovery_file", "discovery_check_interval_secs"):
+            args_dict.pop(key)
         # Convert RouterArgs to _Router parameters
         args_dict["worker_urls"] = (
             []
             if (
-                args_dict["service_discovery"]
+                provider is not None
                 or args_dict["pd_disaggregation"]
                 or args_dict["epd_disaggregation"]
             )
@@ -368,6 +428,7 @@ class Router:
             postgres_config = PyPostgresConfig(
                 db_url=args_dict.get("postgres_db_url"),
                 pool_max=args_dict.get("postgres_pool_max", 16),
+                op_timeout_secs=args_dict.get("postgres_op_timeout_secs", 5),
             )
         args_dict["postgres_config"] = postgres_config
 
@@ -382,6 +443,7 @@ class Router:
                 url=args_dict.get("redis_url"),
                 pool_max=args_dict.get("redis_pool_max", 16),
                 retention_days=retention_arg,
+                op_timeout_secs=args_dict.get("redis_op_timeout_secs", 5),
             )
         args_dict["redis_config"] = redis_config
 
@@ -401,9 +463,11 @@ class Router:
             "oracle_pool_timeout_secs",
             "postgres_db_url",
             "postgres_pool_max",
+            "postgres_op_timeout_secs",
             "redis_url",
             "redis_pool_max",
             "redis_retention_days",
+            "redis_op_timeout_secs",
             # Control plane auth fields (converted to control_plane_auth)
             "control_plane_api_keys",
             "control_plane_audit_enabled",

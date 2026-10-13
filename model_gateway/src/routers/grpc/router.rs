@@ -1,286 +1,59 @@
-use std::{borrow::Cow, sync::Arc};
+use std::{borrow::Cow, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use axum::{
-    http::{header, HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
+    Json,
 };
-use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use openai_protocol::{
-    chat::{ChatCompletionRequest, ChatMessage, MessageContent},
+    chat::ChatCompletionRequest,
     classify::ClassifyRequest,
-    common::{ContentPart, InputAudio},
     completion::CompletionRequest,
+    decisions::DecisionsRequest,
     embedding::EmbeddingRequest,
     generate::GenerateRequest,
-    messages::CreateMessageRequest,
+    messages::{
+        CountMessageTokensRequest, CountMessageTokensResponse, CreateMessageRequest, Message,
+        MessageDelta, MessageDeltaUsage, MessageStreamEvent, StopReason, Tool, ToolChoice, Usage,
+    },
     responses::ResponsesRequest,
     transcription::{AudioFile, TranscriptionRequest},
 };
-use serde_json::json;
-use tracing::debug;
+use tracing::{debug, warn};
+use uuid::Uuid;
 
 use super::{
     common::{
         responses::{
-            handlers::cancel_response_impl, utils::validate_worker_availability, ResponsesContext,
+            background, handlers::cancel_response_impl, streaming::build_sse_response_from_stream,
+            utils::validate_worker_availability, BackgroundResponses, BackgroundStream,
+            ResponsesContext,
         },
-        stages::{RateLimitCell, RateLimitOutcome},
+        stages::{
+            context_length_exceeded, helpers::resolve_request_id_stamp, smallest_context_length,
+            RateLimitCell, RateLimitOutcome,
+        },
     },
-    context::SharedComponents,
+    context::{RequestType, SharedComponents},
     harmony::{serve_harmony_responses, serve_harmony_responses_stream, HarmonyDetector},
     mode::Mode,
-    multimodal::MultimodalComponents,
+    multimodal::{mm_settings, MultimodalComponents},
     pipeline::{Endpoint, PipelineDeps, RequestPipeline},
-    regular::responses,
-    utils::ParserResolver,
+    regular::{
+        responses, stages::decisions::supports_worker as supports_decisions_worker,
+        streaming::StreamingProcessor,
+    },
+    utils::{message_utils, missing_tokenizer_response, ParserResolver},
 };
 use crate::{
     app_context::AppContext,
     config::types::RetryConfig,
     middleware::TenantRequestMeta,
+    observability::metrics::metrics_labels,
     routers::{error, RouterTrait},
-    worker::{WorkerRegistry, WorkerType},
+    worker::{RoutingPool, WorkerRegistry, WorkerType},
 };
-
-const QWEN3_ASR_LANGUAGES: &[(&str, &str)] = &[
-    ("ar", "Arabic"),
-    ("yue", "Cantonese"),
-    ("zh", "Chinese"),
-    ("cs", "Czech"),
-    ("da", "Danish"),
-    ("nl", "Dutch"),
-    ("en", "English"),
-    ("fil", "Filipino"),
-    ("fi", "Finnish"),
-    ("fr", "French"),
-    ("de", "German"),
-    ("el", "Greek"),
-    ("hi", "Hindi"),
-    ("hu", "Hungarian"),
-    ("id", "Indonesian"),
-    ("it", "Italian"),
-    ("ja", "Japanese"),
-    ("ko", "Korean"),
-    ("mk", "Macedonian"),
-    ("ms", "Malay"),
-    ("fa", "Persian"),
-    ("pl", "Polish"),
-    ("pt", "Portuguese"),
-    ("ro", "Romanian"),
-    ("ru", "Russian"),
-    ("es", "Spanish"),
-    ("sv", "Swedish"),
-    ("th", "Thai"),
-    ("tr", "Turkish"),
-    ("vi", "Vietnamese"),
-];
-
-const ASR_TEXT_TAG: &str = "<asr_text>";
-const MAX_ASR_PROMPT_BYTES: usize = 4096;
-const QWEN3_ASR_LABEL_KEYS: &[&str] = &[
-    "model",
-    "model_path",
-    "model_type",
-    "hf_model_type",
-    "tokenizer",
-    "tokenizer_path",
-];
-
-fn strip_chatml_like_tokens(text: &str) -> String {
-    let mut remaining = text;
-    let mut output = String::with_capacity(text.len());
-    while let Some(start) = remaining.find("<|") {
-        output.push_str(&remaining[..start]);
-        let candidate = &remaining[start + 2..];
-        if let Some(end) = candidate.find("|>") {
-            let token = &candidate[..end];
-            if !token.is_empty() && !token.contains('|') {
-                remaining = &candidate[end + 2..];
-                continue;
-            }
-        }
-        output.push_str("<|");
-        remaining = candidate;
-    }
-    output.push_str(remaining);
-    output
-}
-
-fn sanitize_qwen3_asr_prompt(mut text: String) -> Result<String, Box<Response>> {
-    if text.len() > MAX_ASR_PROMPT_BYTES {
-        return Err(Box::new(error::bad_request(
-            "asr_prompt_too_long",
-            format!("Qwen3-ASR prompt must not exceed {MAX_ASR_PROMPT_BYTES} bytes"),
-        )));
-    }
-
-    loop {
-        let sanitized = strip_chatml_like_tokens(&text).replace(ASR_TEXT_TAG, "");
-        if sanitized == text {
-            return Ok(text);
-        }
-        text = sanitized;
-    }
-}
-
-fn normalize_qwen3_asr_language(language: Option<&str>) -> Result<Option<String>, Box<Response>> {
-    let Some(language) = language.map(str::trim).filter(|value| !value.is_empty()) else {
-        return Ok(None);
-    };
-    QWEN3_ASR_LANGUAGES
-        .iter()
-        .find(|(code, name)| {
-            code.eq_ignore_ascii_case(language) || name.eq_ignore_ascii_case(language)
-        })
-        .map(|(_, name)| Some((*name).to_string()))
-        .ok_or_else(|| {
-            Box::new(error::bad_request(
-                "unsupported_transcription_language",
-                format!("Qwen3-ASR does not support language '{language}'"),
-            ))
-        })
-}
-
-fn is_qwen3_asr_identifier(value: &str) -> bool {
-    let value = value.to_ascii_lowercase();
-    value.contains("qwen3-asr") || value.contains("qwen3_asr")
-}
-
-fn is_qwen3_asr_metadata_label(key: &str, value: &str) -> bool {
-    QWEN3_ASR_LABEL_KEYS.contains(&key) && is_qwen3_asr_identifier(value)
-}
-
-fn is_qwen3_asr_target(worker_registry: &WorkerRegistry, model_id: &str) -> bool {
-    if is_qwen3_asr_identifier(model_id) {
-        return true;
-    }
-
-    worker_registry.get_by_model(model_id).iter().any(|worker| {
-        let metadata = worker.metadata();
-        is_qwen3_asr_identifier(metadata.model_id())
-            || metadata
-                .spec
-                .labels
-                .iter()
-                .any(|(key, value)| is_qwen3_asr_metadata_label(key, value))
-    })
-}
-
-fn audio_format(audio: &AudioFile) -> String {
-    let content_type = audio.content_type.as_deref().unwrap_or_default();
-    if content_type.eq_ignore_ascii_case("audio/mpeg")
-        || content_type.eq_ignore_ascii_case("audio/mp3")
-    {
-        return "mp3".to_string();
-    }
-    if content_type.eq_ignore_ascii_case("audio/wav")
-        || content_type.eq_ignore_ascii_case("audio/wave")
-        || content_type.eq_ignore_ascii_case("audio/x-wav")
-    {
-        return "wav".to_string();
-    }
-    audio
-        .file_name
-        .rsplit_once('.')
-        .map(|(_, extension)| extension.to_ascii_lowercase())
-        .filter(|extension| !extension.is_empty())
-        .unwrap_or_else(|| "wav".to_string())
-}
-
-fn build_qwen3_asr_chat_request(
-    body: &TranscriptionRequest,
-    audio: &AudioFile,
-    language: Option<&str>,
-) -> Result<ChatCompletionRequest, Box<Response>> {
-    let mut messages = Vec::with_capacity(3);
-    if let Some(prompt) = body.prompt.as_deref() {
-        let prompt = sanitize_qwen3_asr_prompt(prompt.to_string())?;
-        let prompt = prompt.trim();
-        if !prompt.is_empty() {
-            messages.push(ChatMessage::System {
-                content: MessageContent::Text(prompt.to_string()),
-                name: None,
-            });
-        }
-    }
-    messages.push(ChatMessage::User {
-        content: MessageContent::Parts(vec![ContentPart::InputAudio {
-            input_audio: InputAudio {
-                data: BASE64_STANDARD.encode(&audio.bytes),
-                format: audio_format(audio),
-            },
-        }]),
-        name: None,
-    });
-
-    let continue_final_message = if let Some(language) = language {
-        messages.push(ChatMessage::Assistant {
-            content: Some(MessageContent::Text(format!(
-                "language {language}<asr_text>"
-            ))),
-            name: None,
-            tool_calls: None,
-            reasoning_content: None,
-        });
-        true
-    } else {
-        false
-    };
-
-    Ok(ChatCompletionRequest {
-        messages,
-        model: body.model.clone(),
-        n: Some(1),
-        stream: false,
-        temperature: Some(body.temperature.unwrap_or(0.0)),
-        continue_final_message,
-        skip_special_tokens: true,
-        separate_reasoning: false,
-        stream_reasoning: false,
-        ..Default::default()
-    })
-}
-
-fn parse_qwen3_asr_output(raw: &str) -> String {
-    let cleaned = raw.replace("<|im_end|>", "");
-    let cleaned = cleaned.trim();
-    cleaned
-        .split_once("<asr_text>")
-        .map_or(cleaned, |(_, transcription)| transcription)
-        .trim()
-        .to_string()
-}
-
-#[derive(Clone, Copy, Debug)]
-enum TranscriptionResponseFormat {
-    Json,
-    Text,
-}
-
-fn parse_transcription_response_format(
-    format: Option<&str>,
-) -> Result<TranscriptionResponseFormat, Box<Response>> {
-    match format.unwrap_or("json").to_ascii_lowercase().as_str() {
-        "json" => Ok(TranscriptionResponseFormat::Json),
-        "text" => Ok(TranscriptionResponseFormat::Text),
-        unsupported => Err(Box::new(error::bad_request(
-            "unsupported_transcription_response_format",
-            format!(
-                "Qwen3-ASR does not provide timestamps required for response format '{unsupported}'"
-            ),
-        ))),
-    }
-}
-
-fn transcription_response(format: TranscriptionResponseFormat, text: String) -> Response {
-    match format {
-        TranscriptionResponseFormat::Json => axum::Json(json!({"text": text})).into_response(),
-        TranscriptionResponseFormat::Text => {
-            ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], text).into_response()
-        }
-    }
-}
 
 /// `501 NOT_IMPLEMENTED`, returned by endpoints this router's mode doesn't
 /// serve (matching the `RouterTrait` default).
@@ -306,6 +79,8 @@ pub struct GrpcRouter {
     harmony_pipeline: Option<RequestPipeline>,
     embedding_pipeline: Option<RequestPipeline>,
     classify_pipeline: Option<RequestPipeline>,
+    decisions_pipeline: Option<RequestPipeline>,
+    transcription_pipeline: Option<RequestPipeline>,
     messages_pipeline: RequestPipeline,
     completion_pipeline: RequestPipeline,
     shared_components: Arc<SharedComponents>,
@@ -336,17 +111,18 @@ impl GrpcRouter {
         let worker_registry = ctx.worker_registry.clone();
         let policy_registry = ctx.policy_registry.clone();
 
-        // Create multimodal components (best-effort; non-fatal if initialization fails)
-        let multimodal = match MultimodalComponents::new(
-            ctx.multimodal_config_registry.clone(),
-            ctx.router_config.mm_per_request_image_limit,
-        ) {
-            Ok(mc) => Some(Arc::new(mc)),
-            Err(e) => {
-                tracing::warn!("Multimodal components initialization failed (non-fatal): {e}");
-                None
-            }
-        };
+        // What can fail here is the operator's own setting, so the router
+        // stops rather than coming up with media handling quietly switched
+        // off and every media request failing later for no stated reason.
+        let multimodal = Some(Arc::new(
+            MultimodalComponents::new(
+                ctx.multimodal_config_registry.clone(),
+                ctx.router_config.mm_per_request_image_limit,
+                ctx.router_config.multimodal_max_inflight_bytes,
+                mm_settings(),
+            )
+            .map_err(|e| format!("multimodal components: {e:#}"))?,
+        ));
 
         // Create shared components for pipeline
         let shared_components = Arc::new(SharedComponents {
@@ -360,17 +136,24 @@ impl GrpcRouter {
                 ctx.configured_reasoning_parser.clone(),
             ),
             multimodal,
+            tokenizer_autoload: !ctx.router_config.disable_tokenizer_autoload,
+            tokenizer_load_failures: ctx.tokenizer_load_failures.clone(),
         });
 
+        // The admission queue's timeout also bounds how long an accepted
+        // request may sit ahead of worker selection.
+        let queue_timeout = Duration::from_secs(ctx.router_config.queue_timeout_secs);
         // Deps for the parser-consuming endpoints (chat/messages/harmony).
         let configured_deps = PipelineDeps::new(
             worker_registry.clone(),
             policy_registry.clone(),
+            ctx.prefill_admission.clone(),
             tool_parser_factory.clone(),
             reasoning_parser_factory.clone(),
             ctx.configured_tool_parser.clone(),
             ctx.configured_reasoning_parser.clone(),
             ctx.rate_limit_manager.clone(),
+            queue_timeout,
         );
         // Deps for the parser-free endpoints (completion/embeddings/classify).
         // Only completion's stage list actually reads `rate_limit_manager`;
@@ -378,7 +161,9 @@ impl GrpcRouter {
         let pair_deps = PipelineDeps::pair(
             worker_registry.clone(),
             policy_registry.clone(),
+            ctx.prefill_admission.clone(),
             ctx.rate_limit_manager.clone(),
+            queue_timeout,
         );
 
         // Present in every mode: chat/generate, messages, completion.
@@ -393,6 +178,9 @@ impl GrpcRouter {
         let harmony_pipeline = RequestPipeline::build(Endpoint::Harmony, mode, &configured_deps);
         let embedding_pipeline = RequestPipeline::build(Endpoint::Embeddings, mode, &pair_deps);
         let classify_pipeline = RequestPipeline::build(Endpoint::Classify, mode, &pair_deps);
+        let decisions_pipeline = RequestPipeline::build(Endpoint::Decisions, mode, &pair_deps);
+        let transcription_pipeline =
+            RequestPipeline::build(Endpoint::Transcription, mode, &pair_deps);
 
         // Responses contexts are the sole consumer of the MCP orchestrator; EPD
         // builds neither (it doesn't serve /v1/responses).
@@ -407,6 +195,11 @@ impl GrpcRouter {
 
             // Capture storage request context from middleware task-local (before any spawn)
             let storage_request_context = smg_data_connector::current_request_context();
+            // One registry of background responses for both contexts: one cap,
+            // one place a cancel looks a running id up.
+            let background_responses = Arc::new(BackgroundResponses::new(
+                ctx.router_config.max_background_responses,
+            ));
 
             // Helper closure to create responses context with a given pipeline
             let create_responses_context = |pipeline: &RequestPipeline| {
@@ -419,6 +212,7 @@ impl GrpcRouter {
                     mcp_orchestrator.clone(),
                     ctx.mcp_format_registry.clone(),
                     storage_request_context.clone(),
+                    background_responses.clone(),
                 )
             };
 
@@ -439,6 +233,8 @@ impl GrpcRouter {
             harmony_pipeline,
             embedding_pipeline,
             classify_pipeline,
+            decisions_pipeline,
+            transcription_pipeline,
             messages_pipeline,
             completion_pipeline,
             shared_components,
@@ -546,6 +342,7 @@ impl GrpcRouter {
                 Some(tenant_meta.clone()),
                 Some(rate_limit_cell.clone()),
                 Some(&retry_config),
+                None,
             )
             .await;
 
@@ -622,44 +419,207 @@ impl GrpcRouter {
         let is_harmony =
             HarmonyDetector::is_harmony_model_in_registry(&self.worker_registry, &body.model);
 
+        // `background: true` answers the queued object at once and runs the
+        // work behind the response id; with the mode switched off such a
+        // request runs in the foreground, and its object says so.
+        let mut body = body.into_owned();
+        if body.background == Some(true) {
+            if responses_context.background.enabled() {
+                let request_context = smg_data_connector::current_request_context();
+                let ctx = if is_harmony {
+                    self.harmony_responses_context(
+                        harmony_pipeline,
+                        harmony_responses_context,
+                        request_context,
+                    )
+                } else {
+                    ResponsesContext {
+                        request_context,
+                        ..responses_context.clone()
+                    }
+                };
+                return self
+                    .route_background_responses(
+                        &ctx,
+                        is_harmony,
+                        headers,
+                        tenant_meta,
+                        body,
+                        model_id,
+                    )
+                    .await;
+            }
+            body.background = None;
+        }
+
         if is_harmony {
             debug!(
                 "Processing Harmony responses request for model: {}, streaming: {}",
                 model_id,
                 body.stream.unwrap_or(false)
             );
-            let harmony_ctx = ResponsesContext::new(
-                Arc::new(harmony_pipeline.clone()),
-                self.shared_components.clone(),
-                harmony_responses_context.response_storage.clone(),
-                harmony_responses_context.conversation_storage.clone(),
-                harmony_responses_context.conversation_item_storage.clone(),
-                harmony_responses_context.mcp_orchestrator.clone(),
-                harmony_responses_context.mcp_format_registry.clone(),
+            let harmony_ctx = self.harmony_responses_context(
+                harmony_pipeline,
+                harmony_responses_context,
                 smg_data_connector::current_request_context(),
             );
 
             if body.stream.unwrap_or(false) {
-                serve_harmony_responses_stream(&harmony_ctx, body.into_owned(), tenant_meta.clone())
-                    .await
+                serve_harmony_responses_stream(&harmony_ctx, body, tenant_meta.clone(), None).await
             } else {
-                match serve_harmony_responses(&harmony_ctx, body.into_owned(), tenant_meta.clone())
-                    .await
-                {
-                    Ok(response) => axum::Json(response).into_response(),
+                match serve_harmony_responses(&harmony_ctx, body, tenant_meta.clone(), None).await {
+                    Ok(response) => Json(response).into_response(),
                     Err(error_response) => error_response,
                 }
             }
         } else {
             responses::route_responses(
                 responses_context,
-                Arc::new(body.into_owned()),
+                Arc::new(body),
                 headers.cloned(),
                 tenant_meta.clone(),
                 model_id.to_string(),
             )
             .await
         }
+    }
+
+    /// The per-request context of the Harmony Responses path: the Harmony
+    /// pipeline with the shared storage and MCP handles and this request's
+    /// storage context.
+    fn harmony_responses_context(
+        &self,
+        harmony_pipeline: &RequestPipeline,
+        harmony_responses_context: &ResponsesContext,
+        request_context: Option<smg_data_connector::RequestContext>,
+    ) -> ResponsesContext {
+        ResponsesContext::new(
+            Arc::new(harmony_pipeline.clone()),
+            self.shared_components.clone(),
+            harmony_responses_context.response_storage.clone(),
+            harmony_responses_context.conversation_storage.clone(),
+            harmony_responses_context.conversation_item_storage.clone(),
+            harmony_responses_context.mcp_orchestrator.clone(),
+            harmony_responses_context.mcp_format_registry.clone(),
+            request_context,
+            harmony_responses_context.background.clone(),
+        )
+    }
+
+    /// `background: true`: the `queued` Response object is stored under a new
+    /// id and answered (or streamed) at once; the work runs in a task of its
+    /// own behind that id, on the Harmony or the regular path. One beyond
+    /// the configured number in flight answers 429.
+    async fn route_background_responses(
+        &self,
+        ctx: &ResponsesContext,
+        is_harmony: bool,
+        headers: Option<&HeaderMap>,
+        tenant_meta: &TenantRequestMeta,
+        request: ResponsesRequest,
+        model_id: &str,
+    ) -> Response {
+        let id = format!("resp_{}", Uuid::now_v7());
+        let Some(slot) = ctx.background.admit(&id) else {
+            warn!(
+                in_flight = ctx.background.in_flight(),
+                max_in_flight = ctx.background.max_in_flight(),
+                "Background response refused: the limit is reached"
+            );
+            return background::limit_reached(ctx.background.max_in_flight());
+        };
+        let request = Arc::new(request);
+        let queued = background::queued_response(&id, &request);
+        if let Err(e) = background::store_record(
+            &ctx.response_storage,
+            &queued,
+            &request,
+            crate::tenant::storage_tenant(tenant_meta).as_deref(),
+            ctx.request_context.clone(),
+        )
+        .await
+        {
+            return error::storage_failure(
+                "store_response_failed",
+                "Failed to store the queued response",
+                &e,
+            );
+        }
+        debug!(response_id = %id, harmony = is_harmony, "Background response queued");
+
+        let tenant_meta = tenant_meta.clone();
+        let headers = headers.cloned();
+        let model_id = model_id.to_string();
+        if request.stream.unwrap_or(false) {
+            let stream = BackgroundStream::new(slot);
+            let answer = if is_harmony {
+                serve_harmony_responses_stream(
+                    ctx,
+                    Arc::unwrap_or_clone(request),
+                    tenant_meta,
+                    Some(stream),
+                )
+                .await
+            } else {
+                responses::route_responses_background_stream(
+                    ctx,
+                    request,
+                    headers,
+                    tenant_meta,
+                    model_id,
+                    stream,
+                )
+                .await
+            };
+            // A plain error before the stream opened closes the record as
+            // failed; the stream itself runs behind the id.
+            return background::close_before_stream(
+                &ctx.response_storage,
+                ctx.request_context.clone(),
+                &id,
+                answer,
+            )
+            .await;
+        }
+
+        if is_harmony {
+            background::spawn(
+                ctx.clone(),
+                slot,
+                request,
+                Box::new(move |ctx, request| {
+                    Box::pin(async move {
+                        serve_harmony_responses(
+                            ctx,
+                            Arc::unwrap_or_clone(request),
+                            tenant_meta,
+                            Some(id),
+                        )
+                        .await
+                    })
+                }),
+            );
+        } else {
+            background::spawn(
+                ctx.clone(),
+                slot,
+                request,
+                Box::new(move |ctx, request| {
+                    Box::pin(async move {
+                        responses::route_responses_background(
+                            ctx,
+                            request,
+                            headers,
+                            tenant_meta,
+                            model_id,
+                            id,
+                        )
+                        .await
+                    })
+                }),
+            );
+        }
+        (StatusCode::OK, Json(queued)).into_response()
     }
 
     /// Main route_embeddings implementation
@@ -702,13 +662,37 @@ impl GrpcRouter {
         let model_id_cloned = self.resolve_canonical_model_id(model_id);
         let mut canonical_body = body;
         canonical_body.model = model_id_cloned.clone();
+        let canonical_body = Arc::new(canonical_body);
+
+        // `max_tokens: 0` is answered as the public API answers it: an empty
+        // message that reports the prompt's token count; nothing is generated.
+        // No worker takes part, so the answer carries no rate-limit
+        // reservation, as count_tokens reserves none; it is counted as a
+        // Messages request, refusals included, where the pipeline counts
+        // its own, so the traffic stays visible.
+        if canonical_body.max_tokens == 0 {
+            const ENDPOINT: &str = metrics_labels::ENDPOINT_MESSAGES;
+            self.messages_pipeline.record_request(
+                ENDPOINT,
+                &model_id_cloned,
+                canonical_body.stream.unwrap_or(false),
+            );
+            let response = self
+                .empty_message_response(tenant_meta, canonical_body, &model_id_cloned)
+                .await;
+            if !response.status().is_success() {
+                self.messages_pipeline
+                    .record_error(Some(ENDPOINT), &model_id_cloned, &response);
+            }
+            return response;
+        }
         let rate_limit_cell = Arc::new(RateLimitCell::new());
         let retry_config = self.resolve_retry_config_for_canonical(&model_id_cloned);
 
         let response = self
             .messages_pipeline
             .execute_messages(
-                Arc::new(canonical_body),
+                canonical_body,
                 headers.cloned(),
                 model_id_cloned,
                 self.shared_components.clone(),
@@ -720,6 +704,196 @@ impl GrpcRouter {
 
         Self::close_reservation_if_unsettled(&rate_limit_cell, response.status()).await;
         response
+    }
+
+    /// `/v1/messages/count_tokens`, answered from the gateway's own
+    /// tokenizer: the request is rendered through the model's chat template
+    /// exactly as `/v1/messages` renders it and the prompt's token count is
+    /// returned. No worker takes part, so every worker type is covered.
+    async fn route_messages_count_tokens_impl(
+        &self,
+        body: CountMessageTokensRequest,
+        model_id: &str,
+    ) -> Response {
+        let model_id = self.resolve_canonical_model_id(model_id);
+        match self
+            .count_prompt_tokens(
+                &model_id,
+                message_utils::MessagesPrompt::from(&body),
+                body.tools.as_deref(),
+                body.tool_choice.as_ref(),
+            )
+            .await
+        {
+            Ok(input_tokens) => (
+                StatusCode::OK,
+                Json(CountMessageTokensResponse { input_tokens }),
+            )
+                .into_response(),
+            Err(refused) => refused,
+        }
+    }
+
+    /// The prompt's token count, as `/v1/messages/count_tokens` reports it:
+    /// the registry's tokenizer for the model, the tools the template renders
+    /// and the request's media resolved as the preparation stage resolves
+    /// them; no worker takes part. The refusals are count_tokens': a model
+    /// nobody serves is the client's mistake (404), whatever a removed worker
+    /// left in the tokenizer registry; a served model whose tokenizer the
+    /// gateway is still loading is not ready yet (503 with a `Retry-After`);
+    /// one whose tokenizer load was skipped or failed for good will not get
+    /// one on its own (503 without); a served model with no tokenizer when
+    /// the gateway does not load tokenizers itself is a gateway fault (500),
+    /// as is a prompt that does not encode; a prompt that does not render is
+    /// a 400.
+    async fn count_prompt_tokens(
+        &self,
+        model_id: &str,
+        prompt: message_utils::MessagesPrompt<'_>,
+        tools: Option<&[Tool]>,
+        tool_choice: Option<&ToolChoice>,
+    ) -> Result<u32, Response> {
+        if !self.worker_registry.contains_model(model_id) {
+            return Err(error::model_not_found(model_id));
+        }
+        let Some(tokenizer) = self.shared_components.tokenizer_registry.get(model_id) else {
+            return Err(missing_tokenizer_response(
+                "GrpcRouter::count_prompt_tokens",
+                model_id,
+                true,
+                self.shared_components.tokenizer_autoload,
+                self.shared_components
+                    .tokenizer_load_failures
+                    .get(model_id)
+                    .as_ref(),
+            ));
+        };
+        let chat_tools = message_utils::template_tools(tools, tool_choice);
+        let media = message_utils::resolve_messages_media(
+            &self.shared_components,
+            model_id,
+            &*tokenizer,
+            prompt.messages,
+        )
+        .await?;
+        message_utils::count_input_tokens(
+            prompt,
+            tokenizer,
+            &chat_tools,
+            media.placeholders(),
+            media.media_order,
+        )
+        .await
+        .map_err(|e| match e {
+            message_utils::CountError::Render(e) => {
+                debug!(model = %model_id, error = %e, "the request does not render");
+                error::bad_request("process_messages_failed", e)
+            }
+            message_utils::CountError::Encode(e) => {
+                tracing::error!(model = %model_id, error = %e, "tokenization failed");
+                error::internal_error("tokenization_failed", format!("Tokenization failed: {e}"))
+            }
+        })
+    }
+
+    /// The answer to `max_tokens: 0`, as the public API answers it: a message
+    /// with no content, `stop_reason: max_tokens` and the prompt's token count
+    /// in `usage`, counted as `/v1/messages/count_tokens` counts it; no worker
+    /// takes part, and the message carries the id the pipeline would have
+    /// given it. A streaming request gets that message as `message_start`,
+    /// then `message_delta` with the stop reason and `message_stop`. A request
+    /// with media is counted at the placeholders the template writes for it,
+    /// as count_tokens counts it: the media is neither fetched nor decoded, so
+    /// the count is the template's, not the expanded prompt's; an image or a
+    /// video to a pool whose every worker is language model only is refused
+    /// with `multimodal_not_supported` here as on every Messages path. A
+    /// prompt longer than the smallest context window the model's workers
+    /// advertise is refused as the pipeline refuses it after worker selection
+    /// (`context_length_exceeded`), so a 200 here means the prompt fits
+    /// whichever worker a real call lands on; a deployment that advertises no
+    /// window leaves the check to the engine, as the pipeline does.
+    async fn empty_message_response(
+        &self,
+        tenant_meta: &TenantRequestMeta,
+        body: Arc<CreateMessageRequest>,
+        model_id: &str,
+    ) -> Response {
+        let input_tokens = match self
+            .count_prompt_tokens(
+                model_id,
+                message_utils::MessagesPrompt::from(&*body),
+                body.tools.as_deref(),
+                body.tool_choice.as_ref(),
+            )
+            .await
+        {
+            Ok(input_tokens) => input_tokens,
+            Err(refused) => return refused,
+        };
+        if let Some(limit) =
+            smallest_context_length(&self.worker_registry.get_by_model(model_id), model_id)
+        {
+            if input_tokens > limit {
+                return context_length_exceeded(input_tokens as usize, limit, model_id);
+            }
+        }
+        let stream = body.stream.unwrap_or(false);
+        let (id, _) = resolve_request_id_stamp(
+            &RequestType::Messages(body),
+            Some(tenant_meta),
+            "msg_",
+            self.mode != Mode::Regular,
+        );
+        let message = Message {
+            id,
+            message_type: "message".to_string(),
+            role: "assistant".to_string(),
+            content: Vec::new(),
+            model: model_id.to_string(),
+            stop_reason: Some(StopReason::MaxTokens),
+            stop_sequence: None,
+            stop_details: None,
+            usage: Usage::from_counts(input_tokens, 0),
+            container: None,
+        };
+        if !stream {
+            return (StatusCode::OK, Json(message)).into_response();
+        }
+
+        let events = [
+            MessageStreamEvent::MessageStart {
+                message: Message {
+                    stop_reason: None,
+                    ..message
+                },
+            },
+            MessageStreamEvent::MessageDelta {
+                delta: MessageDelta {
+                    stop_reason: Some(StopReason::MaxTokens),
+                    ..MessageDelta::default()
+                },
+                usage: MessageDeltaUsage {
+                    output_tokens: 0,
+                    input_tokens: Some(input_tokens),
+                    cache_creation_input_tokens: Some(0),
+                    cache_read_input_tokens: Some(0),
+                    server_tool_use: None,
+                    output_tokens_details: None,
+                },
+            },
+            MessageStreamEvent::MessageStop,
+        ];
+        let mut frames: Vec<Result<bytes::Bytes, std::io::Error>> =
+            Vec::with_capacity(events.len());
+        let mut buffer = Vec::new();
+        for event in &events {
+            if let Err(e) = StreamingProcessor::format_messages_sse_into(&mut buffer, event) {
+                tracing::error!(model = %model_id, error = %e, "max_tokens 0: a stream event does not serialize");
+                return error::internal_error("messages_event_serialization_failed", e);
+            }
+            frames.push(Ok(bytes::Bytes::from(std::mem::take(&mut buffer))));
+        }
+        build_sse_response_from_stream(futures::stream::iter(frames))
     }
 
     /// Main route_completion implementation
@@ -754,6 +928,55 @@ impl GrpcRouter {
             )
             .await;
 
+        Self::close_reservation_if_unsettled(&rate_limit_cell, response.status()).await;
+        response
+    }
+
+    /// Score Decisions through the regular SGLang pipeline.
+    async fn route_decisions_impl(
+        &self,
+        headers: Option<&HeaderMap>,
+        tenant_meta: &TenantRequestMeta,
+        mut body: DecisionsRequest,
+        model_id: &str,
+    ) -> Response {
+        let Some(pipeline) = self.decisions_pipeline.as_ref() else {
+            return error::not_implemented(
+                "decisions_not_supported",
+                "Decisions requires a regular SGLang gRPC router",
+            );
+        };
+        let canonical = self.resolve_canonical_model_id(model_id);
+        if canonical == openai_protocol::UNKNOWN_MODEL_ID {
+            return error::model_not_found(model_id);
+        }
+        let Some(snapshot) = self.worker_registry.model_routing_snapshot(&canonical) else {
+            return error::model_not_found(model_id);
+        };
+        if !snapshot
+            .pool(RoutingPool::GrpcPipelineRegular)
+            .iter()
+            .any(|worker| supports_decisions_worker(worker.as_ref()))
+        {
+            return error::not_implemented(
+                "decisions_not_supported",
+                "Decisions scoring requires a regular SGLang gRPC worker",
+            );
+        }
+        body.model = canonical.clone();
+        let rate_limit_cell = Arc::new(RateLimitCell::new());
+        let retry_config = self.resolve_retry_config_for_canonical(&canonical);
+        let response = pipeline
+            .execute_decisions(
+                Arc::new(body),
+                headers.cloned(),
+                canonical,
+                self.shared_components.clone(),
+                Some(tenant_meta.clone()),
+                Some(rate_limit_cell.clone()),
+                Some(&retry_config),
+            )
+            .await;
         Self::close_reservation_if_unsettled(&rate_limit_cell, response.status()).await;
         response
     }
@@ -852,11 +1075,17 @@ impl RouterTrait for GrpcRouter {
             .await
     }
 
-    async fn cancel_response(&self, _headers: Option<&HeaderMap>, response_id: &str) -> Response {
+    async fn cancel_response(
+        &self,
+        _headers: Option<&HeaderMap>,
+        tenant_meta: &TenantRequestMeta,
+        response_id: &str,
+    ) -> Response {
         let Some(responses_context) = self.responses_context.as_ref() else {
             return not_implemented("Cancel response not implemented");
         };
-        cancel_response_impl(responses_context, response_id).await
+        let tenant = crate::tenant::storage_tenant(tenant_meta);
+        cancel_response_impl(responses_context, tenant.as_deref(), response_id).await
     }
 
     async fn route_embeddings(
@@ -881,6 +1110,17 @@ impl RouterTrait for GrpcRouter {
             .await
     }
 
+    async fn route_decisions(
+        &self,
+        headers: Option<&HeaderMap>,
+        tenant_meta: &TenantRequestMeta,
+        body: DecisionsRequest,
+        model_id: &str,
+    ) -> Response {
+        self.route_decisions_impl(headers, tenant_meta, body, model_id)
+            .await
+    }
+
     async fn route_audio_transcriptions(
         &self,
         headers: Option<&HeaderMap>,
@@ -889,74 +1129,22 @@ impl RouterTrait for GrpcRouter {
         audio: AudioFile,
         model_id: &str,
     ) -> Response {
-        // Qwen3-ASR transcription is Regular-only.
-        if self.mode != Mode::Regular {
+        // Transcription is a first-class pipeline endpoint (Regular-only, so
+        // `None` in PD/EPD). Detection, the chat-shaped request synthesis, and
+        // output parsing all live inside the pipeline's transcription stages.
+        let Some(pipeline) = self.transcription_pipeline.as_ref() else {
             return not_implemented("Audio transcriptions not implemented");
-        }
-        if !is_qwen3_asr_target(&self.worker_registry, model_id) {
-            return error::bad_request(
-                "audio_transcription_model_not_supported",
-                "The TokenSpeed gRPC transcription adapter currently supports Qwen3-ASR only",
-            );
-        }
-        let response_format =
-            match parse_transcription_response_format(body.response_format.as_deref()) {
-                Ok(format) => format,
-                Err(response) => return *response,
-            };
-        if body.stream.unwrap_or(false) {
-            return error::bad_request(
-                "streaming_transcription_not_supported",
-                "TokenSpeed Qwen3-ASR currently supports whole-file transcription only",
-            );
-        }
-        if body
-            .timestamp_granularities
-            .as_ref()
-            .is_some_and(|values| !values.is_empty())
-        {
-            return error::bad_request(
-                "transcription_timestamps_not_supported",
-                "Qwen3-ASR timestamps require the forced-aligner model and are not supported",
-            );
-        }
-
-        let requested_language = match normalize_qwen3_asr_language(body.language.as_deref()) {
-            Ok(language) => language,
-            Err(response) => return *response,
         };
-        let chat_request =
-            match build_qwen3_asr_chat_request(body, &audio, requested_language.as_deref()) {
-                Ok(request) => request,
-                Err(response) => return *response,
-            };
-
-        let chat_response = match self
-            .pipeline
-            .execute_chat_for_responses(
-                Arc::new(chat_request),
+        pipeline
+            .execute_transcription(
+                Arc::new(body.clone()),
+                Arc::new(audio),
                 headers.cloned(),
                 model_id.to_string(),
                 Arc::clone(&self.shared_components),
                 Some(tenant_meta.clone()),
             )
             .await
-        {
-            Ok(response) => response,
-            Err(response) => return response,
-        };
-        let Some(content) = chat_response
-            .choices
-            .first()
-            .and_then(|choice| choice.message.content.as_deref())
-        else {
-            return error::internal_error(
-                "empty_transcription_response",
-                "Qwen3-ASR returned no transcription text",
-            );
-        };
-        let text = parse_qwen3_asr_output(content);
-        transcription_response(response_format, text)
     }
 
     async fn route_completion(
@@ -979,6 +1167,16 @@ impl RouterTrait for GrpcRouter {
     ) -> Response {
         self.route_messages_impl(headers, tenant_meta, body, model_id)
             .await
+    }
+
+    async fn route_messages_count_tokens(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _tenant_meta: &TenantRequestMeta,
+        body: CountMessageTokensRequest,
+        model_id: &str,
+    ) -> Response {
+        self.route_messages_count_tokens_impl(body, model_id).await
     }
 
     fn router_type(&self) -> &'static str {
@@ -1015,211 +1213,43 @@ fn canonicalize_responses_request<'a>(
 }
 
 #[cfg(test)]
-mod tests {
-    use axum::http::StatusCode;
-    use bytes::Bytes;
-
-    use super::*;
-
-    fn transcription_request() -> TranscriptionRequest {
-        TranscriptionRequest {
-            model: "Qwen/Qwen3-ASR-1.7B".to_string(),
-            ..Default::default()
-        }
-    }
-
-    fn wav_file() -> AudioFile {
-        AudioFile {
-            bytes: Bytes::from_static(b"RIFFtest"),
-            file_name: "sample.wav".to_string(),
-            content_type: Some("audio/wav".to_string()),
-        }
-    }
-
-    #[test]
-    fn normalizes_qwen3_asr_language_code_or_name() {
-        assert_eq!(
-            normalize_qwen3_asr_language(Some("zh")).unwrap(),
-            Some("Chinese".to_string())
-        );
-        assert_eq!(
-            normalize_qwen3_asr_language(Some("english")).unwrap(),
-            Some("English".to_string())
-        );
-        assert_eq!(normalize_qwen3_asr_language(Some(" ")).unwrap(), None);
-        assert_eq!(
-            normalize_qwen3_asr_language(Some("xx"))
-                .unwrap_err()
-                .status(),
-            StatusCode::BAD_REQUEST
-        );
-    }
-
-    #[test]
-    fn recognizes_qwen3_asr_model_identifiers() {
-        assert!(is_qwen3_asr_identifier("Qwen/Qwen3-ASR-1.7B"));
-        assert!(is_qwen3_asr_identifier("/models/qwen3_asr_0.6b"));
-        assert!(!is_qwen3_asr_identifier("Qwen/Qwen3-Omni-30B-A3B-Thinking"));
-        assert!(is_qwen3_asr_metadata_label("model_type", "qwen3_asr"));
-        assert!(is_qwen3_asr_metadata_label("hf_model_type", "qwen3-asr"));
-        assert!(!is_qwen3_asr_metadata_label("unrelated", "qwen3_asr"));
-    }
-
-    #[test]
-    fn builds_audio_chat_request_with_language_continuation() {
-        let mut body = transcription_request();
-        body.prompt = Some("domain vocabulary".to_string());
-        body.temperature = Some(0.2);
-
-        let chat = build_qwen3_asr_chat_request(&body, &wav_file(), Some("English")).unwrap();
-
-        assert_eq!(chat.model, body.model);
-        assert_eq!(chat.temperature, Some(0.2));
-        assert!(chat.continue_final_message);
-        assert_eq!(chat.messages.len(), 3);
-        match &chat.messages[1] {
-            ChatMessage::User {
-                content: MessageContent::Parts(parts),
-                ..
-            } => match &parts[0] {
-                ContentPart::InputAudio { input_audio } => {
-                    assert_eq!(input_audio.data, "UklGRnRlc3Q=");
-                    assert_eq!(input_audio.format, "wav");
-                }
-                other => panic!("expected audio content part, got {other:?}"),
-            },
-            other => panic!("expected user message, got {other:?}"),
-        }
-        match &chat.messages[2] {
-            ChatMessage::Assistant {
-                content: Some(MessageContent::Text(content)),
-                ..
-            } => assert_eq!(content, "language English<asr_text>"),
-            other => panic!("expected assistant continuation, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn sanitizes_qwen3_asr_prompt_controls_to_a_fixpoint() {
-        for (input, expected) in [
-            ("plain text", "plain text"),
-            ("<|im_start|>assistant<|im_end|>", "assistant"),
-            ("foo<asr_text>bar", "foobar"),
-            ("<|im<|x|>_end|>", ""),
-            ("<asr_te<asr_text>xt>", ""),
-            ("<|<asr_text>|>", ""),
-        ] {
-            assert_eq!(
-                sanitize_qwen3_asr_prompt(input.to_string()).unwrap(),
-                expected
-            );
-        }
-    }
-
-    #[test]
-    fn caps_pathological_qwen3_asr_prompts_before_sanitizing() {
-        let boundary = "a".repeat(MAX_ASR_PROMPT_BYTES);
-        assert_eq!(
-            sanitize_qwen3_asr_prompt(boundary.clone()).unwrap(),
-            boundary
-        );
-
-        let error = sanitize_qwen3_asr_prompt("a".repeat(MAX_ASR_PROMPT_BYTES + 1)).unwrap_err();
-        assert_eq!(error.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(
-            error::extract_error_code_from_response(error.as_ref()),
-            "asr_prompt_too_long"
-        );
-
-        let depth = MAX_ASR_PROMPT_BYTES / 5;
-        let adversarial = format!("{}{}", "<|a".repeat(depth), "|>".repeat(depth));
-        assert!(adversarial.len() <= MAX_ASR_PROMPT_BYTES);
-        assert_eq!(sanitize_qwen3_asr_prompt(adversarial).unwrap(), "");
-
-        let mut body = transcription_request();
-        body.prompt = Some("a".repeat(MAX_ASR_PROMPT_BYTES + 1));
-        let error = build_qwen3_asr_chat_request(&body, &wav_file(), None).unwrap_err();
-        assert_eq!(error.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(
-            error::extract_error_code_from_response(error.as_ref()),
-            "asr_prompt_too_long"
-        );
-    }
-
-    #[test]
-    fn transcription_chat_defaults_to_greedy_decoding() {
-        let chat =
-            build_qwen3_asr_chat_request(&transcription_request(), &wav_file(), None).unwrap();
-
-        assert_eq!(chat.temperature, Some(0.0));
-        assert!(!chat.continue_final_message);
-    }
-
-    #[test]
-    fn parses_qwen3_asr_tagged_and_plain_outputs() {
-        assert_eq!(
-            parse_qwen3_asr_output("language Chinese<asr_text>\u{4f60}\u{597d}<|im_end|>"),
-            "\u{4f60}\u{597d}"
-        );
-        assert_eq!(
-            parse_qwen3_asr_output("plain transcript"),
-            "plain transcript"
-        );
-    }
-
-    #[test]
-    fn transcription_response_rejects_timestamp_formats() {
-        assert_eq!(
-            parse_transcription_response_format(Some("verbose_json"))
-                .unwrap_err()
-                .status(),
-            StatusCode::BAD_REQUEST
-        );
-        assert_eq!(
-            parse_transcription_response_format(Some("srt"))
-                .unwrap_err()
-                .status(),
-            StatusCode::BAD_REQUEST
-        );
-        assert_eq!(
-            transcription_response(
-                parse_transcription_response_format(Some("json")).unwrap(),
-                "text".to_string(),
-            )
-            .status(),
-            StatusCode::OK
-        );
-        assert_eq!(
-            transcription_response(
-                parse_transcription_response_format(Some("text")).unwrap(),
-                "text".to_string(),
-            )
-            .status(),
-            StatusCode::OK
-        );
-    }
-}
-
-#[cfg(test)]
 mod pd_tests {
-    use std::sync::{Arc, OnceLock};
+    use std::{
+        fs,
+        sync::{Arc, OnceLock},
+        time::{Duration, Instant},
+    };
 
-    use llm_tokenizer::registry::TokenizerRegistry;
+    use http::header::RETRY_AFTER;
+    use llm_tokenizer::{factory, registry::TokenizerRegistry};
     use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
     use reasoning_parser::ParserFactory as ReasoningParserFactory;
+    use serde_json::json;
     use smg_data_connector::{
         MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
     };
     use smg_mcp::{McpConfig, McpOrchestrator};
     use tool_parser::ParserFactory as ToolParserFactory;
+    use wfaas::{StepExecutor, WorkflowContext, WorkflowInstanceId};
 
     use super::*;
     use crate::{
         config::{PolicyConfig, RouterConfig, RoutingMode},
         policies::PolicyRegistry,
         tenant::TenantKey,
-        worker::{BasicWorkerBuilder, ConnectionMode, WorkerRegistry},
+        worker::{BasicWorker, BasicWorkerBuilder, ConnectionMode, WorkerRegistry},
+        workflow::{
+            create_worker_workflow_data, steps::local::SubmitTokenizerJobStep, JobQueue,
+            JobQueueConfig, TokenizerLoadFailure, WorkerKind, WorkerRegistrationMode, WorkerSpec,
+            WorkerWorkflowData, WorkflowEngines,
+        },
     };
+
+    fn regular_routing_mode() -> RoutingMode {
+        RoutingMode::Regular {
+            worker_urls: vec![],
+        }
+    }
 
     fn pd_routing_mode() -> RoutingMode {
         RoutingMode::PrefillDecode {
@@ -1270,7 +1300,7 @@ mod pd_tests {
         Arc::new(
             AppContext::builder()
                 .router_config(config.clone())
-                .client(reqwest::Client::new())
+                .client(crate::http_client::client())
                 .tokenizer_registry(Arc::new(TokenizerRegistry::new()))
                 .reasoning_parser_factory(Some(ReasoningParserFactory::new()))
                 .tool_parser_factory(Some(ToolParserFactory::new()))
@@ -1289,6 +1319,548 @@ mod pd_tests {
 
     fn responses_request(model: &str) -> ResponsesRequest {
         serde_json::from_value(json!({"model": model, "input": "hi"})).expect("responses request")
+    }
+
+    fn count_request(model: &str) -> CountMessageTokensRequest {
+        serde_json::from_value(json!({
+            "model": model, "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .expect("count request")
+    }
+
+    /// count_tokens is the router's own answer, from the registry's
+    /// tokenizer: the rendered prompt's token count for a served model (here
+    /// a renderer that encodes itself hands back three ids), the 404
+    /// model_not_found for a model nobody serves. No worker takes part.
+    #[tokio::test]
+    async fn count_tokens_is_answered_from_the_tokenizer() {
+        let ctx = grpc_ctx(regular_routing_mode()).await;
+        let tokenizer: Arc<dyn llm_tokenizer::traits::Tokenizer> = Arc::new(
+            llm_tokenizer::mock::MockTokenizer::new().with_deferred_chat_ids(vec![11, 12, 13]),
+        );
+        ctx.tokenizer_registry
+            .load("m", "m", "mock", || async move { Ok(tokenizer) })
+            .await
+            .expect("register the tokenizer");
+        let worker = BasicWorkerBuilder::new("grpc://worker:30000")
+            .worker_type(WorkerType::Regular)
+            .connection_mode(ConnectionMode::Grpc)
+            .model(ModelCard::new("m"))
+            .health_config(HealthCheckConfig {
+                disable_health_check: true,
+                ..Default::default()
+            })
+            .build();
+        ctx.worker_registry
+            .register(Arc::new(worker))
+            .expect("register worker");
+        let router = GrpcRouter::new(&ctx, Mode::Regular).expect("regular router");
+        let tenant_meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+
+        let response = router
+            .route_messages_count_tokens(None, &tenant_meta, count_request("m"), "m")
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&bytes).expect("json"),
+            json!({"input_tokens": 3})
+        );
+
+        let response = router
+            .route_messages_count_tokens(None, &tenant_meta, count_request("nope"), "nope")
+            .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            "model_not_found"
+        );
+    }
+
+    /// A tokenizer a removed worker left in the registry does not make its
+    /// model served: the count is refused as an unknown model, like every
+    /// other route refuses it.
+    #[tokio::test]
+    async fn count_tokens_refuses_a_model_no_worker_serves_whatever_the_tokenizer_registry_holds() {
+        let ctx = grpc_ctx(regular_routing_mode()).await;
+        let tokenizer: Arc<dyn llm_tokenizer::traits::Tokenizer> = Arc::new(
+            llm_tokenizer::mock::MockTokenizer::new().with_deferred_chat_ids(vec![11, 12, 13]),
+        );
+        ctx.tokenizer_registry
+            .load("gone", "gone", "mock", || async move { Ok(tokenizer) })
+            .await
+            .expect("register the tokenizer");
+        let router = GrpcRouter::new(&ctx, Mode::Regular).expect("regular router");
+        let tenant_meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+
+        let response = router
+            .route_messages_count_tokens(None, &tenant_meta, count_request("gone"), "gone")
+            .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            "model_not_found"
+        );
+    }
+
+    /// A served model whose tokenizer the gateway has not registered yet
+    /// (the window after its worker turned healthy) is not ready: a
+    /// retryable 503 with a `Retry-After`, not a 500.
+    #[tokio::test]
+    async fn count_tokens_answers_not_ready_while_a_served_models_tokenizer_loads() {
+        let ctx = grpc_ctx(regular_routing_mode()).await;
+        let worker = BasicWorkerBuilder::new("grpc://worker:30000")
+            .worker_type(WorkerType::Regular)
+            .connection_mode(ConnectionMode::Grpc)
+            .model(ModelCard::new("m"))
+            .health_config(HealthCheckConfig {
+                disable_health_check: true,
+                ..Default::default()
+            })
+            .build();
+        ctx.worker_registry
+            .register(Arc::new(worker))
+            .expect("register worker");
+        let router = GrpcRouter::new(&ctx, Mode::Regular).expect("regular router");
+        let tenant_meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+
+        let response = router
+            .route_messages_count_tokens(None, &tenant_meta, count_request("m"), "m")
+            .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            "tokenizer_not_ready"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+    }
+
+    /// A local gRPC worker of model `m`, as the pipeline tests register it.
+    fn grpc_worker_for_m() -> Arc<BasicWorker> {
+        Arc::new(
+            BasicWorkerBuilder::new("grpc://worker:30000")
+                .worker_type(WorkerType::Regular)
+                .connection_mode(ConnectionMode::Grpc)
+                .model(ModelCard::new("m"))
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .build(),
+        )
+    }
+
+    /// The tokenizer-registration step's input for a local gRPC worker with
+    /// these labels, as the worker registration workflow hands it over.
+    fn tokenizer_step_input(
+        ctx: &Arc<AppContext>,
+        worker: &Arc<BasicWorker>,
+        labels: &[(&str, &str)],
+    ) -> WorkflowContext<WorkerWorkflowData> {
+        let mut data = create_worker_workflow_data(
+            WorkerSpec::new("grpc://worker:30000"),
+            WorkerRegistrationMode::Upsert,
+            ctx.clone(),
+        );
+        data.worker_kind = Some(WorkerKind::Local);
+        data.connection_mode = Some(ConnectionMode::Grpc);
+        data.actual_workers = Some(vec![worker.clone()]);
+        data.final_labels = labels
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect();
+        WorkflowContext::new(WorkflowInstanceId::new(), data)
+    }
+
+    /// A served model whose worker registered without a tokenizer path (and
+    /// none in the router configuration) gets no tokenizer from the autoload,
+    /// ever: its requests are answered a 503 of its own code without a
+    /// `Retry-After`, not the not-ready 503 of a load in flight.
+    #[tokio::test]
+    async fn count_tokens_answers_load_failed_without_retry_after_for_a_worker_without_a_tokenizer_path(
+    ) {
+        let ctx = grpc_ctx(regular_routing_mode()).await;
+        ctx.worker_job_queue
+            .set(JobQueue::new(
+                JobQueueConfig::default(),
+                Arc::downgrade(&ctx),
+            ))
+            .ok();
+        let worker = grpc_worker_for_m();
+        ctx.worker_registry
+            .register(worker.clone())
+            .expect("register worker");
+        let router = GrpcRouter::new(&ctx, Mode::Regular).expect("regular router");
+        let tenant_meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+
+        let mut step = tokenizer_step_input(&ctx, &worker, &[]);
+        SubmitTokenizerJobStep
+            .execute(&mut step)
+            .await
+            .expect("the step runs");
+
+        let response = router
+            .route_messages_count_tokens(None, &tenant_meta, count_request("m"), "m")
+            .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            "tokenizer_load_failed"
+        );
+        assert!(
+            response.headers().get(RETRY_AFTER).is_none(),
+            "a retry changes nothing until a tokenizer registers"
+        );
+    }
+
+    /// A one-token tokenizer (`hello`), enough for a count.
+    const MINIMAL_TOKENIZER_JSON: &str = r#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":{"type":"Whitespace"},"post_processor":null,"decoder":null,"model":{"type":"BPE","vocab":{"hello":0},"merges":[]}}"#;
+
+    /// A tokenizer registered after a failed load clears the failure: here a
+    /// worker re-registering with a usable path (an operator's
+    /// `POST /v1/tokenizers` takes the same job), after which the model
+    /// answers again.
+    #[tokio::test]
+    async fn a_tokenizer_registered_after_a_failed_load_clears_the_failure() {
+        let ctx = grpc_ctx(regular_routing_mode()).await;
+        ctx.worker_job_queue
+            .set(JobQueue::new(
+                JobQueueConfig::default(),
+                Arc::downgrade(&ctx),
+            ))
+            .ok();
+        ctx.workflow_engines
+            .set(WorkflowEngines::new(&ctx.router_config))
+            .ok();
+        let worker = grpc_worker_for_m();
+        ctx.worker_registry
+            .register(worker.clone())
+            .expect("register worker");
+        let router = GrpcRouter::new(&ctx, Mode::Regular).expect("regular router");
+        let tenant_meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        assert!(ctx.tokenizer_load_failures.record(
+            "m",
+            TokenizerLoadFailure::Failed(
+                "Workflow failed at step load_tokenizer: boom".to_string()
+            )
+        ));
+
+        let response = router
+            .route_messages_count_tokens(None, &tenant_meta, count_request("m"), "m")
+            .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            "tokenizer_load_failed"
+        );
+        assert!(response.headers().get(RETRY_AFTER).is_none());
+
+        // The worker registers again, this time with a tokenizer to load.
+        let tokenizer_dir = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            tokenizer_dir.path().join("tokenizer.json"),
+            MINIMAL_TOKENIZER_JSON,
+        )
+        .expect("tokenizer.json");
+        fs::write(
+            tokenizer_dir.path().join("tokenizer_config.json"),
+            r#"{"chat_template": "hello"}"#,
+        )
+        .expect("tokenizer_config.json");
+        let path = tokenizer_dir.path().to_str().expect("utf-8 path");
+        let mut step = tokenizer_step_input(&ctx, &worker, &[("tokenizer_path", path)]);
+        SubmitTokenizerJobStep
+            .execute(&mut step)
+            .await
+            .expect("the step runs");
+        // Submitted: the model is pending again, not failed.
+        assert_eq!(ctx.tokenizer_load_failures.get("m"), None);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ctx.tokenizer_registry.contains("m") {
+            assert!(Instant::now() < deadline, "the tokenizer did not register");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        let response = router
+            .route_messages_count_tokens(None, &tenant_meta, count_request("m"), "m")
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(ctx.tokenizer_load_failures.get("m"), None);
+    }
+
+    /// Two registrations of one model: while worker A's tokenizer load is in
+    /// flight (held here on the registry's per-name lock), worker B
+    /// registering without a path does not turn the model's answer into a
+    /// final failure; the model stays not ready with its retry hint, and
+    /// answers once A's load ends.
+    #[tokio::test]
+    async fn a_registration_without_a_path_defers_to_the_models_load_in_flight() {
+        let ctx = grpc_ctx(regular_routing_mode()).await;
+        ctx.worker_job_queue
+            .set(JobQueue::new(
+                JobQueueConfig::default(),
+                Arc::downgrade(&ctx),
+            ))
+            .ok();
+        ctx.workflow_engines
+            .set(WorkflowEngines::new(&ctx.router_config))
+            .ok();
+        let worker = grpc_worker_for_m();
+        ctx.worker_registry
+            .register(worker.clone())
+            .expect("register worker");
+        let router = GrpcRouter::new(&ctx, Mode::Regular).expect("regular router");
+        let tenant_meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        let tokenizer_dir = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            tokenizer_dir.path().join("tokenizer.json"),
+            MINIMAL_TOKENIZER_JSON,
+        )
+        .expect("tokenizer.json");
+        fs::write(
+            tokenizer_dir.path().join("tokenizer_config.json"),
+            r#"{"chat_template": "hello"}"#,
+        )
+        .expect("tokenizer_config.json");
+        let path = tokenizer_dir
+            .path()
+            .to_str()
+            .expect("utf-8 path")
+            .to_string();
+
+        // A load of `m` held on the registry's per-name lock for 1.5 s: worker
+        // A's job, submitted next, waits behind it; worker B registers without
+        // a path meanwhile.
+        let held_path = path.clone();
+        let held = ctx
+            .tokenizer_registry
+            .load("held", "m", &path, move || async move {
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+                factory::create_tokenizer_with_chat_template(&held_path, None)
+                    .map_err(|e| e.to_string())
+            });
+        let registrations = async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let mut step = tokenizer_step_input(&ctx, &worker, &[("tokenizer_path", &path)]);
+            SubmitTokenizerJobStep
+                .execute(&mut step)
+                .await
+                .expect("the step runs");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let mut step = tokenizer_step_input(&ctx, &worker, &[]);
+            SubmitTokenizerJobStep
+                .execute(&mut step)
+                .await
+                .expect("the step runs");
+            router
+                .route_messages_count_tokens(None, &tenant_meta, count_request("m"), "m")
+                .await
+        };
+        let (held, response) = tokio::join!(held, registrations);
+        held.expect("the held load succeeds");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            "tokenizer_not_ready",
+            "a load in flight keeps the retry hint"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let response = router
+                .route_messages_count_tokens(None, &tenant_meta, count_request("m"), "m")
+                .await;
+            if response.status() == StatusCode::OK {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the model did not answer");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    fn message_request(body: serde_json::Value) -> CreateMessageRequest {
+        serde_json::from_value(body).expect("message request")
+    }
+
+    fn sse_event(frame: &str, name: &str) -> serde_json::Value {
+        let prefix = format!("event: {name}\ndata: ");
+        let data = frame
+            .strip_prefix(prefix.as_str())
+            .unwrap_or_else(|| panic!("expected a {name} frame, got {frame:?}"));
+        serde_json::from_str(data).expect("event json")
+    }
+
+    /// `max_tokens: 0` is the router's own answer, as the public API's: a
+    /// message with no content, `stop_reason: max_tokens` and the prompt's
+    /// token count in `usage` (the renderer hands back three ids), under the
+    /// id the pipeline would have given it (the client's `rid` when it sends
+    /// one); streamed, that message as `message_start`, then `message_delta`
+    /// with the stop reason and `message_stop`. No worker takes part; a
+    /// model nobody serves is a 404, and a prompt longer than the smallest
+    /// context window the model's workers advertise is the pipeline's 400.
+    #[tokio::test]
+    async fn max_tokens_zero_is_answered_with_an_empty_message() {
+        let ctx = grpc_ctx(regular_routing_mode()).await;
+        let tokenizer: Arc<dyn llm_tokenizer::traits::Tokenizer> = Arc::new(
+            llm_tokenizer::mock::MockTokenizer::new().with_deferred_chat_ids(vec![11, 12, 13]),
+        );
+        ctx.tokenizer_registry
+            .load("m", "m", "mock", || async move { Ok(tokenizer) })
+            .await
+            .expect("register the tokenizer");
+        let worker = BasicWorkerBuilder::new("grpc://worker:30000")
+            .worker_type(WorkerType::Regular)
+            .connection_mode(ConnectionMode::Grpc)
+            .model(ModelCard::new("m"))
+            .health_config(HealthCheckConfig {
+                disable_health_check: true,
+                ..Default::default()
+            })
+            .build();
+        ctx.worker_registry
+            .register(Arc::new(worker))
+            .expect("register worker");
+        let router = GrpcRouter::new(&ctx, Mode::Regular).expect("regular router");
+        let tenant_meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        let body = json!({
+            "model": "m", "max_tokens": 0,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+
+        let response = router
+            .route_messages(None, &tenant_meta, message_request(body.clone()), "m")
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let message: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(message["type"], "message");
+        assert_eq!(message["role"], "assistant");
+        assert_eq!(message["content"], json!([]));
+        assert_eq!(message["stop_reason"], "max_tokens");
+        assert_eq!(message["usage"]["input_tokens"], 3);
+        assert_eq!(message["usage"]["output_tokens"], 0);
+        assert_eq!(message["usage"]["cache_read_input_tokens"], 0);
+        assert!(message["id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("msg_")));
+
+        let mut with_rid = body.clone();
+        with_rid["rid"] = json!("req-7");
+        let response = router
+            .route_messages(None, &tenant_meta, message_request(with_rid), "m")
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let message: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(message["id"], "req-7");
+
+        let mut streamed = body.clone();
+        streamed["stream"] = json!(true);
+        let response = router
+            .route_messages(None, &tenant_meta, message_request(streamed), "m")
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("text/event-stream; charset=utf-8")
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let text = String::from_utf8(bytes.to_vec()).expect("utf-8");
+        let frames: Vec<&str> = text.split("\n\n").filter(|f| !f.is_empty()).collect();
+        assert_eq!(frames.len(), 3, "{text}");
+        let start = sse_event(frames[0], "message_start");
+        assert_eq!(start["message"]["content"], json!([]));
+        assert_eq!(start["message"]["stop_reason"], serde_json::Value::Null);
+        assert_eq!(start["message"]["usage"]["input_tokens"], 3);
+        let delta = sse_event(frames[1], "message_delta");
+        assert_eq!(delta["delta"]["stop_reason"], "max_tokens");
+        assert_eq!(delta["usage"]["output_tokens"], 0);
+        assert_eq!(delta["usage"]["input_tokens"], 3);
+        assert_eq!(
+            sse_event(frames[2], "message_stop"),
+            json!({"type": "message_stop"})
+        );
+
+        let response = router
+            .route_messages(
+                None,
+                &tenant_meta,
+                message_request(json!({
+                    "model": "nope", "max_tokens": 0,
+                    "messages": [{"role": "user", "content": "hi"}]
+                })),
+                "nope",
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            "model_not_found"
+        );
+
+        // The window check the pipeline makes after worker selection, here on
+        // the smallest window the model's workers advertise: a worker whose
+        // card holds the three-token prompt exactly changes nothing; one with
+        // a two-token window refuses it as the pipeline would.
+        let window_worker = |url: &str, context_length: u32| {
+            Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .worker_type(WorkerType::Regular)
+                    .connection_mode(ConnectionMode::Grpc)
+                    .model(ModelCard::new("m").with_context_length(context_length))
+                    .health_config(HealthCheckConfig {
+                        disable_health_check: true,
+                        ..Default::default()
+                    })
+                    .build(),
+            )
+        };
+        ctx.worker_registry
+            .register(window_worker("grpc://worker-window-3:30000", 3))
+            .expect("register worker");
+        let response = router
+            .route_messages(None, &tenant_meta, message_request(body.clone()), "m")
+            .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "a three-token prompt fits a three-token window"
+        );
+        ctx.worker_registry
+            .register(window_worker("grpc://worker-window-2:30000", 2))
+            .expect("register worker");
+        let response = router
+            .route_messages(None, &tenant_meta, message_request(body), "m")
+            .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            "context_length_exceeded"
+        );
     }
 
     /// PD-mode completion must honor a per-model retry override, not the router
@@ -1378,7 +1950,9 @@ mod pd_tests {
             .await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
-        let cancel = router.cancel_response(None, "resp_missing").await;
+        let cancel = router
+            .cancel_response(None, &tenant_meta, "resp_missing")
+            .await;
         assert_eq!(cancel.status(), StatusCode::NOT_FOUND);
     }
 
@@ -1395,7 +1969,9 @@ mod pd_tests {
             .await;
         assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
 
-        let cancel = router.cancel_response(None, "resp_missing").await;
+        let cancel = router
+            .cancel_response(None, &tenant_meta, "resp_missing")
+            .await;
         assert_eq!(cancel.status(), StatusCode::NOT_IMPLEMENTED);
     }
 

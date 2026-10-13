@@ -1,8 +1,8 @@
 use openai_protocol::{
     chat::{ChatCompletionRequest, ChatMessage, MessageContent},
     common::{
-        Function, FunctionCall, FunctionChoice, StreamOptions, Tool, ToolChoice, ToolChoiceValue,
-        ToolReference,
+        Function, FunctionCall, FunctionChoice, JsonSchemaFormat, ResponseFormat, StreamOptions,
+        Tool, ToolChoice, ToolChoiceValue, ToolReference,
     },
     validated::Normalizable,
 };
@@ -12,11 +12,12 @@ use validator::Validate;
 // Deprecated fields normalization tests
 
 #[test]
-fn test_max_tokens_normalizes_to_max_completion_tokens() {
+fn test_max_tokens_stays_as_the_client_wrote_it() {
     #[expect(deprecated)]
     let mut req = ChatCompletionRequest {
         model: "test-model".to_string(),
         messages: vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Text("hello".to_string()),
             name: None,
         }],
@@ -26,18 +27,23 @@ fn test_max_tokens_normalizes_to_max_completion_tokens() {
     };
 
     req.normalize();
-    assert_eq!(
-        req.max_completion_tokens,
-        Some(100),
-        "max_tokens should be copied to max_completion_tokens"
-    );
     #[expect(deprecated)]
     {
-        assert!(
-            req.max_tokens.is_none(),
-            "Deprecated field should be cleared"
+        assert_eq!(
+            req.max_tokens,
+            Some(100),
+            "the field the client wrote is kept for the upstream"
         );
     }
+    assert_eq!(
+        req.max_completion_tokens, None,
+        "nothing is migrated into the field the client did not write"
+    );
+    assert_eq!(
+        req.output_token_cap(),
+        Some(100),
+        "the cap is read from the deprecated field"
+    );
     assert!(
         req.validate().is_ok(),
         "Should be valid after normalization"
@@ -50,6 +56,7 @@ fn test_max_completion_tokens_takes_precedence() {
     let mut req = ChatCompletionRequest {
         model: "test-model".to_string(),
         messages: vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Text("hello".to_string()),
             name: None,
         }],
@@ -64,9 +71,20 @@ fn test_max_completion_tokens_takes_precedence() {
         Some(200),
         "max_completion_tokens should take precedence"
     );
+    assert_eq!(req.output_token_cap(), Some(200));
+    #[expect(deprecated)]
+    {
+        assert_eq!(
+            req.max_tokens,
+            Some(100),
+            "the field the client wrote is kept for the upstream"
+        );
+    }
+    // A self-hosted model takes the pair, as the serving engines do; only
+    // OpenAI's own contract refuses it (pinned by the profile's unit tests).
     assert!(
         req.validate().is_ok(),
-        "Should be valid after normalization"
+        "both token limits at once are accepted; max_completion_tokens wins"
     );
 }
 
@@ -76,6 +94,7 @@ fn test_functions_normalizes_to_tools() {
     let mut req = ChatCompletionRequest {
         model: "test-model".to_string(),
         messages: vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Text("hello".to_string()),
             name: None,
         }],
@@ -84,6 +103,7 @@ fn test_functions_normalizes_to_tools() {
             description: Some("Test function".to_string()),
             parameters: json!({}),
             strict: None,
+            extra: Default::default(),
         }]),
         tools: None,
         ..Default::default()
@@ -112,6 +132,7 @@ fn test_function_call_normalizes_to_tool_choice() {
     let mut req = ChatCompletionRequest {
         model: "test-model".to_string(),
         messages: vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Text("hello".to_string()),
             name: None,
         }],
@@ -148,6 +169,7 @@ fn test_function_call_function_variant_normalizes() {
     let mut req = ChatCompletionRequest {
         model: "test-model".to_string(),
         messages: vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Text("hello".to_string()),
             name: None,
         }],
@@ -162,6 +184,7 @@ fn test_function_call_function_variant_normalizes() {
                 description: None,
                 parameters: json!({}),
                 strict: None,
+                extra: Default::default(),
             },
         }]),
         ..Default::default()
@@ -196,6 +219,7 @@ fn test_min_tokens_zero_is_valid() {
     let req = ChatCompletionRequest {
         model: "test-model".to_string(),
         messages: vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Text("hello".to_string()),
             name: None,
         }],
@@ -214,6 +238,7 @@ fn test_stream_options_requires_stream_enabled() {
     let req = ChatCompletionRequest {
         model: "test-model".to_string(),
         messages: vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Text("hello".to_string()),
             name: None,
         }],
@@ -242,6 +267,7 @@ fn test_stream_options_valid_when_stream_enabled() {
     let req = ChatCompletionRequest {
         model: "test-model".to_string(),
         messages: vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Text("hello".to_string()),
             name: None,
         }],
@@ -265,6 +291,7 @@ fn test_no_stream_options_valid_when_stream_disabled() {
     let req = ChatCompletionRequest {
         model: "test-model".to_string(),
         messages: vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Text("hello".to_string()),
             name: None,
         }],
@@ -285,6 +312,7 @@ fn test_stream_options_continuous_usage_stats_valid() {
     let req = ChatCompletionRequest {
         model: "test-model".to_string(),
         messages: vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Text("hello".to_string()),
             name: None,
         }],
@@ -329,6 +357,7 @@ fn test_tool_choice_function_not_found() {
     let req = ChatCompletionRequest {
         model: "test-model".to_string(),
         messages: vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Text("hello".to_string()),
             name: None,
         }],
@@ -339,6 +368,7 @@ fn test_tool_choice_function_not_found() {
                 description: Some("Get weather".to_string()),
                 parameters: json!({}),
                 strict: None,
+                extra: Default::default(),
             },
         }]),
         tool_choice: Some(ToolChoice::Function {
@@ -364,6 +394,7 @@ fn test_tool_choice_function_exists_valid() {
     let req = ChatCompletionRequest {
         model: "test-model".to_string(),
         messages: vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Text("hello".to_string()),
             name: None,
         }],
@@ -374,6 +405,7 @@ fn test_tool_choice_function_exists_valid() {
                 description: Some("Get weather".to_string()),
                 parameters: json!({}),
                 strict: None,
+                extra: Default::default(),
             },
         }]),
         tool_choice: Some(ToolChoice::Function {
@@ -394,6 +426,7 @@ fn test_tool_choice_allowed_tools_invalid_mode() {
     let req = ChatCompletionRequest {
         model: "test-model".to_string(),
         messages: vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Text("hello".to_string()),
             name: None,
         }],
@@ -404,6 +437,7 @@ fn test_tool_choice_allowed_tools_invalid_mode() {
                 description: Some("Get weather".to_string()),
                 parameters: json!({}),
                 strict: None,
+                extra: Default::default(),
             },
         }]),
         tool_choice: Some(ToolChoice::AllowedTools {
@@ -430,6 +464,7 @@ fn test_tool_choice_allowed_tools_valid_mode_auto() {
     let req = ChatCompletionRequest {
         model: "test-model".to_string(),
         messages: vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Text("hello".to_string()),
             name: None,
         }],
@@ -440,6 +475,7 @@ fn test_tool_choice_allowed_tools_valid_mode_auto() {
                 description: Some("Get weather".to_string()),
                 parameters: json!({}),
                 strict: None,
+                extra: Default::default(),
             },
         }]),
         tool_choice: Some(ToolChoice::AllowedTools {
@@ -461,6 +497,7 @@ fn test_tool_choice_allowed_tools_valid_mode_required() {
     let req = ChatCompletionRequest {
         model: "test-model".to_string(),
         messages: vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Text("hello".to_string()),
             name: None,
         }],
@@ -471,6 +508,7 @@ fn test_tool_choice_allowed_tools_valid_mode_required() {
                 description: Some("Get weather".to_string()),
                 parameters: json!({}),
                 strict: None,
+                extra: Default::default(),
             },
         }]),
         tool_choice: Some(ToolChoice::AllowedTools {
@@ -492,6 +530,7 @@ fn test_tool_choice_allowed_tools_tool_not_found() {
     let req = ChatCompletionRequest {
         model: "test-model".to_string(),
         messages: vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Text("hello".to_string()),
             name: None,
         }],
@@ -502,6 +541,7 @@ fn test_tool_choice_allowed_tools_tool_not_found() {
                 description: Some("Get weather".to_string()),
                 parameters: json!({}),
                 strict: None,
+                extra: Default::default(),
             },
         }]),
         tool_choice: Some(ToolChoice::AllowedTools {
@@ -528,6 +568,7 @@ fn test_tool_choice_allowed_tools_multiple_tools_valid() {
     let req = ChatCompletionRequest {
         model: "test-model".to_string(),
         messages: vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Text("hello".to_string()),
             name: None,
         }],
@@ -539,6 +580,7 @@ fn test_tool_choice_allowed_tools_multiple_tools_valid() {
                     description: Some("Get weather".to_string()),
                     parameters: json!({}),
                     strict: None,
+                    extra: Default::default(),
                 },
             },
             Tool {
@@ -548,6 +590,7 @@ fn test_tool_choice_allowed_tools_multiple_tools_valid() {
                     description: Some("Get time".to_string()),
                     parameters: json!({}),
                     strict: None,
+                    extra: Default::default(),
                 },
             },
         ]),
@@ -575,6 +618,7 @@ fn test_tool_choice_allowed_tools_one_invalid_among_valid() {
     let req = ChatCompletionRequest {
         model: "test-model".to_string(),
         messages: vec![ChatMessage::User {
+            ext: Default::default(),
             content: MessageContent::Text("hello".to_string()),
             name: None,
         }],
@@ -586,6 +630,7 @@ fn test_tool_choice_allowed_tools_one_invalid_among_valid() {
                     description: Some("Get weather".to_string()),
                     parameters: json!({}),
                     strict: None,
+                    extra: Default::default(),
                 },
             },
             Tool {
@@ -595,6 +640,7 @@ fn test_tool_choice_allowed_tools_one_invalid_among_valid() {
                     description: Some("Get time".to_string()),
                     parameters: json!({}),
                     strict: None,
+                    extra: Default::default(),
                 },
             },
         ]),
@@ -622,5 +668,55 @@ fn test_tool_choice_allowed_tools_one_invalid_among_valid() {
     assert!(
         err.contains("tool 'nonexistent_tool' not found"),
         "Error should mention the missing tool: {err}"
+    );
+}
+
+#[test]
+fn test_validate_response_format_json_schema_schema_not_object() {
+    fn request(name: &str, schema: serde_json::Value) -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: "test-model".to_string(),
+            messages: vec![ChatMessage::User {
+                ext: Default::default(),
+                content: MessageContent::Text("hello".to_string()),
+                name: None,
+            }],
+            response_format: Some(ResponseFormat::JsonSchema {
+                json_schema: JsonSchemaFormat {
+                    name: name.to_string(),
+                    schema,
+                    strict: None,
+                },
+            }),
+            ..Default::default()
+        }
+    }
+
+    for schema in [json!("x"), json!(1), json!([]), json!(null), json!(true)] {
+        let err = request("weather", schema.clone())
+            .validate()
+            .expect_err(&format!("schema {schema} should be rejected"));
+        assert!(
+            format!("{err:?}").contains("json_schema_schema_not_object"),
+            "schema {schema}: expected json_schema_schema_not_object, got: {err:?}"
+        );
+    }
+
+    for schema in [
+        json!({}),
+        json!({"type": "object", "properties": {"city": {"type": "string"}}}),
+    ] {
+        assert!(
+            request("weather", schema.clone()).validate().is_ok(),
+            "schema {schema} should be accepted"
+        );
+    }
+
+    let err = request("", json!("x"))
+        .validate()
+        .expect_err("empty name should be rejected");
+    assert!(
+        format!("{err:?}").contains("json_schema_name_empty"),
+        "empty name should win over schema shape, got: {err:?}"
     );
 }

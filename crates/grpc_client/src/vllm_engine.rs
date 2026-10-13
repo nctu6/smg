@@ -92,6 +92,7 @@ impl VllmEngineClient {
         Ok(())
     }
 
+    crate::impl_flush_cache!();
     crate::impl_get_tokenizer!();
     crate::impl_subscribe_kv_events!();
 
@@ -141,6 +142,8 @@ impl VllmEngineClient {
             kv_transfer_params_json: None,
             data_parallel_rank: None,
             mm_inputs,
+            media_refs: None,
+            extra_mm_inputs: Vec::new(),
         };
 
         Ok(grpc_request)
@@ -170,6 +173,8 @@ impl VllmEngineClient {
             kv_transfer_params_json: None,
             data_parallel_rank: None,
             mm_inputs: None,
+            media_refs: None,
+            extra_mm_inputs: Vec::new(),
         };
 
         Ok(grpc_request)
@@ -203,6 +208,8 @@ impl VllmEngineClient {
             kv_transfer_params_json: None,
             data_parallel_rank: None,
             mm_inputs: None,
+            media_refs: None,
+            extra_mm_inputs: Vec::new(),
         };
 
         Ok(grpc_request)
@@ -219,7 +226,7 @@ impl VllmEngineClient {
     ) -> Result<proto::SamplingParams, String> {
         let stop_sequences = Self::extract_stop_strings(request);
 
-        let max_tokens = request.max_completion_tokens;
+        let max_tokens = request.output_token_cap();
 
         // Hardcode to true: gRPC backends return raw token IDs, not decoded text.
         // Detokenization happens on the SMG Rust side (StopDecoder/Sequence).
@@ -415,6 +422,8 @@ impl VllmEngineClient {
             kv_transfer_params_json: None,
             data_parallel_rank: None,
             mm_inputs: multimodal_inputs,
+            media_refs: None,
+            extra_mm_inputs: Vec::new(),
         };
 
         Ok(grpc_request)
@@ -474,6 +483,8 @@ impl VllmEngineClient {
             kv_transfer_params_json: None,
             data_parallel_rank: None,
             mm_inputs: None,
+            media_refs: None,
+            extra_mm_inputs: Vec::new(),
         };
 
         Ok(grpc_request)
@@ -524,7 +535,7 @@ impl VllmEngineClient {
             None => vec![],
         };
 
-        let logprobs = request.logprobs.map(|v| v.min(5) as i32);
+        let logprobs = request.logprobs.map(|v| v.min(20) as i32);
 
         let constraint = Self::build_single_constraint_from_completion(request)?;
 
@@ -695,8 +706,7 @@ impl From<proto::SchedulerLoad> for openai_protocol::worker::SchedulerLoadSnapsh
             dp_rank: load.dp_rank,
             num_running_reqs: load.num_running_reqs,
             num_waiting_reqs: load.num_waiting_reqs,
-            // vLLM does not report queued token-work; degrade to 0.
-            num_waiting_uncached_tokens: 0,
+            num_waiting_uncached_tokens: load.num_waiting_uncached_tokens,
             num_total_reqs: load.num_total_reqs,
             num_used_tokens: load.num_used_tokens,
             max_total_num_tokens: load.max_total_num_tokens,
@@ -720,6 +730,7 @@ impl From<proto::GetLoadsResponse> for openai_protocol::worker::WorkerLoadRespon
             dp_rank_count: resp.dp_rank_count,
             loads: resp.loads.into_iter().map(Into::into).collect(),
             aggregate: None,
+            sampled_at: None,
         }
     }
 }
@@ -802,6 +813,8 @@ mod tests {
             kv_transfer_params_json: None,
             data_parallel_rank: None,
             mm_inputs: None,
+            media_refs: None,
+            extra_mm_inputs: Vec::new(),
         };
 
         assert_eq!(gen_req.request_id, "test-req-123");
@@ -964,6 +977,21 @@ mod tests {
         let huge_params = VllmEngineClient::build_grpc_sampling_params_from_completion(&huge)
             .expect("build sampling params");
         assert_eq!(huge_params.seed, Some(i32::MAX));
+    }
+
+    #[test]
+    fn test_completion_sampling_params_pass_up_to_20_logprobs() {
+        // `logprobs` on /v1/completions goes up to 20, as chat's
+        // `top_logprobs`, and the backend gets the count as asked.
+        for (logprobs, expected) in [(0, 0), (5, 5), (20, 20)] {
+            let request = CompletionRequest {
+                logprobs: Some(logprobs),
+                ..minimal_completion_request()
+            };
+            let params = VllmEngineClient::build_grpc_sampling_params_from_completion(&request)
+                .expect("build sampling params");
+            assert_eq!(params.logprobs, Some(expected));
+        }
     }
 
     #[test]
