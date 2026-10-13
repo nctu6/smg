@@ -1505,12 +1505,20 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             .await
             .map_err(|e| format!("Failed to create TLS config: {e}"))?;
 
-        axum_server::bind_rustls(addr, tls_config)
+        // TCP_NODELAY on every accepted connection: without it a streamed
+        // response's first small SSE chunk waits behind Nagle + the client's
+        // delayed ACK (~40 ms) on keep-alive connections.
+        axum_server::bind(addr)
+            .acceptor(
+                axum_server::tls_rustls::RustlsAcceptor::new(tls_config)
+                    .acceptor(axum_server::accept::NoDelayAcceptor::new()),
+            )
             .handle(handle)
             .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
             .await
     } else {
         axum_server::bind(addr)
+            .acceptor(axum_server::accept::NoDelayAcceptor::new())
             .handle(handle)
             .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())
             .await
