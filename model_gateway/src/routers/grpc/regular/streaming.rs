@@ -463,6 +463,22 @@ impl StreamingProcessor {
                     }
 
                     if chunk_text.is_empty() {
+                        // A first token that decodes to nothing yet (special token,
+                        // partial UTF-8) still opens the stream: send the role chunk
+                        // now, otherwise the client sees its first byte only when
+                        // visible text arrives, which can be the end of the generation.
+                        if Self::take_first_chunk(&mut is_firsts, index) {
+                            let first_chunk =
+                                ChatCompletionStreamResponse::builder(request_id, model)
+                                    .created(created)
+                                    .add_choice_role(index, "assistant")
+                                    .maybe_system_fingerprint(system_fingerprint)
+                                    .build();
+                            Self::format_sse_chunk_into(&mut sse_buffer, &first_chunk);
+                            tx.send(Ok(Bytes::from(sse_buffer.clone())))
+                                .await
+                                .map_err(|_| "Failed to send first chunk".to_string())?;
+                        }
                         continue;
                     }
 
@@ -516,7 +532,7 @@ impl StreamingProcessor {
             let stream_buffer = stream_buffers.entry(index).or_default();
 
             // Send first chunk with role
-            if is_firsts.get(&index).copied().unwrap_or(true) {
+            if Self::take_first_chunk(&mut is_firsts, index) {
                 let first_chunk = ChatCompletionStreamResponse::builder(request_id, model)
                     .created(created)
                     .add_choice_role(index, "assistant")
@@ -526,7 +542,6 @@ impl StreamingProcessor {
                 tx.send(Ok(Bytes::from(sse_buffer.clone())))
                     .await
                     .map_err(|_| "Failed to send first chunk".to_string())?;
-                is_firsts.insert(index, false);
             }
 
             // Calculate delta
@@ -1607,6 +1622,16 @@ impl StreamingProcessor {
         }
 
         chunks
+    }
+
+    /// True exactly once per choice index: the call that must send the role
+    /// chunk that opens that choice's stream.
+    fn take_first_chunk(is_firsts: &mut HashMap<u32, bool>, index: u32) -> bool {
+        let first = is_firsts.get(&index).copied().unwrap_or(true);
+        if first {
+            is_firsts.insert(index, false);
+        }
+        first
     }
 
     /// Format a response as SSE chunk into a reusable buffer
@@ -2920,14 +2945,20 @@ impl StreamingProcessor {
                     chunk_text.clear();
                     chunk_text.push_str(&decoded_text);
 
-                    if *is_first {
+                    // The first chunk of a choice is always sent, even with empty
+                    // text: a first token that decodes to nothing yet (special
+                    // token, partial UTF-8) is still the first token, and holding
+                    // the stream back until visible text arrives makes a client
+                    // see its TTFT as the whole generation time.
+                    let first_chunk = *is_first;
+                    if first_chunk {
                         if echo {
                             chunk_text.insert_str(0, prompt_text);
                         }
                         *is_first = false;
                     }
 
-                    if !chunk_text.is_empty() {
+                    if first_chunk || !chunk_text.is_empty() {
                         let stream_resp = CompletionStreamResponse {
                             id: request_id.clone(),
                             object: "text_completion".to_string(),
@@ -3264,6 +3295,15 @@ impl StreamingProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_chunk_opens_each_choice_stream_exactly_once() {
+        let mut is_firsts = HashMap::new();
+        assert!(StreamingProcessor::take_first_chunk(&mut is_firsts, 0));
+        assert!(!StreamingProcessor::take_first_chunk(&mut is_firsts, 0));
+        assert!(StreamingProcessor::take_first_chunk(&mut is_firsts, 1));
+        assert!(!StreamingProcessor::take_first_chunk(&mut is_firsts, 1));
+    }
 
     #[test]
     fn completion_streaming_usage_includes_reasoning_tokens() {
