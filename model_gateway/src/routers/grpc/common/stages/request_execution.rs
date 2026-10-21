@@ -1,40 +1,285 @@
 //! Request execution: dispatch one attempt of the retained execution plan.
 
-use std::time::Instant;
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::{Arc, OnceLock},
+    time::{Duration, Instant},
+};
 
 use axum::response::Response;
 use futures::future::{join_all, try_join_all};
-use tracing::{debug, error, info_span, Instrument};
+use smg_grpc_client::{is_transport_failure, vllm_proto as vllm};
+use tracing::{debug, error, info_span, warn, Instrument};
 
-use super::pd_protocol::{DpPlacement, PdDispatch, PdProtocol};
+use super::{
+    helpers::{maybe_inject_pd_metadata, maybe_inject_pd_rendezvous},
+    pd_protocol::{DpPlacement, PdDispatch, PdProtocol},
+};
 use crate::{
-    observability::metrics::{metrics_labels, Metrics},
+    observability::{
+        cache_trace,
+        metrics::{metrics_labels, Metrics},
+    },
     routers::{
-        common::kv_transfer::{
-            connector_mode_for_worker, mooncake_decode_params, mooncake_prefill_params,
-            KvConnectorMode, NIXL_PREFILL_KV_PARAMS,
+        common::{
+            attempt_ledger::{mark_failed_side, mark_upstream_answer, AttemptLedger},
+            kv_transfer::{
+                connector_mode_for_worker, is_moriio_worker, mooncake_decode_params,
+                mooncake_prefill_params, KvConnectorMode, NIXL_PREFILL_KV_PARAMS,
+            },
+            pd_admission,
+            retry::mark_non_retryable,
         },
         error,
         grpc::{
+            backend_client::BackendClient,
             common::stages::encode::EncodeDispatchPlan,
             context::{
-                ClientSelection, DispatchContext, ExecutionPlan, ExecutionPlanKind,
+                stage_output, ClientSelection, DispatchContext, ExecutionPlan, ExecutionPlanKind,
                 ExecutionResult, LoadGuards, PdTiming, WorkerSelection,
             },
+            multimodal::worker_language_model_only,
             proto_wrapper::{
-                ProtoEmbedRequest, ProtoGenerateRequest, ProtoRequest, ProtoResponseVariant,
-                ProtoStream,
+                DispatchBooking, FanoutStream, FirstItem, PrefillCachedTokens, PrefillTicket,
+                ProtoEmbedRequest, ProtoGenerateRequest, ProtoInputLogProbs, ProtoRequest,
+                ProtoResponseVariant, ProtoStream,
             },
-            utils::tonic_ext::{TonicResultExt, TonicStatusExt},
+            utils::{
+                account_pd_side_failure,
+                stream_failure::UpstreamClass,
+                tonic_ext::{TonicResultExt, TonicStatusExt},
+            },
         },
     },
-    worker::ConnectionModeExt,
+    worker::{
+        liveness::{self, SideReprieve},
+        worker::WorkerTypeExt,
+        ConnectionModeExt, PrefillLoadGuard, Worker,
+    },
 };
 
 type StreamResult = Result<ProtoStream, tonic::Status>;
 
-/// Metric connection labels for the PD legs (a leg can be gRPC or ZMQ).
-fn pd_leg_labels(workers: &WorkerSelection) -> (&'static str, &'static str) {
+/// One side's owned dispatch. Owned (rather than borrowed from the client
+/// selection) so the side still in flight when its partner fails can be moved
+/// off the request path — see [`retire_pd_side`].
+type SideDispatch = Pin<Box<dyn Future<Output = StreamResult> + Send>>;
+
+/// Which side of a disaggregated dispatch a result belongs to. The error code
+/// and message are part of the client contract, so they live per side here
+/// rather than being reconstructed at each call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PdSide {
+    Prefill,
+    Decode,
+}
+
+impl PdSide {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Prefill => metrics_labels::WORKER_PREFILL,
+            Self::Decode => metrics_labels::WORKER_DECODE,
+        }
+    }
+
+    fn error_code(self) -> &'static str {
+        match self {
+            Self::Prefill => "prefill_worker_failed_to_start",
+            Self::Decode => "decode_worker_failed_to_start",
+        }
+    }
+
+    fn error_message(self) -> &'static str {
+        match self {
+            Self::Prefill => "Prefill worker failed to start",
+            Self::Decode => "Decode worker failed to start",
+        }
+    }
+
+    fn partner(self) -> Self {
+        match self {
+            Self::Prefill => Self::Decode,
+            Self::Decode => Self::Prefill,
+        }
+    }
+}
+
+/// How the two parallel sides resolved.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "consumed by its caller on the next line; boxing would add an allocation to the success path to save one stack move"
+)]
+enum PdDispatchOutcome {
+    /// Both sides answered; either or both may carry an error.
+    Both(StreamResult, StreamResult),
+    /// One side failed while its partner was still dispatching. The partner is
+    /// handed back so the caller can retire it instead of waiting it out.
+    FailedFirst {
+        side: PdSide,
+        error: tonic::Status,
+        partner: SideDispatch,
+    },
+}
+
+/// Backend requests one plan dispatches — one per batched prompt, times the
+/// PD fan-out width where a parallel PD request asks for n>1 samples.
+///
+/// This is both the load-guard scale and the number of PD bootstrap rooms the
+/// plan will post, which is why admission and the guards read the same count.
+fn plan_sub_requests(plan: &ExecutionPlan, workers: Option<&WorkerSelection>) -> usize {
+    let protocol = workers
+        .and_then(WorkerSelection::disaggregated_runtime_type)
+        .and_then(|runtime| PdProtocol::for_runtime(*runtime));
+    let width = |request: &ProtoGenerateRequest| {
+        protocol
+            .and_then(|protocol| pd_fanout_width(request, protocol))
+            .map_or(1, |n| n as usize)
+    };
+    match plan {
+        ExecutionPlan::Batch {
+            kind: ExecutionPlanKind::Single,
+            requests,
+            ..
+        } => requests.len(),
+        ExecutionPlan::Batch { requests, .. } => requests.iter().map(width).sum(),
+        ExecutionPlan::PrefillDecode(request) | ExecutionPlan::EncodePrefillDecode { request } => {
+            width(request)
+        }
+        // One Embed RPC per input string (embeddings never disaggregate).
+        ExecutionPlan::EmbedBatch { requests, .. } => requests.len(),
+        ExecutionPlan::Single(_) => 1,
+    }
+}
+
+/// Fan-out width for a parallel PD dispatch: `n` when the request asks for
+/// more than one sample of a text-only prompt, else `None`.
+///
+/// A rendezvous room serves one sample. The engines that rendezvous on a
+/// room broadcast the request's single room to every sample of an n>1
+/// request: each of the decode's children then pre-allocates against the
+/// same room, and the prefill either rejects the repeats (TokenSpeed) or
+/// serves one child while the rest wait on KV that never comes. So each
+/// sample becomes its own single-sample PD dispatch with its own room, and
+/// the merged streams stamp every child's position as the choice index. A
+/// multimodal payload travels as one SHM segment that the prefill unlinks on
+/// read, so it cannot be handed to n prefills; those requests keep the
+/// single dispatch.
+fn pd_fanout_width(request: &ProtoGenerateRequest, protocol: PdProtocol) -> Option<u32> {
+    if protocol.dispatch != PdDispatch::Parallel
+        || request.has_mm_inputs()
+        || request.has_vllm_media_refs()
+    {
+        return None;
+    }
+    let n = request.sampling_n();
+    (n > 1).then_some(n)
+}
+
+fn pd_sub_request_id(base_id: &str, index: u32) -> String {
+    format!("{base_id}-{index}")
+}
+
+fn trace_engine_ids(
+    plan: &mut ExecutionPlan,
+    workers: Option<&WorkerSelection>,
+) -> (Vec<String>, bool) {
+    let protocol = if matches!(
+        plan,
+        ExecutionPlan::Single(_)
+            | ExecutionPlan::Batch {
+                kind: ExecutionPlanKind::Single,
+                ..
+            }
+    ) {
+        None
+    } else {
+        workers
+            .and_then(WorkerSelection::disaggregated_runtime_type)
+            .and_then(|runtime| PdProtocol::for_runtime(*runtime))
+    };
+    let mut ids: Vec<_> = plan
+        .generate_requests_mut()
+        .flat_map(|request| {
+            let width = protocol.and_then(|protocol| pd_fanout_width(request, protocol));
+            let base_id = request.request_id().to_owned();
+            (0..width.unwrap_or(1)).map(move |index| {
+                if width.is_some() {
+                    pd_sub_request_id(&base_id, index)
+                } else {
+                    base_id.clone()
+                }
+            })
+        })
+        .take(33)
+        .collect();
+    let complete = !ids.is_empty() && ids.len() <= 32;
+    ids.truncate(32);
+    (ids, complete)
+}
+
+/// Give the decode side the media identity the prefill side produced, so it
+/// is served without pixels or references. Only on a side that will pull its
+/// prompt KV from prefill: it must hold a KV handoff (`handed_off`) and be
+/// a single-sample request (`relay_kv_params`); with n>1 decode recomputes
+/// the prompt and needs the references itself, even where legacy Mooncake
+/// still injects its host and port, and a pixel-less side without KV is
+/// refused by the servicer. A prefill that was asked for an identity
+/// (`solicited`: its request carried KV params) but returned none is an
+/// older servicer; the side is left as it is, and decode reprocesses the
+/// media.
+fn apply_prefill_media_identity(
+    decode_request: &mut ProtoGenerateRequest,
+    handed_off: bool,
+    relay_kv_params: bool,
+    solicited: bool,
+    identity: Option<&vllm::MediaIdentity>,
+) {
+    if !handed_off || !relay_kv_params || !decode_request.has_vllm_media_refs() {
+        return;
+    }
+    let applied = match identity {
+        Some(identity) => decode_request.apply_media_identity(identity),
+        None if solicited => {
+            warn!(
+                request_id = %decode_request.request_id(),
+                "prefill worker returned no media identity; decode side will reprocess media"
+            );
+            return;
+        }
+        None => return,
+    };
+    if !applied {
+        warn!(
+            request_id = %decode_request.request_id(),
+            "prefill worker's media identity is unusable; decode side will reprocess media"
+        );
+    }
+}
+
+/// Split an n>1 request into `n` single-sample sub-requests. Sub `i` carries
+/// engine id `{id}-{i}`, `n = 1`, a seed offset of `i` when the request
+/// pinned a seed, and whatever rendezvous `remint` stamps on it.
+fn fan_out_pd_request(
+    request: &ProtoGenerateRequest,
+    n: u32,
+    mut remint: impl FnMut(&mut ProtoGenerateRequest),
+) -> Vec<ProtoGenerateRequest> {
+    let base_id = request.request_id().to_string();
+    (0..n)
+        .map(|i| {
+            let mut sub = request.clone();
+            sub.set_request_id(pd_sub_request_id(&base_id, i));
+            sub.set_sampling_n(1);
+            sub.offset_sampling_seed(i);
+            remint(&mut sub);
+            sub
+        })
+        .collect()
+}
+
+/// Metric connection labels for the PD sides (a side can be gRPC or ZMQ).
+fn pd_side_labels(workers: &WorkerSelection) -> (&'static str, &'static str) {
     match workers {
         WorkerSelection::Disaggregated {
             prefill, decode, ..
@@ -52,48 +297,63 @@ fn pd_leg_labels(workers: &WorkerSelection) -> (&'static str, &'static str) {
 /// Dispatch one attempt of the retained plan: create the attempt's load
 /// guards, fan out encode jobs on the first EPD dispatch, and store the
 /// execution result on the context for response processing.
+///
+/// `last_attempt` says whether a plan is still retained for a replay, which
+/// is what decides when the media bytes stop counting against the in-flight
+/// budget.
 pub(crate) async fn execute_plan(
     ctx: &mut DispatchContext,
-    execution_plan: ExecutionPlan,
+    mut execution_plan: ExecutionPlan,
+    last_attempt: bool,
 ) -> Result<(), Response> {
+    // One bootstrap room per backend request the plan will post: a batched
+    // completion fans out one PD dispatch per sub-request, so admission has
+    // to claim for all of them or the siblings walk past a gate that only
+    // ever asked about one.
+    let sub_requests = plan_sub_requests(&execution_plan, ctx.workers.as_ref());
+
+    // Admission runs before this attempt claims anything else. The decode
+    // side's engine window is what clears the prefill's bootstrap deadline, so
+    // a request the decode cannot admit yet waits here rather than in the
+    // engine's queue — where it would burn the prefill's deadline and strand
+    // both rooms. Waiting ahead of the encode take below also keeps the
+    // encode jobs' SHM unclaimed for the duration: under the burst this gate
+    // targets, holding it would queue a second scarce resource behind the
+    // decode window and throw the finished encode work away on a shed. The
+    // gate abstains when the engine reports no window.
+    let admission = match ctx
+        .workers
+        .as_ref()
+        .and_then(WorkerSelection::decode_worker)
+    {
+        Some(decode) => pd_admission::admit_decode(decode, &ctx.model_id, sub_requests).await?,
+        None => None,
+    };
+
     // `None` for non-EPD, text-only EPD, or an EPD retry (the first dispatch
     // consumed it). Taking it transfers the encode jobs' SHM Drop guards
     // here: dispatch consumes them, while an early error before dispatch
     // drops them and reclaims the SHM.
     let encode_dispatch = ctx.encode_outputs.take().map(|o| o.dispatch);
 
-    let clients = ctx.clients.as_mut().ok_or_else(|| {
-        error!(
-            function = "execute_plan",
-            "Client acquisition not completed"
-        );
-        error::internal_error(
-            "client_acquisition_not_completed",
-            "Client acquisition not completed",
-        )
-    })?;
+    let clients = stage_output(ctx.clients.as_mut(), "execute_plan")?;
 
     // Create load guards for worker load tracking (increment load when created)
     // They will be automatically dropped (and decrement load) when the
     // dispatch context (or the streaming body they are attached to) drops.
-    let workers = ctx.workers.as_ref().ok_or_else(|| {
-        error!(function = "execute_plan", "Worker selection not completed");
-        error::internal_error(
-            "worker_selection_not_completed",
-            "Worker selection not completed",
-        )
-    })?;
+    let workers = stage_output(ctx.workers.as_ref(), "execute_plan")?;
+    // Every breaker sample of this attempt goes through the request's
+    // ledger, which charges a worker once per request however often the
+    // request retried on it.
+    let ledger = &ctx.ledger;
 
-    let sub_requests = match &execution_plan {
-        ExecutionPlan::Batch { requests, .. } => requests.len(),
-        ExecutionPlan::EmbedBatch { requests, .. } => requests.len(),
-        _ => 1,
-    };
-    ctx.load_guards = Some(LoadGuards::scaled(
-        workers,
-        ctx.sticky_key.as_deref(),
-        sub_requests,
+    ctx.load_guards = Some(LoadGuards::admitted(
+        admission,
+        LoadGuards::scaled(workers, ctx.sticky_key.as_deref(), sub_requests),
     ));
+    // The Prefill admission slot worker selection took for this attempt. It
+    // is released when the Prefill phase ends, not with the load guards.
+    let prefill_guard = ctx.pd_prefill_guard.take();
 
     // Extract dispatch metadata for the tracing span and PD metric labels.
     let dispatch = ctx.dispatch.as_ref().ok_or_else(|| {
@@ -104,8 +364,22 @@ pub(crate) async fn execute_plan(
     let model = dispatch.model.as_str();
     let request_type = execution_plan.request_type();
     let mode = execution_plan.mode_label();
+    if cache_trace::enabled() {
+        let (engine_ids, engine_ids_complete) =
+            trace_engine_ids(&mut execution_plan, Some(workers));
+        ctx.cache_trace = cache_trace::dispatch(
+            ctx.root_request_id.as_deref(),
+            ctx.attempt,
+            engine_ids,
+            engine_ids_complete,
+            mode,
+        );
+    }
 
-    // Create OTEL span for gRPC request execution
+    // The upstream span: the dispatch, then the response stream (it closes
+    // with the load guards, which the response body holds to its last frame;
+    // see `LoadGuards::traced`). A failed dispatch sets its status to ERROR;
+    // success is left unset, as the RPC conventions have it.
     let span = info_span!(
         target: "smg::otel-trace",
         "grpc_execute",
@@ -113,37 +387,91 @@ pub(crate) async fn execute_plan(
         request_id = %request_id,
         model = %model,
         mode = %mode,
+        otel.status_code = tracing::field::Empty,
     );
 
     let result = async {
         match execution_plan {
             ExecutionPlan::Single(request) => match request {
-                ProtoRequest::Generate(req) => execute_single(req, clients, workers).await,
-                ProtoRequest::Embed(req) => execute_single_embed(req, clients, workers).await,
+                ProtoRequest::Generate(req) => execute_single(req, clients, workers, ledger).await,
+                ProtoRequest::Embed(req) => {
+                    execute_single_embed(req, clients, workers, ledger).await
+                }
             },
             ExecutionPlan::PrefillDecode(req) => {
-                execute_pd_dispatch(req, clients, workers, model).await
+                let prefill_guard = require_prefill_guard(prefill_guard)?;
+                execute_pd_dispatch(req, clients, workers, model, prefill_guard, ledger).await
             }
             ExecutionPlan::EncodePrefillDecode { request } => {
                 // Bootstrap info was injected into the prefill request during
                 // request building; dispatch the encode jobs with the
-                // prefill+decode leg.
-                execute_epd_dispatch(request, clients, workers, model, encode_dispatch).await
+                // prefill+decode side.
+                let prefill_guard = require_prefill_guard(prefill_guard)?;
+                execute_epd_dispatch(
+                    request,
+                    clients,
+                    workers,
+                    model,
+                    encode_dispatch,
+                    prefill_guard,
+                    ledger,
+                )
+                .await
             }
             ExecutionPlan::Batch { kind, requests, .. } => {
-                execute_batch_dispatch(kind, requests, clients, workers, model).await
+                execute_batch_dispatch(
+                    kind,
+                    requests,
+                    clients,
+                    workers,
+                    model,
+                    prefill_guard,
+                    ledger,
+                )
+                .await
             }
             ExecutionPlan::EmbedBatch { requests, .. } => {
-                execute_embed_batch_dispatch(requests, clients, workers).await
+                execute_batch_embed(requests, clients, workers, ledger).await
             }
         }
     }
-    .instrument(span)
-    .await?;
+    .instrument(span.clone())
+    .await;
+    // The engines hold the request bodies now. An earlier attempt keeps its
+    // share of the budget: the retained plan still owns the same media, and a
+    // replay would send it again.
+    if last_attempt {
+        ctx.multimodal_inflight.take();
+    }
+    let result = match result {
+        Ok(result) => result,
+        Err(response) => {
+            span.record("otel.status_code", "ERROR");
+            return Err(response);
+        }
+    };
+    if let Some(guards) = ctx.load_guards.take() {
+        ctx.load_guards = Some(LoadGuards::traced(span, guards));
+    }
 
     // Store result in context for response processing
     ctx.response.execution_result = Some(result);
     Ok(())
+}
+
+/// A disaggregated dispatch without the Prefill admission slot worker
+/// selection took for it is a pipeline bug, not a routable request.
+fn require_prefill_guard(guard: Option<PrefillLoadGuard>) -> Result<PrefillLoadGuard, Response> {
+    guard.ok_or_else(|| {
+        error!(
+            function = "execute_plan",
+            "PD dispatch without a Prefill admission slot"
+        );
+        error::internal_error(
+            "prefill_admission_missing",
+            "PD dispatch without a Prefill admission slot",
+        )
+    })
 }
 
 async fn execute_pd_dispatch(
@@ -151,6 +479,8 @@ async fn execute_pd_dispatch(
     clients: &mut ClientSelection,
     workers: &WorkerSelection,
     model: &str,
+    prefill_guard: PrefillLoadGuard,
+    ledger: &AttemptLedger,
 ) -> Result<ExecutionResult, Response> {
     let Some(runtime_type) = workers.disaggregated_runtime_type() else {
         error!(
@@ -174,17 +504,175 @@ async fn execute_pd_dispatch(
         ));
     };
     // Dispatch shape comes from the per-runtime PD protocol table (see
-    // `PdProtocol::for_runtime`): sequential legs relay the KV handoff
-    // through the router, parallel legs rendezvous on bootstrap info
+    // `PdProtocol::for_runtime`): sequential sides relay the KV handoff
+    // through the router, parallel sides rendezvous on bootstrap info
     // carried in the request.
-    match protocol.dispatch {
+    let result = match protocol.dispatch {
         PdDispatch::Sequential => {
-            execute_sequential_pd(proto_request, clients, workers, model).await
+            execute_sequential_pd(
+                proto_request,
+                clients,
+                workers,
+                model,
+                prefill_guard,
+                ledger,
+            )
+            .await
         }
-        PdDispatch::Parallel => {
-            execute_parallel_pd(proto_request, clients, workers, protocol).await
+        PdDispatch::Parallel => match pd_fanout_width(&proto_request, protocol) {
+            Some(n) => {
+                execute_fanout_pd(
+                    proto_request,
+                    n,
+                    clients,
+                    workers,
+                    protocol,
+                    prefill_guard,
+                    ledger,
+                )
+                .await
+            }
+            None => {
+                execute_parallel_pd(
+                    proto_request,
+                    clients,
+                    workers,
+                    protocol,
+                    prefill_guard,
+                    ledger,
+                )
+                .await
+            }
+        },
+    }?;
+    Ok(attribute_pd_sides(result, workers))
+}
+
+/// Pair each side's stream of a disaggregated dispatch with the worker it was
+/// sent to, so a failure of the stream can be charged to that worker wherever
+/// the stream is read: the streamed answer knows its sides from the request's
+/// selection, the buffered one reads the streams alone and had no worker to
+/// charge. Each response then counts as that worker's token progress for the
+/// liveness monitor, as a regular dispatch's does. The sides join no tracked
+/// pile and add no prefill backlog: those are the regular dispatch's rules,
+/// and a disaggregated request is admitted through its prefill guard. The
+/// decode side's dispatch success is sampled on its worker's breaker at the
+/// side's first response (see [`ProtoStream::tracked_decode_side`]). The
+/// sequential dispatch's prefill stream is drained already; the wrapper is a
+/// no-op on it.
+fn attribute_pd_sides(result: ExecutionResult, workers: &WorkerSelection) -> ExecutionResult {
+    let ExecutionResult::PrefillDecode {
+        prefill,
+        decode,
+        prefill_guards,
+        pd_timing,
+        prefill_input_logprobs,
+    } = result
+    else {
+        return result;
+    };
+    let attribute = |stream: ProtoStream, worker: Option<&Arc<dyn Worker>>| match worker {
+        Some(worker) => stream.tracked(Arc::clone(worker), 0, false),
+        None => stream,
+    };
+    // The sequential path tracks its decode side itself, at the dispatch,
+    // so it can wait for the side's first token under the side's bound: a side
+    // already on a worker is left as it is (a second layer would sample its
+    // success twice).
+    let decode = match workers.decode_worker() {
+        Some(worker) if decode.worker().is_none() => {
+            (*decode).tracked_decode_side(Arc::clone(worker))
         }
+        _ => *decode,
+    };
+    ExecutionResult::PrefillDecode {
+        prefill: attribute(prefill, workers.prefill_worker()),
+        decode: Box::new(decode),
+        prefill_guards,
+        pd_timing,
+        prefill_input_logprobs,
     }
+}
+
+/// Dispatch an n>1 request as `n` concurrent single-sample PD pairs, each
+/// with its own rendezvous room, and merge their sides into one PD result
+/// whose responses carry the sample index. Fail-fast: the first pair that
+/// fails to start fails the request, and dropping the others aborts them.
+async fn execute_fanout_pd(
+    proto_request: ProtoGenerateRequest,
+    n: u32,
+    clients: &mut ClientSelection,
+    workers: &WorkerSelection,
+    protocol: PdProtocol,
+    prefill_guard: PrefillLoadGuard,
+    ledger: &AttemptLedger,
+) -> Result<ExecutionResult, Response> {
+    let subs = fan_out_pd_request(&proto_request, n, |sub| {
+        maybe_inject_pd_metadata(sub, workers);
+        maybe_inject_pd_rendezvous(sub, workers);
+    });
+    debug!(
+        request_id = proto_request.request_id(),
+        samples = n,
+        "PD fan-out: one single-sample pair per sample, each with its own room"
+    );
+    // The samples share the one admission slot; each pair's Prefill phase
+    // ends on its own, so each carries its own handle.
+    let guards = prefill_guard.replicate_to(subs.len());
+    let dispatches = subs.into_iter().zip(guards).map(|(sub, guard)| {
+        let mut clients = clients.clone();
+        async move {
+            execute_parallel_pd(sub, &mut clients, workers, protocol, guard, ledger).await
+        }
+    });
+    let results = try_join_all(dispatches).await?;
+
+    let mut prefills = Vec::with_capacity(results.len());
+    let mut decodes = Vec::with_capacity(results.len());
+    let mut prefill_guards = Vec::with_capacity(results.len());
+    let mut timing: Option<PdTiming> = None;
+    for result in results {
+        let ExecutionResult::PrefillDecode {
+            prefill,
+            decode,
+            prefill_guards: guards,
+            pd_timing,
+            prefill_input_logprobs: _,
+        } = result
+        else {
+            error!(
+                function = "execute_fanout_pd",
+                "PD fan-out child returned a non-PD result"
+            );
+            return Err(error::internal_error(
+                "pd_fanout_unexpected_result",
+                "PD fan-out child returned a non-PD result",
+            ));
+        };
+        prefills.push(prefill);
+        decodes.push(*decode);
+        prefill_guards.extend(guards);
+        // The earliest prefill start anchors the merged request's TTFT.
+        timing = Some(match timing {
+            Some(earliest) if earliest.prefill_start <= pd_timing.prefill_start => earliest,
+            _ => pd_timing,
+        });
+    }
+    let Some(pd_timing) = timing else {
+        return Err(error::internal_error(
+            "pd_fanout_empty",
+            "PD fan-out produced no dispatch",
+        ));
+    };
+    Ok(ExecutionResult::PrefillDecode {
+        prefill: ProtoStream::Fanout(FanoutStream::new(prefills)),
+        decode: Box::new(ProtoStream::Fanout(FanoutStream::new(decodes))),
+        prefill_guards,
+        pd_timing,
+        // Fan-out children keep live prefill streams; the streaming layer
+        // drains them for input logprobs.
+        prefill_input_logprobs: None,
+    })
 }
 
 async fn execute_epd_dispatch(
@@ -193,17 +681,27 @@ async fn execute_epd_dispatch(
     workers: &WorkerSelection,
     model: &str,
     encode_dispatch: Option<EncodeDispatchPlan>,
+    prefill_guard: PrefillLoadGuard,
+    ledger: &AttemptLedger,
 ) -> Result<ExecutionResult, Response> {
     if let Some(encode_dispatch) = encode_dispatch {
         spawn_encode_dispatch(encode_dispatch);
     }
     proto_request.clear_mm_pixel_values();
-    execute_pd_dispatch(proto_request, clients, workers, model).await
+    execute_pd_dispatch(
+        proto_request,
+        clients,
+        workers,
+        model,
+        prefill_guard,
+        ledger,
+    )
+    .await
 }
 
 #[expect(
     clippy::disallowed_methods,
-    reason = "EPD encode dispatch is intentionally supervised in the background while the prefill leg blocks on embedding receive."
+    reason = "EPD encode dispatch is intentionally supervised in the background while the prefill side blocks on embedding receive."
 )]
 fn spawn_encode_dispatch(encode_dispatch: EncodeDispatchPlan) {
     if encode_dispatch.is_empty() {
@@ -254,33 +752,47 @@ async fn execute_batch_dispatch(
     clients: &ClientSelection,
     workers: &WorkerSelection,
     model: &str,
+    prefill_guard: Option<PrefillLoadGuard>,
+    ledger: &AttemptLedger,
 ) -> Result<ExecutionResult, Response> {
-    let dispatches = requests.into_iter().map(|request| {
-        let mut clients = clients.clone();
-        async move {
-            match kind {
-                ExecutionPlanKind::Single => execute_single(request, &mut clients, workers).await,
-                // Completion EPD carries no encode jobs; sub-requests dispatch as PD.
-                ExecutionPlanKind::PrefillDecode | ExecutionPlanKind::EncodePrefillDecode => {
-                    execute_pd_dispatch(request, &mut clients, workers, model).await
+    // One Prefill handle per PD sub-request, all on the one admission slot.
+    let prefill_guards: Vec<Option<PrefillLoadGuard>> = match kind {
+        ExecutionPlanKind::Single => requests.iter().map(|_| None).collect(),
+        ExecutionPlanKind::PrefillDecode | ExecutionPlanKind::EncodePrefillDecode => {
+            require_prefill_guard(prefill_guard)?
+                .replicate_to(requests.len())
+                .into_iter()
+                .map(Some)
+                .collect()
+        }
+    };
+    let dispatches = requests
+        .into_iter()
+        .zip(prefill_guards)
+        .map(|(request, prefill_guard)| {
+            let mut clients = clients.clone();
+            async move {
+                match kind {
+                    ExecutionPlanKind::Single => {
+                        execute_single(request, &mut clients, workers, ledger).await
+                    }
+                    // Completion EPD carries no encode jobs; sub-requests dispatch as PD.
+                    ExecutionPlanKind::PrefillDecode | ExecutionPlanKind::EncodePrefillDecode => {
+                        let prefill_guard = require_prefill_guard(prefill_guard)?;
+                        execute_pd_dispatch(
+                            request,
+                            &mut clients,
+                            workers,
+                            model,
+                            prefill_guard,
+                            ledger,
+                        )
+                        .await
+                    }
                 }
             }
-        }
-    });
+        });
 
-    let results = try_join_all(dispatches).await?;
-    Ok(ExecutionResult::Batch { results })
-}
-
-async fn execute_embed_batch_dispatch(
-    requests: Vec<ProtoEmbedRequest>,
-    clients: &ClientSelection,
-    workers: &WorkerSelection,
-) -> Result<ExecutionResult, Response> {
-    let dispatches = requests.into_iter().map(|request| {
-        let mut clients = clients.clone();
-        async move { execute_single_embed(request, &mut clients, workers).await }
-    });
     let results = try_join_all(dispatches).await?;
     Ok(ExecutionResult::Batch { results })
 }
@@ -289,99 +801,311 @@ async fn execute_single(
     mut proto_request: ProtoGenerateRequest,
     clients: &mut ClientSelection,
     workers: &WorkerSelection,
+    ledger: &AttemptLedger,
 ) -> Result<ExecutionResult, Response> {
-    let client = clients.single_mut().ok_or_else(|| {
-        error!(
-            function = "execute_single",
-            "Expected single client but got disaggregated"
-        );
-        error::internal_error(
-            "expected_single_client_got_disaggregated",
-            "Expected single client but got disaggregated",
-        )
-    })?;
+    let client = clients.single_or_mismatch("execute_single")?;
 
     if let Some(rank) = workers.single().and_then(|w| w.dp_rank()) {
         proto_request.set_data_parallel_rank(rank as i32);
     }
 
-    let result = client.generate(proto_request).await;
-    workers.record_outcome(result.cb_status_code());
+    let prompt_tokens = u64::try_from(proto_request.prompt_len()).unwrap_or(u64::MAX);
+    let streaming = proto_request.stream();
+    let worker = workers.single();
+    if let Some(worker) = worker {
+        Metrics::record_worker_request(worker.url(), worker.model_id());
+    }
+    // The call's future is boxed, as the disaggregated sides' are: it is the
+    // large part of the dispatch, and inlined in the pipeline's future it
+    // put that future over the size bound.
+    let result = dispatch_single_booked(
+        Box::pin(client.generate(proto_request)),
+        worker,
+        prompt_tokens,
+        streaming,
+    )
+    .await;
+    if let Some(status) = result.breaker_status() {
+        workers.record_outcome(ledger, status);
+    }
 
     let stream = result.map_err(|e| {
-        error!(function = "execute_single", error = %e, "Failed to start generation");
-        e.to_http_error(
+        if let Some(worker) = workers.single() {
+            UpstreamClass::account_dispatch_failure(
+                worker.worker_type().as_metric_label(),
+                worker.connection_mode().as_metric_label(),
+                &e,
+            );
+        }
+        start_failure_response(
+            &e,
+            "execute_single",
+            "Failed to start generation",
             "start_generation_failed",
-            format!("Failed to start generation: {}", e.message()),
         )
     })?;
-
     Ok(ExecutionResult::Single { stream })
+}
+
+/// Dispatch one generation to `worker` (the `call`), booked on the worker
+/// before the call is polled; the call's stream takes the booking over.
+/// Every generation to one worker is tracked: each response on it is
+/// progress for the worker (liveness), the one answer of a non-streaming
+/// generation included, and its prompt is pending prefill there from the
+/// dispatch until the first response. Only a streaming generation joins the
+/// worker's pile: a non-streaming one shows nothing between dispatch and
+/// completion, and the pile rule never judges a worker by requests it cannot
+/// see progress on. The booking comes first because the gRPC servicers
+/// answer the call together with the first message: booked at the call's
+/// return, the prompt was never pending while its prefill ran, every busy
+/// span was about zero, the worker learned a prefill rate many times its
+/// real one and the wedge bound never covered a prefill in progress (see
+/// `PrefillTicket::book`). A call that fails gives the booking back.
+async fn dispatch_single_booked(
+    call: impl Future<Output = StreamResult>,
+    worker: Option<&Arc<dyn Worker>>,
+    prompt_tokens: u64,
+    streaming: bool,
+) -> StreamResult {
+    let Some(worker) = worker else {
+        return call.await;
+    };
+    let booking = DispatchBooking::book(worker, prompt_tokens, streaming);
+    let stream = call.await?;
+    Ok(stream.tracked_booked(Arc::clone(worker), booking))
+}
+
+/// Client answer for a request the worker did not start; an engine rejection (4xx) is not a fault.
+fn start_failure_response(
+    e: &tonic::Status,
+    function: &'static str,
+    description: &str,
+    code: &str,
+) -> Response {
+    // The request's media failed, not the worker (see `TonicStatusExt::media_fault`):
+    // the answer is for the media, under the code the worker names (see
+    // `TonicStatusExt::media_code`), and another worker fetching the same URL
+    // would meet the same host, so the request is not replayed.
+    if let Some(fault) = e.media_fault() {
+        warn!(function = function, error = %e, ?fault, "{}: the request's media failed", description);
+        let mut response = e.to_http_error(e.media_code().as_str(), e.message().to_string());
+        mark_non_retryable(&mut response);
+        return response;
+    }
+    if e.http_status().is_client_error() {
+        warn!(function = function, error = %e, "{}: engine rejected the request", description);
+    } else {
+        error!(function = function, error = %e, "{}", description);
+    }
+    let mut response = e.to_http_error(code, format!("{description}: {}", e.message()));
+    // INTERNAL is the servicers' code for a request the engine took and failed
+    // on: the worker's own answer for this payload, which the retry layer does
+    // not replay on it (see `routers::common::attempt_ledger`). tonic gives
+    // the same code to an HTTP/2 protocol fault under the call, which is no
+    // answer of the worker's (see `TonicStatusExt::http_status`).
+    if e.code() == tonic::Code::Internal && !is_transport_failure(e) {
+        mark_upstream_answer(&mut response);
+    }
+    // The worker already spent its whole media-sidecar budget on this input;
+    // another attempt costs the same again. Other sidecar failures fail fast.
+    if e.code() == tonic::Code::Unavailable && e.message().starts_with("sidecar_timeout") {
+        mark_non_retryable(&mut response);
+    }
+    response
 }
 
 async fn execute_single_embed(
     proto_request: ProtoEmbedRequest,
     clients: &mut ClientSelection,
     workers: &WorkerSelection,
+    ledger: &AttemptLedger,
 ) -> Result<ExecutionResult, Response> {
-    let client = clients.single_mut().ok_or_else(|| {
-        error!(
-            function = "execute_single_embed",
-            "Expected single client but got disaggregated"
-        );
-        error::internal_error(
-            "expected_single_client_got_disaggregated",
-            "Expected single client but got disaggregated",
-        )
-    })?;
+    let client = clients.single_or_mismatch("execute_single_embed")?;
 
+    if let Some(worker) = workers.single() {
+        Metrics::record_worker_request(worker.url(), worker.model_id());
+    }
     let result = client.embed(proto_request).await;
-    workers.record_outcome(result.cb_status_code());
+    if let Some(status) = result.breaker_status() {
+        workers.record_outcome(ledger, status);
+    }
 
     let complete = result.map_err(|e| {
-        error!(function = "execute_single_embed", error = %e, "Failed to start embedding");
-        e.to_http_error(
+        if let Some(worker) = workers.single() {
+            UpstreamClass::account_dispatch_failure(
+                worker.worker_type().as_metric_label(),
+                worker.connection_mode().as_metric_label(),
+                &e,
+            );
+        }
+        start_failure_response(
+            &e,
+            "execute_single_embed",
+            "Failed to start embedding",
             "start_embedding_failed",
-            format!("Failed to start embedding: {}", e.message()),
         )
     })?;
 
     Ok(ExecutionResult::Embedding { response: complete })
 }
 
+/// Fan a batch of embedding inputs out to one Embed RPC each, collected in
+/// input order as a `Batch` result (mirrors the completion batch fan-out).
+/// A single failed sub-request fails the batch, as the completion fan-out does.
+async fn execute_batch_embed(
+    requests: Vec<ProtoEmbedRequest>,
+    clients: &mut ClientSelection,
+    workers: &WorkerSelection,
+    ledger: &AttemptLedger,
+) -> Result<ExecutionResult, Response> {
+    let mut results = Vec::with_capacity(requests.len());
+    for request in requests {
+        results.push(execute_single_embed(request, clients, workers, ledger).await?);
+    }
+    Ok(ExecutionResult::Batch { results })
+}
+
+/// What addresses both sides of a disaggregated dispatch: the pair and the
+/// request's ledger, each side's transport label, the request id both sides
+/// carry, and the prompt's size, which bounds each side's silence.
+struct PdSides<'a> {
+    workers: &'a WorkerSelection,
+    ledger: &'a AttemptLedger,
+    prefill_label: &'static str,
+    decode_label: &'static str,
+    request_id: String,
+    prompt_tokens: u64,
+}
+
+impl<'a> PdSides<'a> {
+    fn of(
+        workers: &'a WorkerSelection,
+        ledger: &'a AttemptLedger,
+        prefill_request: &ProtoGenerateRequest,
+    ) -> Self {
+        let (prefill_label, decode_label) = pd_side_labels(workers);
+        let prompt_tokens = u64::try_from(prefill_request.prompt_len()).unwrap_or(u64::MAX);
+        let request_id = prefill_request.request_id().to_string();
+        Self {
+            workers,
+            ledger,
+            prefill_label,
+            decode_label,
+            request_id,
+            prompt_tokens,
+        }
+    }
+}
+
+/// Execute a parallel PD dispatch: both sides are sent together and rendezvous
+/// on the bootstrap info the request carries; the first failure answers, and
+/// the pair that answered is handed to the response with the decode's abort
+/// deferred until its first item proves the handoff finished.
 async fn execute_parallel_pd(
     proto_request: ProtoGenerateRequest,
     clients: &mut ClientSelection,
     workers: &WorkerSelection,
     protocol: PdProtocol,
+    prefill_guard: PrefillLoadGuard,
+    ledger: &AttemptLedger,
 ) -> Result<ExecutionResult, Response> {
     let runtime = workers
         .disaggregated_runtime_type()
         .map(|r| r.as_str())
         .unwrap_or("");
-    let (prefill_client, decode_client) = clients.disaggregated_mut().ok_or_else(|| {
-        error!(
-            function = "execute_parallel_pd",
-            "Expected disaggregated clients but got single"
-        );
-        error::internal_error(
-            "expected_disaggregated_clients_got_single",
-            "Expected disaggregated clients but got single",
-        )
-    })?;
+    let (prefill_client, decode_client) =
+        clients.disaggregated_or_mismatch("execute_parallel_pd")?;
+    let (prefill_request, decode_request) = parallel_pd_requests(proto_request, workers, protocol);
 
+    // `generate` only establishes the prefill stream here (SMG does not drain
+    // it on this path), so prefill duration cannot be measured — only TTFT,
+    // recorded at the first decode token in streaming. prefill_start anchors it.
+    let prefill_start = Instant::now();
+    let sides = PdSides::of(workers, ledger, &prefill_request);
+    // The prefill side's silence is bounded from its dispatch: a call that
+    // returns no stream, or a stream with nothing on it, within the bound
+    // fails the attempt instead of holding the request (and the decode room
+    // the admission gate claimed for it) until its own timeout.
+    let prefill_worker = workers.prefill_worker();
+    let bound = prefill_worker
+        .and_then(|worker| PrefillBound::at(worker, sides.prompt_tokens, prefill_start));
+    // Each side owns its client handle (a cheap channel clone, the same one
+    // batched dispatch takes per sub-request) so the side still in flight when
+    // its partner fails can be moved off the request path.
+    let mut prefill_client = prefill_client.clone();
+    let mut decode_client = decode_client.clone();
+    for worker in [workers.prefill_worker(), workers.decode_worker()]
+        .into_iter()
+        .flatten()
+    {
+        Metrics::record_worker_request(worker.url(), worker.model_id());
+    }
+    // The side is booked on its worker here, before its call is polled: a
+    // servicer that sends its headers with the first message answers the
+    // call only once the prefill is done, so a booking at the call's return
+    // would time nothing (see `PrefillTicket::book`). The bound above was
+    // read before the booking, so the side's own prompt is not counted twice.
+    let prefill_ticket =
+        prefill_worker.and_then(|worker| PrefillTicket::book(worker, sides.prompt_tokens));
+    let prefill_dispatch: SideDispatch = Box::pin(dispatch_prefill_within(
+        bound.clone(),
+        Box::pin(async move { prefill_client.generate(prefill_request).await }),
+        prefill_worker.cloned(),
+        workers.decode_worker().cloned(),
+        sides.prefill_label,
+        sides.request_id.clone(),
+        sides.prompt_tokens,
+    ));
+    let decode_dispatch: SideDispatch =
+        Box::pin(async move { decode_client.generate(decode_request).await });
+
+    match dispatch_pd_sides(prefill_dispatch, decode_dispatch).await {
+        PdDispatchOutcome::Both(prefill_result, decode_result) => {
+            parallel_sides_answered(
+                &sides,
+                prefill_result,
+                decode_result,
+                bound,
+                prefill_ticket,
+                prefill_guard,
+                // Both sides were dispatched together, so the decode side's
+                // time to first token is the end-to-end one.
+                PdTiming {
+                    prefill_start,
+                    decode_sent: prefill_start,
+                    runtime,
+                },
+            )
+            .await
+        }
+        PdDispatchOutcome::FailedFirst {
+            side,
+            error,
+            partner,
+        } => Err(parallel_side_failed_first(&sides, side, &error, partner)),
+    }
+}
+
+/// The parallel dispatch's two requests from the client's: the prefill side is
+/// the request itself, the decode side its pixel-free clone, each pinned to its
+/// worker's DP rank where the engine reads placement from the request.
+fn parallel_pd_requests(
+    proto_request: ProtoGenerateRequest,
+    workers: &WorkerSelection,
+    protocol: PdProtocol,
+) -> (ProtoGenerateRequest, ProtoGenerateRequest) {
     // Decode consumes the KV handoff from prefill, but TokenSpeed still
     // needs multimodal metadata to pad placeholders and compute MRoPE in
     // the same way as prefill. Drop raw pixels and prefill-only encode
-    // rooms, but keep the per-item metadata. The pixel-free leg is the
+    // rooms, but keep the per-item metadata. The pixel-free side is the
     // clone, so pixel tensors are never duplicated.
     let mut prefill_request = proto_request;
     let mut decode_request = prefill_request.clone_without_mm_pixels();
     decode_request.clear_encode_bootstrap_info();
-    // Pin each leg's DP rank only when the engine reads placement from
+    // Pin each side's DP rank only when the engine reads placement from
     // the request field; `RoomResidue` engines take it from the bootstrap
     // room minted in maybe_inject_pd_rendezvous, ignore the pin, and spam
-    // conflict warnings on a mismatched decode-leg pin.
+    // conflict warnings on a mismatched decode-side pin.
     if protocol.dp_placement == DpPlacement::PinField {
         if let Some(rank) = workers.prefill_worker().and_then(|w| w.dp_rank()) {
             prefill_request.set_data_parallel_rank(rank as i32);
@@ -390,58 +1114,106 @@ async fn execute_parallel_pd(
             decode_request.set_data_parallel_rank(rank as i32);
         }
     }
+    (prefill_request, decode_request)
+}
 
-    // `generate` only establishes the prefill stream here (SMG does not drain
-    // it on this path), so prefill duration cannot be measured — only TTFT,
-    // recorded at the first decode token in streaming. prefill_start anchors it.
-    let prefill_start = Instant::now();
-    let (prefill_result, decode_result): (StreamResult, StreamResult) = tokio::join!(
-        prefill_client.generate(prefill_request),
-        decode_client.generate(decode_request)
-    );
+/// Both sides answered their dispatch: each verdict is translated before either
+/// is propagated, the prefill side's first response is waited for within what is
+/// left of its bound, and the pair goes to the response with the decode's abort
+/// deferred until its first item.
+async fn parallel_sides_answered(
+    sides: &PdSides<'_>,
+    prefill_result: StreamResult,
+    decode_result: StreamResult,
+    bound: Option<PrefillBound>,
+    prefill_ticket: Option<PrefillTicket>,
+    prefill_guard: PrefillLoadGuard,
+    pd_timing: PdTiming,
+) -> Result<ExecutionResult, Response> {
+    let workers = sides.workers;
+    record_pd_dispatch_outcomes(workers, sides.ledger, &prefill_result, &decode_result);
 
-    // Record circuit breaker outcomes (client errors don't count as failures)
-    workers.record_prefill_decode_outcomes(
-        prefill_result.cb_status_code(),
-        decode_result.cb_status_code(),
-    );
+    // Both sides are translated before either is propagated: a
+    // decode-side failure is logged and counted even when the prefill
+    // error is the one the client sees.
+    let prefill_silence = prefill_result
+        .as_ref()
+        .is_err_and(|e| is_prefill_silence(e) || is_decode_silence(e));
+    let prefill = prefill_result
+        .map_err(|e| pd_side_error(PdSide::Prefill, sides.prefill_label, &e, workers));
+    let decode =
+        decode_result.map_err(|e| pd_side_error(PdSide::Decode, sides.decode_label, &e, workers));
+    let (prefill_stream, decode_stream) = match (prefill, decode) {
+        (Ok(prefill), Ok(decode)) => (prefill, decode),
+        // A prefill given up on for a silence verdict (its own, or
+        // its stalled decode partner's) may yet start the handoff
+        // into the decode's room: the decode's abort is deferred
+        // until its first item, as the other two paths of the
+        // verdict defer it (30 s at most), not fired by the drop.
+        (Err(response), Ok(decode)) if prefill_silence => {
+            drop(decode.defer_abort_until_first_item());
+            return Err(response);
+        }
+        // Any other failure: the surviving side's stream drops here,
+        // which aborts its room on the worker.
+        (Err(response), _) | (Ok(_), Err(response)) => return Err(response),
+    };
 
-    let (prefill_label, decode_label) = pd_leg_labels(workers);
+    // The prefill side's prompt has been pending prefill on its worker
+    // since its dispatch, until its first response (which teaches the
+    // worker's rate); the stream takes the booking over. What is left
+    // of the side's bound is spent waiting for that response here,
+    // before the response to the client begins, so a silent prefill
+    // fails the attempt where the retry layer can still take the
+    // request to another prefill worker.
+    let prefill_worker = workers.prefill_worker();
+    let mut prefill_stream = match prefill_worker {
+        Some(worker) => {
+            prefill_stream.tracked_prefill_side_booked(Arc::clone(worker), prefill_ticket)
+        }
+        None => prefill_stream,
+    };
+    match first_prefill_response_within(
+        &mut prefill_stream,
+        bound,
+        prefill_worker,
+        workers.decode_worker(),
+        sides.prefill_label,
+        &sides.request_id,
+        sides.prompt_tokens,
+    )
+    .await
+    {
+        Err(e) => {
+            // Dropping the prefill stream aborts its room. The
+            // decode's abort waits for its first response (30 s at
+            // most): a handoff the silent prefill may yet start must
+            // not be torn down mid-write.
+            drop(prefill_stream);
+            drop(decode_stream.defer_abort_until_first_item());
+            record_silence_outcome(workers, sides.ledger, &e);
+            return Err(pd_side_error(
+                PdSide::Prefill,
+                sides.prefill_label,
+                &e,
+                workers,
+            ));
+        }
+        // The side answered: the success its dispatch's sample waited
+        // for. A side whose first item is a failure is charged once,
+        // where its reader meets it (the streaming layer's
+        // accounting); a stream that ended with nothing on it is no
+        // success of the side either.
+        Ok(FirstItem::Response) => workers.record_outcome_prefill(sides.ledger, 200),
+        Ok(FirstItem::Failure | FirstItem::End) => {}
+    }
 
-    // Handle prefill result
-    let prefill_stream = prefill_result.map_err(|e| {
-        Metrics::record_worker_error(
-            metrics_labels::WORKER_PREFILL,
-            prefill_label,
-            metrics_labels::ERROR_BACKEND,
-        );
-        error!(function = "execute_parallel_pd", error = %e, "Prefill worker failed to start");
-        e.to_http_error(
-            "prefill_worker_failed_to_start",
-            format!("Prefill worker failed to start: {}", e.message()),
-        )
-    })?;
-
-    // Handle decode result
-    let decode_stream = decode_result.map_err(|e| {
-        Metrics::record_worker_error(
-            metrics_labels::WORKER_DECODE,
-            decode_label,
-            metrics_labels::ERROR_BACKEND,
-        );
-        error!(function = "execute_parallel_pd", error = %e, "Decode worker failed to start");
-        e.to_http_error(
-            "decode_worker_failed_to_start",
-            format!("Decode worker failed to start: {}", e.message()),
-        )
-    })?;
-
-    // A client disconnect drops both leg streams, which normally fires an
-    // immediate abort to each worker. The decode leg must not be aborted
+    // A client disconnect drops both side streams, which normally fires an
+    // immediate abort to each worker. The decode side must not be aborted
     // while it is still receiving the KV handoff from prefill — tearing
     // the request down mid-transfer can crash or leak on the engine — so
     // its abort is deferred until the first decode response (the proof
-    // the handoff completed). The prefill leg keeps the immediate abort:
+    // the handoff completed). The prefill side keeps the immediate abort:
     // if prefill is still running there is nothing to hand off yet, and
     // stopping it promptly frees capacity.
     let decode_stream = decode_stream.defer_abort_until_first_item();
@@ -449,50 +1221,1038 @@ async fn execute_parallel_pd(
     Ok(ExecutionResult::PrefillDecode {
         prefill: prefill_stream,
         decode: Box::new(decode_stream),
-        pd_timing: PdTiming {
-            prefill_start,
-            runtime,
-        },
+        prefill_guards: vec![Some(prefill_guard)],
+        pd_timing,
+        // The streaming layer drains the live prefill stream itself.
+        prefill_input_logprobs: None,
     })
 }
 
-/// Execute vLLM PD: send to prefill with max_tokens=1 first, wait for completion,
-/// then send original request to decode.
-///
-/// For Mooncake: injects bootstrap_host/port from prefill worker metadata into
-/// the decode request. For NIXL: tags the prefill request with do_remote_decode,
-/// then relays the kv_transfer_params returned by the prefill engine to decode.
-async fn execute_sequential_pd(
-    mut proto_request: ProtoGenerateRequest,
-    clients: &mut ClientSelection,
-    workers: &WorkerSelection,
-    model: &str,
-) -> Result<ExecutionResult, Response> {
-    let runtime = workers
-        .disaggregated_runtime_type()
-        .map(|r| r.as_str())
-        .unwrap_or("");
-    let (prefill_client, decode_client) = clients.disaggregated_mut().ok_or_else(|| {
-        error!(
-            function = "execute_sequential_pd",
-            "Expected disaggregated clients but got single"
+/// One side failed while its partner was still dispatching: the verdict is
+/// recorded against the side that answered and becomes the response, and the
+/// partner is retired off the request path.
+fn parallel_side_failed_first(
+    sides: &PdSides<'_>,
+    side: PdSide,
+    error: &tonic::Status,
+    partner: SideDispatch,
+) -> Response {
+    let workers = sides.workers;
+    let status = error.breaker_status();
+    // Only the side that answered is recorded: the abandoned one has
+    // said nothing about its worker yet, and `retire_pd_side` records
+    // it when it finally does.
+    let (label, partner_label, partner_worker) = match side {
+        PdSide::Prefill => {
+            record_silence_outcome(workers, sides.ledger, error);
+            (
+                sides.prefill_label,
+                sides.decode_label,
+                workers.decode_worker(),
+            )
+        }
+        PdSide::Decode => {
+            if let Some(status) = status {
+                workers.record_outcome_decode(sides.ledger, status);
+            }
+            (
+                sides.decode_label,
+                sides.prefill_label,
+                workers.prefill_worker(),
+            )
+        }
+    };
+    if let Some(worker) = partner_worker {
+        // The partner of a prefill that fell silent is retired with
+        // its abort deferred (that prefill may yet start the handoff
+        // the decode is waiting for) and uncharged: a late failure
+        // of a handoff that never came is not the decode's fault.
+        // The decode partner the verdict charged for stalling is
+        // retired the same way: charged once, at the verdict.
+        let retirement = if is_prefill_silence(error) || is_decode_silence(error) {
+            Retirement::PartnerSilent
+        } else {
+            Retirement::PartnerFailed
+        };
+        retire_pd_side(
+            side.partner(),
+            partner_label,
+            Arc::clone(worker),
+            partner,
+            retirement,
         );
-        error::internal_error(
-            "expected_disaggregated_clients_got_single",
-            "Expected disaggregated clients but got single",
+    }
+    pd_side_error(side, label, error, workers)
+}
+
+/// Dispatch both sides together and answer with the first failure.
+///
+/// The sides rendezvous on one bootstrap room, so a side that cannot start
+/// leaves its partner's room unreachable — and the engine holding that room
+/// for the whole of its own deadline. Waiting for the second verdict before
+/// reporting the first failure is what turned a 120 s prefill bootstrap
+/// timeout into a 300 s decode transfer timeout for the client, with the
+/// pair's slot held throughout. A side that has already answered is never
+/// discarded, so the success path is byte-for-byte what a join produced.
+async fn dispatch_pd_sides(
+    mut prefill: SideDispatch,
+    mut decode: SideDispatch,
+) -> PdDispatchOutcome {
+    /// One turn of the dispatch loop. The `select!` handlers may only
+    /// classify — moving a still-pending side out happens after the macro's
+    /// borrows end.
+    enum DispatchStep {
+        /// The prefill side answered; a failure here was beaten to the finish
+        /// by its partner, so both verdicts are in.
+        Prefill(StreamResult),
+        Decode(StreamResult),
+        /// This side failed while its partner was still dispatching.
+        Alone(PdSide, tonic::Status),
+    }
+
+    // At most one of these is `Some` at the top of the loop: the second
+    // answer returns rather than being stored, which is also what keeps both
+    // `select!` branches from being disabled at once.
+    let mut prefill_result: Option<StreamResult> = None;
+    let mut decode_result: Option<StreamResult> = None;
+
+    loop {
+        let step = tokio::select! {
+            result = &mut prefill, if prefill_result.is_none() => match result {
+                Err(error) if decode_result.is_none() => DispatchStep::Alone(PdSide::Prefill, error),
+                result => DispatchStep::Prefill(result),
+            },
+            result = &mut decode, if decode_result.is_none() => match result {
+                Err(error) if prefill_result.is_none() => DispatchStep::Alone(PdSide::Decode, error),
+                result => DispatchStep::Decode(result),
+            },
+        };
+
+        match step {
+            DispatchStep::Alone(side, error) => {
+                let partner = match side {
+                    PdSide::Prefill => decode,
+                    PdSide::Decode => prefill,
+                };
+                return PdDispatchOutcome::FailedFirst {
+                    side,
+                    error,
+                    partner,
+                };
+            }
+            DispatchStep::Prefill(result) => match decode_result.take() {
+                Some(decode) => return PdDispatchOutcome::Both(result, decode),
+                None => prefill_result = Some(result),
+            },
+            DispatchStep::Decode(result) => match prefill_result.take() {
+                Some(prefill) => return PdDispatchOutcome::Both(prefill, result),
+                None => decode_result = Some(result),
+            },
+        }
+    }
+}
+
+/// Log, count and translate one side's dispatch failure into the client answer.
+/// A failure that names the rendezvous counts under the rendezvous family too.
+/// A prefill side's silence verdict was logged and counted where its bound
+/// passed, and answers under its own code (see [`prefill_silence_response`]).
+fn pd_side_error(
+    side: PdSide,
+    connection: &'static str,
+    error: &tonic::Status,
+    workers: &WorkerSelection,
+) -> Response {
+    if side == PdSide::Prefill && is_prefill_silence(error) {
+        if let Some(prefill) = workers.prefill_worker() {
+            return prefill_silence_response(error, prefill);
+        }
+    }
+    if side == PdSide::Prefill && is_decode_silence(error) {
+        if let Some(decode) = workers.decode_worker() {
+            return decode_silence_response(error, decode);
+        }
+    }
+    UpstreamClass::account_dispatch_failure(side.name(), connection, error);
+    account_pd_side_failure(side.name(), error);
+    start_failure_response(
+        error,
+        "execute_parallel_pd",
+        side.error_message(),
+        side.error_code(),
+    )
+}
+
+/// Why a PD side still dispatching is retired off the request path (see
+/// [`retire_pd_side`]), and what its late result is worth to its worker's
+/// record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Retirement {
+    /// Its partner failed to start, and the request with it. The side's own
+    /// late failure is still this request's one word on its worker: sampled
+    /// on the breaker and counted as a dispatch's is. A late stream is
+    /// aborted and earns no success: the side never produced anything.
+    PartnerFailed,
+    /// Its partner, the prefill, fell silent: the request charged that
+    /// prefill where its bound passed, and this side's late result is not its
+    /// worker's fault (the handoff it waited for never came), so it is
+    /// neither sampled nor counted. Its abort is deferred: the prefill may
+    /// yet start the handoff, which must not be torn down mid-write.
+    PartnerSilent,
+    /// Its own silence bound passed. The request charged a worker once,
+    /// where the bound passed (the breaker sample through the ledger, the
+    /// `timeout` worker error): this side's, or its decode partner's when
+    /// the partner had stalled mid-stream (see [`decode_partner_silent`]).
+    /// Its late result is neither sampled nor counted, whatever it is. A
+    /// late stream is aborted, a late error noted.
+    Silent,
+    /// Its own first-token bound passed while a KV handoff may still be
+    /// written into it (the decode side of the sequential dispatch): charged
+    /// as [`Self::Silent`] is, and its abort deferred as
+    /// [`Self::PartnerSilent`]'s, since the handoff must not be torn down
+    /// mid-write.
+    HandoffSilent,
+}
+
+impl Retirement {
+    fn cause(self) -> &'static str {
+        match self {
+            Self::PartnerFailed => "its partner failed",
+            Self::PartnerSilent => "its partner fell silent",
+            Self::Silent => "its silence bound passed",
+            Self::HandoffSilent => "its first-token bound passed during the handoff",
+        }
+    }
+
+    fn defer_abort(self) -> bool {
+        matches!(self, Self::PartnerSilent | Self::HandoffSilent)
+    }
+
+    /// Whether the late result is this request's word on the worker.
+    fn charges(self) -> bool {
+        matches!(self, Self::PartnerFailed)
+    }
+}
+
+/// Finish off a side that was still dispatching when its request gave up on
+/// it: its partner failed, or its own silence bound passed
+/// ([`Retirement`]).
+///
+/// The request is already answered; what is left is the engine-side room,
+/// which the abandoned side will allocate the moment its dispatch lands and
+/// then hold for its own deadline. Dropping the side's stream as soon as it
+/// arrives is the abort path the router already uses on a client disconnect,
+/// and it is the only thing that releases that room early. The abort is
+/// deferred only when a KV handoff may still be written into the side: the
+/// decode partner of a prefill that fell silent rather than failed; a peer
+/// that failed to start writes nothing. A late failure is sampled and
+/// counted only when it is the request's one word on the worker; a side
+/// given up on for its silence charged its worker when the bound passed.
+/// A late stream earns no success either way: the side is aborted before it
+/// produced anything.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the abandoned PD side is retired off the request path; its dispatch is bounded by the engine's own deadline"
+)]
+fn retire_pd_side(
+    side: PdSide,
+    connection: &'static str,
+    worker: Arc<dyn Worker>,
+    dispatch: SideDispatch,
+    retirement: Retirement,
+) {
+    tokio::spawn(async move {
+        let result = dispatch.await;
+        if let Some(status) = result
+            .breaker_status()
+            .filter(|_| retirement.charges() && result.is_err())
+        {
+            worker.record_outcome(status);
+        }
+        let cause = retirement.cause();
+        match result {
+            Ok(stream) => {
+                debug!(
+                    leg = side.name(),
+                    worker = worker.url(),
+                    cause,
+                    "Aborting the room of an abandoned PD side"
+                );
+                if retirement.defer_abort() {
+                    drop(stream.defer_abort_until_first_item());
+                } else {
+                    drop(stream);
+                }
+            }
+            Err(error) if retirement.charges() => {
+                UpstreamClass::account_dispatch_failure(side.name(), connection, &error);
+                error!(
+                    function = "retire_pd_side",
+                    leg = side.name(),
+                    worker = worker.url(),
+                    cause,
+                    error = %error,
+                    "Abandoned PD side failed after its request had given up on it"
+                );
+            }
+            Err(error) => {
+                debug!(
+                    leg = side.name(),
+                    worker = worker.url(),
+                    cause,
+                    error = %error,
+                    "Abandoned PD side failed late; its request had charged what it gave up on"
+                );
+            }
+        }
+    });
+}
+
+/// The message a prefill side's silence verdict starts with (see
+/// [`prefill_side_silent`]); it tells the verdict from an engine's own
+/// `DEADLINE_EXCEEDED`.
+const PREFILL_SILENCE_MESSAGE: &str = "prefill leg produced nothing within";
+
+/// The message of the verdict that puts a prefill side's silence on its
+/// stalled decode partner (see [`decode_partner_silent`]).
+const DECODE_SILENCE_MESSAGE: &str = "decode worker produced nothing within";
+
+/// The message a sequential decode side's silence verdict starts with (see
+/// [`decode_side_silent`]); it tells the verdict from an engine's own
+/// `DEADLINE_EXCEEDED`.
+const DECODE_SIDE_SILENCE_MESSAGE: &str = "decode leg produced nothing within";
+
+/// The bound on one prefill side's silence, counted from its dispatch (see
+/// [`liveness::prefill_side_bound`]); the dispatch instant stays with it,
+/// as a reprieve past the deadline may count from there, and so does the
+/// worker's backlog once a reprieve has read it, for both phases of the
+/// side (see [`liveness::prefill_side_reprieve`]).
+#[derive(Clone, Debug)]
+struct PrefillBound {
+    dispatched: Instant,
+    deadline: Instant,
+    bound: Duration,
+    backlog: Arc<OnceLock<Duration>>,
+}
+
+impl PrefillBound {
+    /// The bound for a side of `prompt_tokens` dispatched to `worker` at
+    /// `dispatched`; `None` when the rule is off.
+    fn at(worker: &Arc<dyn Worker>, prompt_tokens: u64, dispatched: Instant) -> Option<Self> {
+        Self::of(
+            liveness::prefill_side_bound(worker, prompt_tokens)?,
+            dispatched,
         )
-    })?;
+    }
 
-    let mode = workers
-        .prefill_worker()
-        .map(|w| connector_mode_for_worker(w.as_ref()))
-        .unwrap_or(KvConnectorMode::Passthrough);
+    /// A bound of `bound` from `dispatched`. A bound past the clock's range
+    /// never expires: `None`, and the side stays unbounded.
+    fn of(bound: Duration, dispatched: Instant) -> Option<Self> {
+        let deadline = dispatched.checked_add(bound)?;
+        Some(Self {
+            dispatched,
+            deadline,
+            bound,
+            backlog: Arc::default(),
+        })
+    }
+}
 
-    // Recorded on the success path (after decode established) so failed
-    // requests don't pollute success metrics; captured here before use of mode.
-    let kv_connector_label = mode.metrics_label();
+/// What a prefill side's silence verdict was judged on (see
+/// [`liveness::SideReprieve::Silent`]).
+#[derive(Clone, Copy, Debug)]
+struct PrefillSilence {
+    /// The side's own bound.
+    bound: Duration,
+    /// How long the side had waited since its dispatch.
+    waited: Duration,
+    /// How long its worker had answered nothing (`None`: never).
+    silent: Option<Duration>,
+    /// What that silence was judged against: the bound, or the time the
+    /// backlog of a run that had not answered takes.
+    window: Duration,
+}
 
-    match &mode {
+/// The verdict on a prefill side that produced nothing within its bound, in
+/// `phase` (`dispatch`: the call returned no stream; `first_response`: the
+/// stream yielded nothing), while its worker answered no other side for its
+/// window either: the bound, or the time the backlog of a run that had not
+/// answered takes (see [`liveness::prefill_side_reprieve`]). One WARN naming
+/// the worker, the request, how long the side waited, how long the worker
+/// had answered nothing against which window and how long ago it last
+/// answered anything, the worker-error counter under the timeout class, and
+/// the status the side's failure is reported with. Nothing else bounds this
+/// wait below the request's own timeout: the engine's health probes keep
+/// passing, the queue timeout ended at worker selection, and the admission
+/// gate only gates the dispatch. The attempt fails here; the retry layer
+/// takes the request to another prefill worker when one is available (see
+/// [`prefill_silence_response`]).
+fn prefill_side_silent(
+    worker: &Arc<dyn Worker>,
+    connection: &'static str,
+    request_id: &str,
+    prompt_tokens: u64,
+    silence: PrefillSilence,
+    phase: &'static str,
+) -> tonic::Status {
+    let millis = |span: Duration| u64::try_from(span.as_millis()).unwrap_or(u64::MAX);
+    let worker_last_answer = worker
+        .prefill_answered_ago()
+        .map_or_else(|| "never".to_string(), |ago| format!("{ago:.1?} ago"));
+    warn!(
+        request_id = %request_id,
+        worker = worker.url(),
+        worker_type = metrics_labels::WORKER_PREFILL,
+        phase,
+        prompt_tokens,
+        bound_ms = millis(silence.bound),
+        waited_ms = millis(silence.waited),
+        worker_silent_ms = silence.silent.map(millis),
+        window_ms = millis(silence.window),
+        worker_last_answer = %worker_last_answer,
+        "PD prefill side produced nothing past its silence bound, and its worker answered no other side for its silence window; giving up on it"
+    );
+    Metrics::record_worker_error(
+        metrics_labels::WORKER_PREFILL,
+        connection,
+        metrics_labels::ERROR_TIMEOUT,
+    );
+    let PrefillSilence {
+        bound,
+        waited,
+        silent,
+        window,
+    } = silence;
+    let worker_silent = match silent {
+        Some(silent) => {
+            format!("its worker answered nothing for {silent:.1?} of a {window:.1?} window")
+        }
+        None => format!("its worker never answered (a {window:.1?} window)"),
+    };
+    tonic::Status::deadline_exceeded(format!(
+        "{PREFILL_SILENCE_MESSAGE} {waited:.1?} of its dispatch ({phase}, bound {bound:.1?}): {worker_silent}"
+    ))
+}
+
+/// Whether `status` is a prefill side's silence verdict.
+fn is_prefill_silence(status: &tonic::Status) -> bool {
+    status.code() == tonic::Code::DeadlineExceeded
+        && status.message().starts_with(PREFILL_SILENCE_MESSAGE)
+}
+
+/// The decode partner of a prefill side whose silence bound passed, when the
+/// silence is the partner's: on the parallel dispatch shape the prefill
+/// side's first response waits for the decode side, so a decode worker that
+/// stopped producing makes every prefill side look silent and the prefill
+/// worker answer no side at all. A decode worker that still holds streams it
+/// had been producing for and has produced nothing for the bound has
+/// stalled ([`Worker::output_silence`]); one that is still producing, or
+/// holds no such stream (its streams ended, or its in-flight work has shown
+/// nothing yet: a frozen prefill in front of an idle decode looks like that,
+/// and the prefill keeps the verdict as before), is not read as the cause.
+/// `None` without a partner (the sequential shape sends the decode side
+/// after the prefill answered, so a silent prefill there is its own).
+fn stalled_decode_partner(
+    partner: Option<&Arc<dyn Worker>>,
+    bound: Duration,
+) -> Option<(Arc<dyn Worker>, Duration)> {
+    let decode = partner?;
+    let silence = decode
+        .output_silence()
+        .filter(|silence| *silence >= bound)?;
+    Some((Arc::clone(decode), silence))
+}
+
+/// The verdict on a prefill side that produced nothing within its bound
+/// while its decode partner had stalled mid-stream (see
+/// [`stalled_decode_partner`]): one WARN naming the decode worker, the
+/// prefill worker and the request, the worker-error counter under the
+/// timeout class for the DECODE worker, and the status the attempt fails
+/// with, which the retry layer may take to another decode worker (see
+/// [`decode_silence_response`]). Nothing is charged to the prefill worker,
+/// which was waiting on its partner.
+fn decode_partner_silent(
+    prefill: &Arc<dyn Worker>,
+    decode: &Arc<dyn Worker>,
+    connection: &'static str,
+    request_id: &str,
+    bound: Duration,
+    silence: Duration,
+    phase: &'static str,
+) -> tonic::Status {
+    warn!(
+        request_id = %request_id,
+        worker = decode.url(),
+        worker_type = metrics_labels::WORKER_DECODE,
+        prefill_worker = prefill.url(),
+        phase,
+        bound_ms = u64::try_from(bound.as_millis()).unwrap_or(u64::MAX),
+        decode_silence_ms = u64::try_from(silence.as_millis()).unwrap_or(u64::MAX),
+        "PD decode worker has produced nothing for the silence bound on the streams it was serving, and the prefill side waits on it; giving up on the pair and charging the decode worker"
+    );
+    Metrics::record_worker_error(
+        metrics_labels::WORKER_DECODE,
+        connection,
+        metrics_labels::ERROR_TIMEOUT,
+    );
+    tonic::Status::deadline_exceeded(format!(
+        "{DECODE_SILENCE_MESSAGE} {bound:.1?} of the prefill leg's dispatch ({phase}): the prefill \
+         leg waited on it (decode silent for {silence:.1?})"
+    ))
+}
+
+/// Whether `status` is the verdict of [`decode_partner_silent`].
+fn is_decode_silence(status: &tonic::Status) -> bool {
+    status.code() == tonic::Code::DeadlineExceeded
+        && status.message().starts_with(DECODE_SILENCE_MESSAGE)
+}
+
+/// The client answer for a pair given up on for its stalled decode partner:
+/// a 504 under its own code, replayable on another decode worker. The
+/// decode worker is marked on the response so the retry window closes on it
+/// alone (the prefill stays selectable) and the answer stands when no other
+/// decode worker is available.
+fn decode_silence_response(status: &tonic::Status, decode: &Arc<dyn Worker>) -> Response {
+    let mut response = error::gateway_timeout(
+        "decode_worker_silent",
+        format!("Decode worker silent: {}", status.message()),
+    );
+    mark_failed_side(&mut response, decode.as_ref());
+    response
+}
+
+/// The breaker samples of a parallel dispatch whose two sides both answered
+/// (client errors don't count as failures). A dispatch that succeeded is
+/// sampled once the side's first response is in: the prefill's where its
+/// first response is awaited, as the sequential path samples it after the
+/// drain; the decode's by the tracked side (`attribute_pd_sides`), since its
+/// first response waits for the handoff. A side that was accepted into
+/// silence, or whose stream fails at once, is one failure of its worker,
+/// not a success and then a failure, which would reset the breaker's streak
+/// every time. A prefill dispatch that ended with the decode verdict (its
+/// partner had stalled while the decode's own call had already returned its
+/// stream) is charged where the verdict put it, the decode.
+fn record_pd_dispatch_outcomes(
+    workers: &WorkerSelection,
+    ledger: &AttemptLedger,
+    prefill_result: &StreamResult,
+    decode_result: &StreamResult,
+) {
+    match prefill_result {
+        Err(e) if is_decode_silence(e) => record_silence_outcome(workers, ledger, e),
+        _ => workers.record_prefill_decode_outcomes(
+            ledger,
+            prefill_result
+                .breaker_status()
+                .filter(|_| prefill_result.is_err()),
+            decode_result
+                .breaker_status()
+                .filter(|_| decode_result.is_err()),
+        ),
+    }
+}
+
+/// The breaker sample of a prefill side's silence verdict: on the worker the
+/// verdict charged (the decode partner that stalled, else the prefill).
+fn record_silence_outcome(
+    workers: &WorkerSelection,
+    ledger: &AttemptLedger,
+    error: &tonic::Status,
+) {
+    if let Some(status) = error.breaker_status() {
+        if is_decode_silence(error) {
+            workers.record_outcome_decode(ledger, status);
+        } else {
+            workers.record_outcome_prefill(ledger, status);
+        }
+    }
+}
+
+/// The client answer for a prefill side's silence: a 504 under its own error
+/// code, replayable on another prefill worker. The side's worker is marked on
+/// the response so the retry window closes on it alone (its decode partner
+/// stays selectable) and the answer stands when no other prefill worker is
+/// available (see `attempt_ledger::FailedSide`).
+fn prefill_silence_response(status: &tonic::Status, prefill: &Arc<dyn Worker>) -> Response {
+    let mut response = error::gateway_timeout(
+        "prefill_worker_silent",
+        format!("Prefill worker silent: {}", status.message()),
+    );
+    mark_failed_side(&mut response, prefill.as_ref());
+    response
+}
+
+/// One check of a prefill side past its deadline, in `phase`: how much
+/// longer it waits (see [`liveness::prefill_side_reprieve`]), or the
+/// verdict that takes its place. Once its worker has answered nothing
+/// within the side's bound, a decode `partner` that had stalled mid-stream
+/// takes the verdict at once (see [`stalled_decode_partner`]; the parallel
+/// shape passes the decode worker, the sequential shape none), whatever the
+/// worker's backlog; otherwise the prefill's verdict, once the worker has
+/// been silent for its window.
+fn judge_prefill_side(
+    worker: &Arc<dyn Worker>,
+    partner: Option<&Arc<dyn Worker>>,
+    bound: &PrefillBound,
+    connection: &'static str,
+    request_id: &str,
+    prompt_tokens: u64,
+    phase: &'static str,
+) -> Result<Duration, tonic::Status> {
+    let waited = bound.dispatched.elapsed();
+    let standing = liveness::prefill_side_reprieve(worker, bound.bound, waited, &bound.backlog);
+    if standing.past_bound() {
+        if let Some((decode, silence)) = stalled_decode_partner(partner, bound.bound) {
+            return Err(decode_partner_silent(
+                worker,
+                &decode,
+                connection,
+                request_id,
+                bound.bound,
+                silence,
+                phase,
+            ));
+        }
+    }
+    match standing {
+        SideReprieve::WithinBound(more) | SideReprieve::FirstAnswerDue(more) => Ok(more),
+        SideReprieve::Silent { silent, window } => Err(prefill_side_silent(
+            worker,
+            connection,
+            request_id,
+            prompt_tokens,
+            PrefillSilence {
+                bound: bound.bound,
+                waited,
+                silent,
+                window,
+            },
+            phase,
+        )),
+    }
+}
+
+/// Await a prefill side's dispatch within its bound. Past the deadline the
+/// side waits on while its worker keeps answering other sides, or while the
+/// worker's current run of prompts has not answered yet and has not gone
+/// unanswered for the time its backlog takes (see [`judge_prefill_side`]);
+/// once it is judged silent, the still-pending call is retired off the
+/// request path (its room is aborted when it lands) and the silence verdict
+/// takes its place: the prefill's, or its decode `partner`'s when the
+/// partner had stalled mid-stream. Without a bound or a worker to charge,
+/// the call is awaited as it is.
+async fn dispatch_prefill_within(
+    bound: Option<PrefillBound>,
+    mut dispatch: SideDispatch,
+    worker: Option<Arc<dyn Worker>>,
+    partner: Option<Arc<dyn Worker>>,
+    connection: &'static str,
+    request_id: String,
+    prompt_tokens: u64,
+) -> StreamResult {
+    let (Some(bound), Some(worker)) = (bound, worker) else {
+        return dispatch.await;
+    };
+    let mut deadline = bound.deadline;
+    loop {
+        if let Ok(result) = tokio::time::timeout_at(deadline.into(), &mut dispatch).await {
+            return result;
+        }
+        match judge_prefill_side(
+            &worker,
+            partner.as_ref(),
+            &bound,
+            connection,
+            &request_id,
+            prompt_tokens,
+            "dispatch",
+        ) {
+            Ok(more) => deadline = Instant::now() + more,
+            Err(verdict) => {
+                retire_pd_side(
+                    PdSide::Prefill,
+                    connection,
+                    Arc::clone(&worker),
+                    dispatch,
+                    Retirement::Silent,
+                );
+                return Err(verdict);
+            }
+        }
+    }
+}
+
+/// Wait for a prefill side's first item within what is left of its bound,
+/// with the same reprieves as [`dispatch_prefill_within`], and say what it
+/// was. The item stays on the stream for its reader; past the bound, with
+/// the worker silent, the silence verdict (the caller drops the side, which
+/// aborts its room). Without a bound nothing is pulled ahead and the side
+/// counts as answered, as its dispatch did.
+async fn first_prefill_response_within(
+    stream: &mut ProtoStream,
+    bound: Option<PrefillBound>,
+    worker: Option<&Arc<dyn Worker>>,
+    partner: Option<&Arc<dyn Worker>>,
+    connection: &'static str,
+    request_id: &str,
+    prompt_tokens: u64,
+) -> Result<FirstItem, tonic::Status> {
+    let (Some(bound), Some(worker)) = (bound, worker) else {
+        return Ok(FirstItem::Response);
+    };
+    let mut deadline = bound.deadline;
+    loop {
+        if let Ok(first) = stream.first_response_within(deadline).await {
+            return Ok(first);
+        }
+        let more = judge_prefill_side(
+            worker,
+            partner,
+            &bound,
+            connection,
+            request_id,
+            prompt_tokens,
+            "first_response",
+        )?;
+        deadline = Instant::now() + more;
+    }
+}
+
+/// The bound on a sequential decode side's first token, counted from its
+/// dispatch (see [`liveness::decode_side_bound`]).
+#[derive(Clone, Copy, Debug)]
+struct DecodeBound {
+    deadline: Instant,
+    bound: Duration,
+}
+
+impl DecodeBound {
+    /// The bound for a side of `prompt_tokens` dispatched at `dispatched`,
+    /// sized from `prefills`, the worker whose prefill of the prompt stands
+    /// before the side's first token (see [`liveness::decode_side_bound`]);
+    /// `None` when the rule is off.
+    fn at(prefills: &Arc<dyn Worker>, prompt_tokens: u64, dispatched: Instant) -> Option<Self> {
+        let bound = liveness::decode_side_bound(prefills, prompt_tokens)?;
+        // A bound past the clock's range never expires: the side stays unbounded.
+        let deadline = dispatched.checked_add(bound)?;
+        Some(Self { deadline, bound })
+    }
+}
+
+/// The worker whose prefill of the prompt stands before a sequential decode
+/// side's first token, which sizes the side's bound: the prefill worker when
+/// the decode side pulls its prompt KV from it, which takes both a handoff
+/// and a request the KV parameters were relayed for (`handed_off` alone does
+/// not say so: the legacy Mooncake arm hands off a fan-out in name only and
+/// the decode engine recomputes the prompt); else the decode worker, which
+/// recomputes the prompt itself (a fan-out, or a prefill that returned no
+/// transfer parameters). The decode worker's prefill rate is never measured
+/// under PD (its decode sides book no prefill), so that bound follows the
+/// cold rate with an empty backlog, the conservative side.
+fn worker_prefilling_before_decode(
+    workers: &WorkerSelection,
+    handed_off: bool,
+    relay_kv_params: bool,
+) -> Option<&Arc<dyn Worker>> {
+    if handed_off && relay_kv_params {
+        workers.prefill_worker()
+    } else {
+        workers.decode_worker()
+    }
+}
+
+/// The verdict on a sequential decode side that produced nothing within its
+/// first-token bound, in `phase` (`dispatch`: the call returned no stream;
+/// `first_response`: the stream yielded nothing): one WARN naming the
+/// worker and the request, the worker-error counter under the timeout
+/// class, and the status the side's failure is reported with. The prefill
+/// side has answered by then, so its silence bound no longer covers the
+/// request, and nothing else bounds this wait below the request's own
+/// timeout: the engines' health probes keep passing while the KV handoff
+/// waits on a prefill engine that stalled right after answering, and the
+/// admission gate only gated the dispatch. The attempt fails here; the
+/// retry layer takes the request to another decode worker when one is
+/// available (see [`decode_silence_response`]).
+fn decode_side_silent(
+    worker: &Arc<dyn Worker>,
+    connection: &'static str,
+    request_id: &str,
+    prompt_tokens: u64,
+    bound: Duration,
+    phase: &'static str,
+) -> tonic::Status {
+    warn!(
+        request_id = %request_id,
+        worker = worker.url(),
+        worker_type = metrics_labels::WORKER_DECODE,
+        phase,
+        prompt_tokens,
+        bound_ms = u64::try_from(bound.as_millis()).unwrap_or(u64::MAX),
+        "PD decode side produced nothing within its first-token bound after the prefill side had answered (the handoff did not complete, or the decode engine never scheduled it); giving up on it"
+    );
+    Metrics::record_worker_error(
+        metrics_labels::WORKER_DECODE,
+        connection,
+        metrics_labels::ERROR_TIMEOUT,
+    );
+    tonic::Status::deadline_exceeded(format!(
+        "{DECODE_SIDE_SILENCE_MESSAGE} {bound:.1?} of its dispatch ({phase})"
+    ))
+}
+
+/// Whether `status` is a sequential decode side's silence verdict. Its
+/// client answer is the one a stalled decode partner gets on the parallel
+/// shape ([`decode_silence_response`]): a 504 `decode_worker_silent`,
+/// replayable on another decode worker, this one excluded.
+fn is_decode_side_silence(status: &tonic::Status) -> bool {
+    status.code() == tonic::Code::DeadlineExceeded
+        && status.message().starts_with(DECODE_SIDE_SILENCE_MESSAGE)
+}
+
+/// Await a sequential decode side's dispatch within its bound. Past the
+/// deadline the still-pending call is retired off the request path (its
+/// room is aborted once the handoff it may be in the middle of has produced
+/// a first item, or the deferral's cap passes) and the silence verdict takes
+/// its place. Without a bound or a worker to charge, the call is awaited as
+/// it is. No reprieve: unlike a prefill side queued on a busy worker, a
+/// decode side was admitted to a room before its dispatch, so nothing of the
+/// worker's other sides stands between it and its first token.
+async fn dispatch_decode_within(
+    bound: Option<DecodeBound>,
+    mut dispatch: SideDispatch,
+    worker: Option<Arc<dyn Worker>>,
+    connection: &'static str,
+    request_id: String,
+    prompt_tokens: u64,
+) -> StreamResult {
+    let (Some(bound), Some(worker)) = (bound, worker) else {
+        return dispatch.await;
+    };
+    match tokio::time::timeout_at(bound.deadline.into(), &mut dispatch).await {
+        Ok(result) => result,
+        Err(_) => {
+            retire_pd_side(
+                PdSide::Decode,
+                connection,
+                Arc::clone(&worker),
+                dispatch,
+                Retirement::HandoffSilent,
+            );
+            Err(decode_side_silent(
+                &worker,
+                connection,
+                &request_id,
+                prompt_tokens,
+                bound.bound,
+                "dispatch",
+            ))
+        }
+    }
+}
+
+/// Wait for a sequential decode side's first item within what is left of its
+/// bound, and say what it was. The item stays on the stream for its reader;
+/// past the bound, the silence verdict (the caller drops the side, whose
+/// abort is deferred past the handoff). Without a bound nothing is pulled
+/// ahead and the side counts as answered, as its dispatch did.
+async fn first_decode_response_within(
+    stream: &mut ProtoStream,
+    bound: Option<DecodeBound>,
+    worker: Option<&Arc<dyn Worker>>,
+    connection: &'static str,
+    request_id: &str,
+    prompt_tokens: u64,
+) -> Result<FirstItem, tonic::Status> {
+    let (Some(bound), Some(worker)) = (bound, worker) else {
+        return Ok(FirstItem::Response);
+    };
+    match stream.first_response_within(bound.deadline).await {
+        Ok(first) => Ok(first),
+        Err(_) => Err(decode_side_silent(
+            worker,
+            connection,
+            request_id,
+            prompt_tokens,
+            bound.bound,
+            "first_response",
+        )),
+    }
+}
+
+/// The attempt's answer for a decode side that failed to start or fell
+/// silent on the sequential path: the breaker sample, the worker-error
+/// counter (the silence verdict counted itself) and the client response.
+fn sequential_decode_failure(
+    e: &tonic::Status,
+    workers: &WorkerSelection,
+    ledger: &AttemptLedger,
+    connection: &'static str,
+) -> Response {
+    if let Some(status) = e.breaker_status() {
+        workers.record_outcome_decode(ledger, status);
+    }
+    if is_decode_side_silence(e) {
+        if let Some(decode) = workers.decode_worker() {
+            return decode_silence_response(e, decode);
+        }
+    }
+    UpstreamClass::account_dispatch_failure(metrics_labels::WORKER_DECODE, connection, e);
+    account_pd_side_failure(metrics_labels::WORKER_DECODE, e);
+    start_failure_response(
+        e,
+        "execute_sequential_pd",
+        PdSide::Decode.error_message(),
+        PdSide::Decode.error_code(),
+    )
+}
+
+/// The attempt's answer for a prefill side that failed to start or fell
+/// silent on the sequential path: the breaker sample, the worker-error
+/// counter (the silence verdict counted itself) and the client response.
+fn sequential_prefill_failure(
+    e: &tonic::Status,
+    workers: &WorkerSelection,
+    ledger: &AttemptLedger,
+    connection: &'static str,
+) -> Response {
+    if let Some(status) = e.breaker_status() {
+        workers.record_outcome_prefill(ledger, status);
+    }
+    if is_prefill_silence(e) {
+        if let Some(prefill) = workers.prefill_worker() {
+            return prefill_silence_response(e, prefill);
+        }
+    }
+    UpstreamClass::account_dispatch_failure(metrics_labels::WORKER_PREFILL, connection, e);
+    account_pd_side_failure(metrics_labels::WORKER_PREFILL, e);
+    start_failure_response(
+        e,
+        "execute_sequential_pd",
+        PdSide::Prefill.error_message(),
+        PdSide::Prefill.error_code(),
+    )
+}
+
+/// How the vLLM sequential-PD decode side is built from the request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SequentialPdDecodeForm {
+    /// Full payload: no KV handoff (n>1), decode recomputes the prompt
+    /// locally and runs the vision encoder itself.
+    Full,
+    /// Pixels dropped, per-image identity and M-RoPE grid tensors kept:
+    /// decode computes grid-aware positions against the KV handoff.
+    IdentityOnly,
+    /// Language-model-only decode worker: everything multimodal goes except
+    /// the per-image content hashes (folded into cache_salt servicer-side),
+    /// so the engine sees a pure-text TokensPrompt and never touches its
+    /// zero-budget encoder cache.
+    TextPlusHashes,
+}
+
+/// Pick the decode-side form, failing fast when the selected decode worker is
+/// language-model-only and the request is one that pairing cannot serve.
+/// Worker selection keeps such a request off such workers while the model
+/// pairs a decode worker with the vision encoder (`decode_needs_vision`), so
+/// a refusal here means none is paired.
+fn sequential_pd_decode_form(
+    request: &ProtoGenerateRequest,
+    decode_language_model_only: bool,
+    relay_kv_params: bool,
+) -> Result<SequentialPdDecodeForm, Response> {
+    if !decode_language_model_only {
+        return Ok(if relay_kv_params {
+            SequentialPdDecodeForm::IdentityOnly
+        } else {
+            SequentialPdDecodeForm::Full
+        });
+    }
+    if request.has_vllm_mrope_grids() {
+        // Grid-dependent models (Qwen-VL family) derive decode-side positions
+        // from the grid tensors: a language-model-only decode worker rejects
+        // them and stripping them would mis-rotate every generated token, so
+        // this pairing cannot serve the request.
+        let mut response = error::bad_request(
+            "pd_decode_language_model_only_mrope",
+            "no decode worker with a vision encoder is paired for this model, and its \
+             decode leg needs the M-RoPE grid tensors a decode worker running with \
+             --language-model-only cannot take; add a decode worker with the vision \
+             encoder enabled for this model"
+                .to_string(),
+        );
+        mark_non_retryable(&mut response);
+        return Err(response);
+    }
+    if request.has_vllm_media_refs() {
+        // Media references reach each side as unexpanded anchors the side
+        // expands itself; a language-model-only decode worker cannot.
+        let mut response = error::bad_request(
+            "pd_decode_language_model_only_media_refs",
+            "no decode worker with a vision encoder is paired for this model, and a \
+             decode worker running with --language-model-only cannot expand media \
+             references; add such a decode worker or use router-side multimodal \
+             processing (--mm-processing=router) for this pool"
+                .to_string(),
+        );
+        mark_non_retryable(&mut response);
+        return Err(response);
+    }
+    if !relay_kv_params && request.has_mm_inputs() {
+        // n>1 has no KV handoff: decode recomputes the prompt locally, which
+        // a pixel-less decode worker cannot do.
+        let mut response = error::bad_request(
+            "pd_decode_language_model_only_n_samples",
+            "no decode worker with a vision encoder is paired for this model, and n>1 \
+             parallel sampling of a multimodal prompt recomputes it on the decode \
+             leg, which a decode worker running with --language-model-only cannot \
+             do; add a decode worker with the vision encoder enabled"
+                .to_string(),
+        );
+        mark_non_retryable(&mut response);
+        return Err(response);
+    }
+    Ok(SequentialPdDecodeForm::TextPlusHashes)
+}
+
+/// What the sequential dispatch decides before either side is sent: the pair's
+/// KV connector mode, whether the KV handoff is relayed through the router,
+/// the transfer id the router mints for Mooncake, and the decode side's form.
+struct SequentialPlan {
+    mode: KvConnectorMode,
+    /// The KV handoff is single-consumer: with n>1 each fan-out child on decode
+    /// would pull, and the first completion frees the prefill blocks under its
+    /// siblings (same hazard for NIXL and Mooncake)
+    relay_kv_params: bool,
+    /// Mooncake is push-based: the engine returns nothing, so the router mints
+    /// the transfer correlation id and synthesizes decode params from metadata
+    mooncake_transfer_id: Option<String>,
+    decode_form: SequentialPdDecodeForm,
+    /// A stripped multimodal side has no local-recompute fallback: the image
+    /// KV exists only on the prefill worker. Text requests strip to a no-op
+    /// and keep the fallback, so only mm requests need the handoff checked.
+    stripped_mm_decode: bool,
+    /// The request streams: its decode side owes a first token within a bound.
+    streaming: bool,
+}
+
+impl SequentialPlan {
+    /// Decide the plan from the pair and the request; a pairing this pipeline
+    /// cannot serve (a MoRI-IO decode, a language-model-only decode the
+    /// request's multimodal payload needs more of) is refused here, before
+    /// either side is sent.
+    fn decide(
+        proto_request: &ProtoGenerateRequest,
+        workers: &WorkerSelection,
+    ) -> Result<Self, Response> {
+        let mode = match workers.decode_worker() {
+            // A MoRI-IO decode engine never recomputes the prompt, whatever the
+            // prefill side runs.
+            Some(decode) if is_moriio_worker(decode.as_ref()) => KvConnectorMode::MoriIo,
+            _ => workers
+                .prefill_worker()
+                .map(|w| connector_mode_for_worker(w.as_ref()))
+                .unwrap_or(KvConnectorMode::Passthrough),
+        };
+
+        match &mode {
             KvConnectorMode::Mooncake {
                 host,
                 port,
@@ -505,6 +2265,18 @@ async fn execute_sequential_pd(
             ),
             KvConnectorMode::Nixl => debug!(
                 "vLLM PD (NIXL): will tag prefill with do_remote_decode and relay returned kv_transfer_params to decode"
+            ),
+            // Relaying nothing would let the decode engine compute over KV that
+            // never arrives, so refuse until this pipeline speaks the protocol.
+            KvConnectorMode::MoriIo => {
+                return Err(error::not_implemented(
+                    "moriio_grpc_pd_unsupported",
+                    "MoRIIOConnector PD is supported by the HTTP PD router only",
+                ));
+            }
+            KvConnectorMode::Store => debug!(
+                "vLLM PD (KV store): the prefill writes its blocks to the shared store and the \
+                 decode reads them back by prefix hash; no connector params on either leg"
             ),
             KvConnectorMode::Passthrough => {
                 // Warn once: PD without a discovered connector usually means GetServerInfo
@@ -519,98 +2291,323 @@ async fn execute_sequential_pd(
             }
         }
 
-    // The KV handoff is single-consumer: with n>1 each fan-out child on decode
-    // would pull, and the first completion frees the prefill blocks under its
-    // siblings (same hazard for NIXL and Mooncake)
-    let relay_kv_params = proto_request.sampling_n() <= 1;
+        let relay_kv_params = proto_request.sampling_n() <= 1;
 
-    // Mooncake is push-based: the engine returns nothing, so the router mints
-    // the transfer correlation id and synthesizes decode params from metadata
-    let mooncake_transfer_id = match &mode {
-        KvConnectorMode::Mooncake {
-            engine_id: Some(_), ..
-        } if relay_kv_params => Some(format!("xfer-{}", uuid::Uuid::now_v7())),
-        _ => None,
-    };
+        let mooncake_transfer_id = match &mode {
+            KvConnectorMode::Mooncake {
+                engine_id: Some(_), ..
+            } if relay_kv_params => Some(format!("xfer-{}", uuid::Uuid::now_v7())),
+            _ => None,
+        };
 
-    // Decode normally reuses the request minus pixels: it receives KV via
-    // the P/D transfer, and prefill reads and unlinks any /dev/shm
-    // segments, so a reused ShmHandle would be unreadable. Same request_id
-    // on both legs is load-bearing for NIXL P/D correlation on vLLM <
-    // 0.13. The pixel-free leg is the clone, so pixel tensors are never
-    // duplicated and die with the prefill send; the per-image mm identity
-    // and grid tensors survive for decode-side hashing and positions.
-    // Without a KV handoff (n>1) decode recomputes the prompt locally and
-    // must run the vision encoder, so that leg keeps the full multimodal
-    // payload (SHM-backed tensors cannot serve both legs and fail loudly
-    // on the decode read).
-    let mut decode_request = if relay_kv_params {
-        proto_request.clone_without_mm_pixels()
-    } else {
-        proto_request.clone()
-    };
-    // Sanitize prefill sampling (max_tokens=1, n=1), stream=false.
-    let mut prefill_request = proto_request;
-    prefill_request.sanitize_sampling_for_prefill(1);
-    prefill_request.set_stream(false);
-    if let Some(rank) = workers.prefill_worker().and_then(|w| w.dp_rank()) {
-        prefill_request.set_data_parallel_rank(rank as i32);
+        // A decode worker started with `--language-model-only` (the production
+        // vLLM P/D shape) has no vision encoder and
+        // an encoder-cache budget of 0, so even the identity payload fails to
+        // schedule there. Its model info reports supports_vision=false; for such
+        // a worker the decode side is stripped down to what such an engine takes: the
+        // prefill-expanded input_ids, the KV handoff, and the per-image content
+        // hashes that the servicer folds into cache_salt so different images
+        // cannot alias in the decode prefix cache.
+        let decode_language_model_only = proto_request.is_vllm()
+            && workers
+                .decode_worker()
+                .is_some_and(|worker| worker_language_model_only(worker.as_ref()));
+        let decode_form =
+            sequential_pd_decode_form(proto_request, decode_language_model_only, relay_kv_params)?;
+        let stripped_mm_decode = matches!(decode_form, SequentialPdDecodeForm::TextPlusHashes)
+            && proto_request.has_mm_inputs();
+        Ok(Self {
+            mode,
+            relay_kv_params,
+            mooncake_transfer_id,
+            decode_form,
+            stripped_mm_decode,
+            streaming: proto_request.stream(),
+        })
     }
-    if mode == KvConnectorMode::Nixl {
-        if relay_kv_params {
-            prefill_request.set_kv_transfer_params_json(NIXL_PREFILL_KV_PARAMS.to_string());
-        } else {
-            debug!(
-                request_id = %prefill_request.request_id(),
-                "vLLM PD (NIXL): n>1 request, skipping kv_transfer_params relay \
-                 (decode recomputes the prompt locally)"
-            );
+
+    /// The prefill request carried KV params, so the servicer was asked for
+    /// the media identity.
+    fn identity_solicited(&self) -> bool {
+        self.mooncake_transfer_id.is_some()
+            || (self.mode == KvConnectorMode::Nixl && self.relay_kv_params)
+    }
+
+    /// The two sides' requests from the client's: the decode side in the form
+    /// the plan decided, the prefill side sanitized to one token, one sample
+    /// and no stream, pinned to its worker's DP rank and tagged for the
+    /// connector's handoff.
+    fn requests(
+        &self,
+        mut proto_request: ProtoGenerateRequest,
+        workers: &WorkerSelection,
+    ) -> (ProtoGenerateRequest, ProtoGenerateRequest) {
+        // Decode normally reuses the request minus pixels: it receives KV via
+        // the P/D transfer, and prefill reads and unlinks any /dev/shm
+        // segments, so a reused ShmHandle would be unreadable. Same request_id
+        // on both sides is load-bearing for NIXL P/D correlation on vLLM <
+        // 0.13. The pixel-free side is the clone, so pixel tensors are never
+        // duplicated and die with the prefill send; the per-image mm identity
+        // and grid tensors survive for decode-side hashing and positions.
+        // Media references are resolved by the prefill side and relayed to
+        // decode as that same identity once prefill completes.
+        // Without a KV handoff (n>1) decode recomputes the prompt locally and
+        // must run the vision encoder, so that side keeps the full multimodal
+        // payload (SHM-backed tensors cannot serve both sides and fail loudly
+        // on the decode read).
+        let decode_request = match self.decode_form {
+            SequentialPdDecodeForm::Full => proto_request.clone(),
+            SequentialPdDecodeForm::TextPlusHashes => proto_request.clone_without_mm(),
+            SequentialPdDecodeForm::IdentityOnly => proto_request.clone_without_mm_pixels(),
+        };
+        // Sanitize prefill sampling (max_tokens=1, n=1), stream=false.
+        let mut prefill_request = proto_request;
+        prefill_request.sanitize_sampling_for_prefill(1);
+        prefill_request.set_stream(false);
+        if let Some(rank) = workers.prefill_worker().and_then(|w| w.dp_rank()) {
+            prefill_request.set_data_parallel_rank(rank as i32);
         }
+        if self.mode == KvConnectorMode::Nixl {
+            if self.relay_kv_params {
+                prefill_request.set_kv_transfer_params_json(NIXL_PREFILL_KV_PARAMS.to_string());
+            } else {
+                debug!(
+                    request_id = %prefill_request.request_id(),
+                    "vLLM PD (NIXL): n>1 request, skipping kv_transfer_params relay \
+                     (decode recomputes the prompt locally)"
+                );
+            }
+        }
+        if let Some(ref transfer_id) = self.mooncake_transfer_id {
+            prefill_request.set_kv_transfer_params_json(mooncake_prefill_params(transfer_id));
+        }
+        (prefill_request, decode_request)
     }
-    if let Some(ref transfer_id) = mooncake_transfer_id {
-        prefill_request.set_kv_transfer_params_json(mooncake_prefill_params(transfer_id));
-    }
+}
 
+/// What the drained prefill side hands on: its completed stream, the connector
+/// params and the processed media identity its Complete frame carried, the
+/// input logprobs and the prefix-cache hit, and the side's start and end.
+struct PrefillHarvest {
+    stream: ProtoStream,
+    kv_params: Option<String>,
+    media_identity: Option<vllm::MediaIdentity>,
+    input_logprobs: Option<ProtoInputLogProbs>,
+    cached_tokens: PrefillCachedTokens,
+    started: Instant,
+    done: Instant,
+}
+
+/// Execute vLLM PD: send to prefill with max_tokens=1 first, wait for completion,
+/// then send original request to decode.
+///
+/// For Mooncake: injects bootstrap_host/port from prefill worker metadata into
+/// the decode request. For NIXL: tags the prefill request with do_remote_decode,
+/// then relays the kv_transfer_params returned by the prefill engine to decode.
+async fn execute_sequential_pd(
+    proto_request: ProtoGenerateRequest,
+    clients: &mut ClientSelection,
+    workers: &WorkerSelection,
+    model: &str,
+    prefill_guard: PrefillLoadGuard,
+    ledger: &AttemptLedger,
+) -> Result<ExecutionResult, Response> {
+    let runtime = workers
+        .disaggregated_runtime_type()
+        .map(|r| r.as_str())
+        .unwrap_or("");
+    let (prefill_client, decode_client) =
+        clients.disaggregated_or_mismatch("execute_sequential_pd")?;
+
+    let plan = SequentialPlan::decide(&proto_request, workers)?;
+    // Recorded on the success path (after decode established) so failed
+    // requests don't pollute success metrics; captured here before use of mode.
+    let kv_connector_label = plan.mode.metrics_label();
+    let (prefill_request, mut decode_request) = plan.requests(proto_request, workers);
+    let sides = PdSides::of(workers, ledger, &prefill_request);
+
+    let PrefillHarvest {
+        stream: prefill_stream,
+        kv_params,
+        media_identity,
+        input_logprobs: prefill_input_logprobs,
+        cached_tokens: prefill_cached_tokens,
+        started: prefill_start,
+        done: prefill_done,
+    } = sequential_prefill_side(
+        &sides,
+        prefill_request,
+        prefill_client.clone(),
+        prefill_guard,
+    )
+    .await?;
+
+    debug!("vLLM PD: prefill completed, sending decode request");
+
+    let handed_off = relay_to_decode(
+        &plan,
+        workers,
+        &mut decode_request,
+        kv_params,
+        media_identity.as_ref(),
+    )?;
+    let (decode_stream, decode_sent) = sequential_decode_side(
+        &sides,
+        &plan,
+        decode_request,
+        decode_client.clone(),
+        handed_off,
+    )
+    .await?;
+    // Decode established: record the success-only PD metrics here.
+    Metrics::record_pd_kv_connector_mode(kv_connector_label);
+    Metrics::record_pd_prefill_duration(
+        metrics_labels::BACKEND_PD,
+        model,
+        runtime,
+        prefill_done.duration_since(prefill_start),
+    );
+    Metrics::record_pd_kv_transfer_duration(
+        metrics_labels::BACKEND_PD,
+        model,
+        runtime,
+        decode_sent.duration_since(prefill_done),
+    );
+
+    // The client's prompt-side usage is the prefill side's: the decode side's
+    // responses carry the prefix-cache hit the prefill side reported, not the
+    // transfer the decode side counts as cached.
+    let decode_stream = decode_stream.decode_side(prefill_cached_tokens);
+
+    // Surface the PD shape (not `Single`) so the streaming layer anchors TTFT
+    // at prefill dispatch. Without this, the decode stream is established only
+    // after prefill completes, and — because the servicer flushes response
+    // headers lazily with the first message — the first decode chunk is
+    // already buffered when the stream task starts, so a task-local timer
+    // measures ~0. The prefill stream is fully drained and its load guard
+    // already released, so the prefill side carries no live guard.
+    Ok(ExecutionResult::PrefillDecode {
+        prefill: prefill_stream,
+        decode: Box::new(decode_stream),
+        prefill_guards: vec![None],
+        pd_timing: PdTiming {
+            prefill_start,
+            decode_sent,
+            runtime,
+        },
+        prefill_input_logprobs,
+    })
+}
+
+/// The prefill side of the sequential dispatch: sent and answered within its
+/// bound, booked on its worker, then drained for what the decode side needs;
+/// its admission slot is released once it is drained. A failure anywhere is
+/// the attempt's, where the retry layer can still take the request to another
+/// prefill worker.
+async fn sequential_prefill_side(
+    sides: &PdSides<'_>,
+    prefill_request: ProtoGenerateRequest,
+    mut prefill_client: BackendClient,
+    prefill_guard: PrefillLoadGuard,
+) -> Result<PrefillHarvest, Response> {
+    let workers = sides.workers;
     debug!(
         request_id = %prefill_request.request_id(),
         "vLLM PD: sending prefill request (max_tokens=1)"
     );
 
-    // Send to prefill, wait for completion
-    let (prefill_label, decode_label) = pd_leg_labels(workers);
+    // Send to prefill, wait for completion. The side's silence is bounded
+    // from its dispatch (see `prefill_side_silent`): a call that returns no
+    // stream (a servicer that holds its headers until the first message in
+    // front of a frozen engine), or a stream with nothing on it, within the
+    // bound fails the attempt here, where the retry layer can still take
+    // the request to another prefill worker.
+    let prefill_worker = workers.prefill_worker();
     let prefill_start = Instant::now();
-    let mut prefill_stream = prefill_client
-            .generate(prefill_request)
-            .await
-            .map_err(|e| {
-                workers.record_outcome_prefill(e.http_status().as_u16());
-                Metrics::record_worker_error(
-                    metrics_labels::WORKER_PREFILL,
-                    prefill_label,
-                    metrics_labels::ERROR_BACKEND,
-                );
-                error!(function = "execute_sequential_pd", error = %e, "Prefill worker failed to start");
-                e.to_http_error("prefill_worker_failed_to_start", format!("Prefill worker failed to start: {}", e.message()))
-            })?;
+    let bound = prefill_worker
+        .and_then(|worker| PrefillBound::at(worker, sides.prompt_tokens, prefill_start));
+    if let Some(prefill) = prefill_worker {
+        Metrics::record_worker_request(prefill.url(), prefill.model_id());
+    }
+    // Booked before the call is polled, for the servicers that send their
+    // headers with the first message (see `PrefillTicket::book`); the bound
+    // above was read before the booking.
+    let prefill_ticket =
+        prefill_worker.and_then(|worker| PrefillTicket::book(worker, sides.prompt_tokens));
+    let prefill_stream = dispatch_prefill_within(
+        bound.clone(),
+        Box::pin(async move { prefill_client.generate(prefill_request).await }),
+        prefill_worker.cloned(),
+        None,
+        sides.prefill_label,
+        sides.request_id.clone(),
+        sides.prompt_tokens,
+    )
+    .await
+    .map_err(|e| sequential_prefill_failure(&e, workers, sides.ledger, sides.prefill_label))?;
+    // The prompt has been pending prefill on its worker since the dispatch,
+    // until the first response, which teaches the worker's rate; the stream
+    // takes the booking over.
+    let mut prefill_stream = match prefill_worker {
+        Some(worker) => {
+            prefill_stream.tracked_prefill_side_booked(Arc::clone(worker), prefill_ticket)
+        }
+        None => prefill_stream,
+    };
+    if let Err(e) = first_prefill_response_within(
+        &mut prefill_stream,
+        bound,
+        prefill_worker,
+        None,
+        sides.prefill_label,
+        &sides.request_id,
+        sides.prompt_tokens,
+    )
+    .await
+    {
+        // Dropping the stream aborts the side's room: nothing was handed off.
+        drop(prefill_stream);
+        return Err(sequential_prefill_failure(
+            &e,
+            workers,
+            sides.ledger,
+            sides.prefill_label,
+        ));
+    }
 
-    // Drain prefill response, harvesting connector params from the Complete frame
-    let mut prefill_kv_params: Option<String> = None;
+    // Drain prefill response, harvesting connector params, the processed
+    // media identity, input logprobs and the prefix-cache hit from the
+    // Complete frame
+    let mut kv_params: Option<String> = None;
+    let mut media_identity: Option<vllm::MediaIdentity> = None;
+    let mut input_logprobs = None;
+    let mut cached_tokens = PrefillCachedTokens::default();
     while let Some(result) = prefill_stream.next().await {
         match result {
             Ok(response) => {
                 if let ProtoResponseVariant::Complete(complete) = response.into_response() {
+                    cached_tokens.note(&complete);
                     if let Some(json) = complete.kv_transfer_params_json() {
-                        prefill_kv_params = Some(json.to_owned());
+                        kv_params = Some(json.to_owned());
+                    }
+                    if let Some(identity) = complete.media_identity() {
+                        media_identity = Some(identity.clone());
+                    }
+                    if let Some(logprobs) = complete.input_logprobs() {
+                        input_logprobs = Some(logprobs);
                     }
                 }
             }
             Err(e) => {
-                workers.record_outcome_prefill(e.http_status().as_u16());
-                Metrics::record_worker_error(
+                if let Some(status) = e.breaker_status() {
+                    workers.record_outcome_prefill(sides.ledger, status);
+                }
+                UpstreamClass::account_dispatch_failure(
                     metrics_labels::WORKER_PREFILL,
-                    prefill_label,
-                    metrics_labels::ERROR_BACKEND,
+                    sides.prefill_label,
+                    &e,
                 );
+                account_pd_side_failure(metrics_labels::WORKER_PREFILL, &e);
                 error!(function = "execute_sequential_pd", error = %e, "Prefill stream error");
                 return Err(e.to_http_error(
                     "prefill_stream_error",
@@ -620,19 +2617,41 @@ async fn execute_sequential_pd(
         }
     }
     prefill_stream.mark_completed();
-    workers.record_outcome_prefill(200);
-    // Captured at drain; recorded below only once decode is established.
-    let prefill_duration = prefill_start.elapsed();
+    // Prefill is drained: its admission slot is free while decode runs.
+    drop(prefill_guard);
+    workers.record_outcome_prefill(sides.ledger, 200);
+    // The prefill phase ends at the drain; recorded by the executor only once
+    // decode is established.
+    let done = Instant::now();
+    Ok(PrefillHarvest {
+        stream: prefill_stream,
+        kv_params,
+        media_identity,
+        input_logprobs,
+        cached_tokens,
+        started: prefill_start,
+        done,
+    })
+}
 
-    // KV-transfer window: prefill drain complete to decode send complete.
-    let kv_window_start = Instant::now();
-
-    debug!("vLLM PD: prefill completed, sending decode request");
-
+/// Complete the decode side's request from the prefill side's harvest: its
+/// worker's DP rank, the KV handoff in the connector's form (minted for
+/// Mooncake, relayed for the others) and the media identity the prefill
+/// resolved. Returns whether a handoff is on the request. A stripped
+/// multimodal side without one is refused rather than sent.
+fn relay_to_decode(
+    plan: &SequentialPlan,
+    workers: &WorkerSelection,
+    decode_request: &mut ProtoGenerateRequest,
+    prefill_kv_params: Option<String>,
+    prefill_media_identity: Option<&vllm::MediaIdentity>,
+) -> Result<bool, Response> {
     if let Some(rank) = workers.decode_worker().and_then(|w| w.dp_rank()) {
         decode_request.set_data_parallel_rank(rank as i32);
     }
-    match (&mode, prefill_kv_params) {
+    let relay_kv_params = plan.relay_kv_params;
+    let mut handed_off = false;
+    match (&plan.mode, prefill_kv_params) {
         // Modern Mooncake: synthesized params under the minted transfer_id
         (
             KvConnectorMode::Mooncake {
@@ -641,8 +2660,8 @@ async fn execute_sequential_pd(
                 engine_id: Some(engine_id),
             },
             _,
-        ) if mooncake_transfer_id.is_some() => {
-            let transfer_id = mooncake_transfer_id.as_deref().unwrap_or_default();
+        ) if plan.mooncake_transfer_id.is_some() => {
+            let transfer_id = plan.mooncake_transfer_id.as_deref().unwrap_or_default();
             debug!(
                 request_id = %decode_request.request_id(),
                 transfer_id = %transfer_id,
@@ -654,6 +2673,7 @@ async fn execute_sequential_pd(
                 host,
                 *port,
             ));
+            handed_off = true;
         }
         // Legacy Mooncake (no engine_id discovered, or n>1): typed host/port injection
         (KvConnectorMode::Mooncake { host, port, .. }, _) => {
@@ -663,14 +2683,19 @@ async fn execute_sequential_pd(
                 "vLLM PD: injecting kv_transfer_params into decode request"
             );
             decode_request.set_kv_transfer_params(host.clone(), *port);
+            handed_off = true;
         }
-        (KvConnectorMode::Nixl | KvConnectorMode::Passthrough, Some(json)) if relay_kv_params => {
+        (
+            KvConnectorMode::Nixl | KvConnectorMode::Store | KvConnectorMode::Passthrough,
+            Some(json),
+        ) if relay_kv_params => {
             debug!(
                 request_id = %decode_request.request_id(),
                 params_len = json.len(),
                 "vLLM PD: relaying prefill kv_transfer_params to decode request"
             );
             decode_request.set_kv_transfer_params_json(json);
+            handed_off = true;
         }
         (KvConnectorMode::Nixl, None) if relay_kv_params => {
             Metrics::record_pd_kv_transfer_failure();
@@ -683,61 +2708,1425 @@ async fn execute_sequential_pd(
         }
         _ => {}
     }
+    apply_prefill_media_identity(
+        decode_request,
+        handed_off,
+        relay_kv_params,
+        plan.identity_solicited(),
+        prefill_media_identity,
+    );
 
-    // Send request to decode
-    let decode_stream = decode_client.generate(decode_request).await.map_err(|e| {
-        workers.record_outcome_decode(e.http_status().as_u16());
-        Metrics::record_worker_error(
-            metrics_labels::WORKER_DECODE,
-            decode_label,
-            metrics_labels::ERROR_BACKEND,
+    // A stripped multimodal side cannot fall back to a local recompute: the
+    // image KV exists only on the prefill worker, so without a handoff the
+    // decode engine would recompute the prompt as pure text and answer
+    // image-blind. Fail instead of dispatching.
+    if plan.stripped_mm_decode && !decode_request.has_kv_transfer_params() {
+        error!(
+            function = "execute_sequential_pd",
+            request_id = %decode_request.request_id(),
+            "stripped multimodal decode leg has no kv_transfer_params to pull from"
         );
-        error!(function = "execute_sequential_pd", error = %e, "Decode worker failed to start");
-        e.to_http_error(
-            "decode_worker_failed_to_start",
-            format!("Decode worker failed to start: {}", e.message()),
-        )
-    })?;
+        let mut response = error::bad_gateway(
+            "pd_decode_missing_kv_transfer_params",
+            "the prefill worker returned no kv_transfer_params for this multimodal \
+             request, and the language-model-only decode worker cannot recompute the \
+             prompt locally (outdated smg-grpc-servicer or missing kv-transfer-config \
+             on the prefill worker?)"
+                .to_string(),
+        );
+        mark_non_retryable(&mut response);
+        return Err(response);
+    }
+    Ok(handed_off)
+}
 
-    workers.record_outcome_decode(200);
-    // Decode established: record the success-only PD metrics here.
-    Metrics::record_pd_kv_connector_mode(kv_connector_label);
-    Metrics::record_pd_prefill_duration(
-        metrics_labels::BACKEND_PD,
-        model,
-        runtime,
-        prefill_duration,
-    );
-    Metrics::record_pd_kv_transfer_duration(
-        metrics_labels::BACKEND_PD,
-        model,
-        runtime,
-        kv_window_start.elapsed(),
-    );
+/// The decode side of the sequential dispatch: sent once the handoff is on its
+/// request, bounded to its first token when the request streams, its abort
+/// deferred until that first item proves the handoff finished, tracked on its
+/// worker. Returns the established stream and the instant of the dispatch,
+/// where the relay phase ends and the decode side's time to first token begins.
+async fn sequential_decode_side(
+    sides: &PdSides<'_>,
+    plan: &SequentialPlan,
+    decode_request: ProtoGenerateRequest,
+    mut decode_client: BackendClient,
+    handed_off: bool,
+) -> Result<(ProtoStream, Instant), Response> {
+    let workers = sides.workers;
+    // Send request to decode
+    if let Some(decode) = workers.decode_worker() {
+        Metrics::record_worker_request(decode.url(), decode.model_id());
+    }
+    // The relay phase ends at the decode dispatch. Everything after this
+    // instant, including the engines' KV transfer and the decode scheduling,
+    // is the decode side's time to first token; the instant is taken before the
+    // call so a worker that holds its response headers until the first token
+    // still lands in the decode phase.
+    let decode_sent = Instant::now();
+    // The decode side owes its first token within a bound counted from here
+    // (see `liveness::decode_side_bound`): the KV handoff from the prefill
+    // side and the decode engine's first step. The prefill side has answered,
+    // so its silence bound no longer covers the request, and nothing else
+    // bounds this wait below the request's own timeout while the engines'
+    // health probes keep passing (a prefill engine that stalls right after
+    // answering leaves the handoff waiting on it).
+    // The bound covers a streaming request only: a non-streaming side's first
+    // item is its whole generation (the servicers send nothing of a
+    // non-streaming request before it finishes), no first-token signal. Its
+    // size follows the worker whose prefill of the prompt stands before the
+    // first token (see `worker_prefilling_before_decode`).
+    let decode_bound = if plan.streaming {
+        worker_prefilling_before_decode(workers, handed_off, plan.relay_kv_params)
+            .and_then(|worker| DecodeBound::at(worker, sides.prompt_tokens, decode_sent))
+    } else {
+        None
+    };
+    let decode_worker = workers.decode_worker().cloned();
+    let decode_stream = dispatch_decode_within(
+        decode_bound,
+        Box::pin(async move { decode_client.generate(decode_request).await }),
+        decode_worker.clone(),
+        sides.decode_label,
+        sides.request_id.clone(),
+        sides.prompt_tokens,
+    )
+    .await
+    .map_err(|e| sequential_decode_failure(&e, workers, sides.ledger, sides.decode_label))?;
 
     // Prefill has completed and its KV blocks are held pending decode's
     // transfer; aborting decode mid-transfer on a client disconnect can
     // crash or leak on the engine side. Defer the abort until the first
     // decode response proves the handoff finished (see the parallel PD
-    // path for the same invariant).
-    let decode_stream = decode_stream.defer_abort_until_first_item();
-
-    Ok(ExecutionResult::Single {
-        stream: decode_stream,
-    })
+    // path for the same invariant). The side is tracked on its worker here,
+    // before its first item is waited for: its responses are the worker's
+    // progress, it joins no pile (its silence is bounded per request), and
+    // the worker's breaker success is sampled at the side's first response
+    // (`ProtoStream::tracked_decode_side`), never at the dispatch; the
+    // attribution stage leaves a side tracked here as it is.
+    let mut decode_stream = match &decode_worker {
+        Some(worker) => decode_stream
+            .defer_abort_until_first_item()
+            .tracked_decode_side(Arc::clone(worker)),
+        None => decode_stream.defer_abort_until_first_item(),
+    };
+    // Without a bound nothing is pulled ahead and the side counts as answered,
+    // as before; a first item that is a failure, or an end with nothing on
+    // the stream, is met by the reader and earns no success either way.
+    if let Err(e) = first_decode_response_within(
+        &mut decode_stream,
+        decode_bound,
+        decode_worker.as_ref(),
+        sides.decode_label,
+        &sides.request_id,
+        sides.prompt_tokens,
+    )
+    .await
+    {
+        return Err(sequential_decode_failure(
+            &e,
+            workers,
+            sides.ledger,
+            sides.decode_label,
+        ));
+    }
+    Ok((decode_stream, decode_sent))
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{sync::Arc, time::Duration};
 
-    use smg_grpc_client::{tokenspeed_proto as ts, vllm_proto as vllm};
+    use smg_grpc_client::{sglang_proto as sglang, tokenspeed_proto as ts, vllm_proto as vllm};
 
     use super::*;
-    use crate::worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker, WorkerType};
+    use crate::{
+        routers::common::{attempt_ledger::FailedSide, retry::is_retryable_response},
+        worker::{
+            BasicWorkerBuilder, CircuitBreakerConfig, ConnectionMode, RuntimeType, Worker,
+            WorkerType,
+        },
+    };
+
+    /// A decode side retired because its prefill fell silent is not charged
+    /// for failing late: the handoff it waited for never came, and the
+    /// request charged the prefill where the bound passed. A partner that
+    /// failed to start still charges, as before.
+    #[tokio::test]
+    async fn the_partner_of_a_silent_prefill_is_not_charged_for_its_late_failure() {
+        let decode: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://decode:30001")
+                .worker_type(WorkerType::Decode)
+                .connection_mode(ConnectionMode::Grpc)
+                .circuit_breaker_config(CircuitBreakerConfig {
+                    failure_threshold: 1,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        let late: SideDispatch =
+            Box::pin(async { Err(tonic::Status::unavailable("the handoff never came")) });
+        retire_pd_side(
+            PdSide::Decode,
+            "grpc",
+            Arc::clone(&decode),
+            late,
+            Retirement::PartnerSilent,
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            decode.circuit_breaker_can_execute(),
+            "a late failure after the prefill fell silent is not the decode worker's fault"
+        );
+        assert!(Retirement::PartnerSilent.defer_abort());
+        assert!(!Retirement::PartnerSilent.charges());
+        assert!(Retirement::PartnerFailed.charges());
+        assert!(!Retirement::PartnerFailed.defer_abort());
+        assert!(!Retirement::Silent.charges());
+    }
+
+    /// A side retired because its partner failed to start samples only a late
+    /// failure on its worker: its late stream is aborted and earns no success
+    /// (the side never produced anything), so a failure before it stands and
+    /// the next one opens a breaker set to two.
+    #[tokio::test]
+    async fn the_late_stream_of_a_side_retired_for_its_partners_failure_earns_no_breaker_success() {
+        use crate::worker::circuit_breaker::CircuitState;
+        let decode: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://decode:30002")
+                .worker_type(WorkerType::Decode)
+                .connection_mode(ConnectionMode::Grpc)
+                .circuit_breaker_config(CircuitBreakerConfig {
+                    failure_threshold: 2,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        decode.record_outcome(504);
+        let late: SideDispatch =
+            Box::pin(async { Ok(ProtoStream::Fanout(FanoutStream::new(Vec::new()))) });
+        retire_pd_side(
+            PdSide::Decode,
+            "grpc",
+            Arc::clone(&decode),
+            late,
+            Retirement::PartnerFailed,
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(decode.circuit_breaker_state(), CircuitState::Closed);
+        decode.record_outcome(504);
+        assert_eq!(
+            decode.circuit_breaker_state(),
+            CircuitState::Open,
+            "the late stream earned no success between the two failures"
+        );
+    }
+
+    fn tokenspeed_request(n: u32, seed: Option<u64>) -> ProtoGenerateRequest {
+        ProtoGenerateRequest::TokenSpeed(Box::new(ts::GenerateRequest {
+            request_id: "req".to_string(),
+            sampling_params: Some(ts::SamplingParams {
+                n,
+                sampling_seed: seed,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }))
+    }
+
+    fn tokenspeed_pair() -> WorkerSelection {
+        let worker = |url: &str, worker_type: WorkerType| -> Arc<dyn Worker> {
+            Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .worker_type(worker_type)
+                    .runtime_type(RuntimeType::TokenSpeed)
+                    .connection_mode(ConnectionMode::Grpc)
+                    .build(),
+            )
+        };
+        WorkerSelection::Disaggregated {
+            encode_assignments: None,
+            prefill: worker("grpc://prefill:30000", WorkerType::Prefill),
+            decode: worker("grpc://decode:30000", WorkerType::Decode),
+            runtime_type: RuntimeType::TokenSpeed,
+        }
+    }
+
+    /// A side whose dispatch fails with the engine's rendezvous verdict is
+    /// counted under the rendezvous family, by side and phase; any other
+    /// dispatch failure of a side is not.
+    #[test]
+    fn a_side_that_fails_its_rendezvous_at_dispatch_is_counted() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let workers = tokenspeed_pair();
+        metrics::with_local_recorder(&recorder, || {
+            pd_side_error(
+                PdSide::Prefill,
+                metrics_labels::CONNECTION_GRPC,
+                &tonic::Status::internal(
+                    "Prefill bootstrap failed for request rank=0 req.rid='r1' \
+                     req.bootstrap_room=41 with exception KVTransferError(bootstrap_room=41): \
+                     Request 41 timed out after 120.0s in KVPoll.Bootstrapping",
+                ),
+                &workers,
+            );
+            pd_side_error(
+                PdSide::Decode,
+                metrics_labels::CONNECTION_GRPC,
+                &tonic::Status::unavailable("connection reset"),
+                &workers,
+            );
+        });
+        let rendered = handle.render();
+        let counted: Vec<&str> = rendered
+            .lines()
+            .filter(|line| line.starts_with("smg_pd_rendezvous_failures_total{"))
+            .collect();
+        assert_eq!(counted.len(), 1, "{rendered}");
+        assert!(
+            counted[0].contains(r#"leg="prefill""#)
+                && counted[0].contains(r#"phase="bootstrap""#)
+                && counted[0].ends_with(" 1"),
+            "{rendered}"
+        );
+    }
 
     #[test]
-    fn pd_leg_labels_reflect_each_legs_transport() {
+    fn engine_rejections_at_start_are_4xx_under_the_same_error_code() {
+        let rejected = start_failure_response(
+            &tonic::Status::invalid_argument("Invalid grammar specification"),
+            "execute_single",
+            "Failed to start generation",
+            "start_generation_failed",
+        );
+        assert_eq!(rejected.status(), http::StatusCode::BAD_REQUEST);
+        assert_eq!(
+            rejected
+                .headers()
+                .get(error::HEADER_X_SMG_ERROR_CODE)
+                .unwrap(),
+            "start_generation_failed"
+        );
+
+        let failed = start_failure_response(
+            &tonic::Status::internal("engine died"),
+            "execute_single",
+            "Failed to start generation",
+            "start_generation_failed",
+        );
+        assert_eq!(failed.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            failed
+                .headers()
+                .get(error::HEADER_X_SMG_ERROR_CODE)
+                .unwrap(),
+            "start_generation_failed"
+        );
+    }
+
+    /// A side's start the worker cancelled (its connection closed under
+    /// the call) is the worker's failure, not a rejection of the request: a
+    /// 502 under the side's code, which the retry layer replays on another
+    /// worker, never a 400 the client would read as its own mistake.
+    #[test]
+    fn a_side_start_the_worker_cancelled_is_a_retryable_502_not_a_rejection() {
+        use crate::routers::common::retry::is_retryable_response;
+
+        let cancelled = start_failure_response(
+            &tonic::Status::cancelled("operation was canceled"),
+            "execute_sequential_pd",
+            PdSide::Decode.error_message(),
+            PdSide::Decode.error_code(),
+        );
+        assert_eq!(cancelled.status(), http::StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            cancelled
+                .headers()
+                .get(error::HEADER_X_SMG_ERROR_CODE)
+                .unwrap(),
+            "decode_worker_failed_to_start"
+        );
+        assert!(is_retryable_response(&cancelled));
+    }
+
+    /// A side start that failed in the HTTP/2 layer (the connection to the
+    /// worker went away under the call) is the worker's transport failure: a
+    /// retryable 502, not the worker's own answer for the payload, whatever
+    /// code tonic picked from the frame's reason.
+    #[test]
+    fn a_side_start_lost_to_an_http2_fault_is_a_retryable_502_not_the_workers_answer() {
+        use smg_grpc_client::h2::{Error, Reason};
+
+        use crate::routers::common::{
+            attempt_ledger::is_definitive_failure, retry::is_retryable_response,
+        };
+
+        for reason in [Reason::ENHANCE_YOUR_CALM, Reason::PROTOCOL_ERROR] {
+            let status = tonic::Status::from_error(Box::new(Error::from(reason)));
+            let failed = start_failure_response(
+                &status,
+                "execute_parallel_pd",
+                PdSide::Prefill.error_message(),
+                PdSide::Prefill.error_code(),
+            );
+            assert_eq!(failed.status(), http::StatusCode::BAD_GATEWAY, "{reason:?}");
+            assert!(is_retryable_response(&failed), "{reason:?}");
+            assert!(!is_definitive_failure(&failed), "{reason:?}");
+        }
+    }
+
+    #[test]
+    fn a_spent_sidecar_budget_is_not_retried_but_a_fast_sidecar_failure_is() {
+        use crate::routers::common::retry::is_retryable_response;
+
+        let start = |status: tonic::Status| {
+            start_failure_response(
+                &status,
+                "execute_single",
+                "Failed to start generation",
+                "start_generation_failed",
+            )
+        };
+
+        let timed_out = start(tonic::Status::unavailable(
+            "sidecar_timeout: no result for job ef684cf9 within 300000 ms",
+        ));
+        assert_eq!(timed_out.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!is_retryable_response(&timed_out));
+
+        for message in [
+            "sidecar_overloaded: 8 jobs queued (cap 8)",
+            "sidecar_unavailable: connection refused",
+            "sidecar_protocol: undecodable result",
+            "sidecar_push_failed: ConnectionResetError: reset",
+            "worker is saturated",
+        ] {
+            let failed = start(tonic::Status::unavailable(message));
+            assert_eq!(failed.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+            assert!(is_retryable_response(&failed), "{message}");
+        }
+
+        // The prefix is the worker's; the same words under another code mean something else.
+        let rejected = start(tonic::Status::invalid_argument(
+            "sidecar_timeout mentioned in a client error",
+        ));
+        assert_eq!(rejected.status(), http::StatusCode::BAD_REQUEST);
+        assert!(!is_retryable_response(&rejected));
+    }
+
+    #[test]
+    fn pd_fanout_width_applies_to_multi_sample_text_requests_on_parallel_pd() {
+        let tokenspeed = PdProtocol::for_runtime(RuntimeType::TokenSpeed).unwrap();
+        assert_eq!(
+            pd_fanout_width(&tokenspeed_request(3, None), tokenspeed),
+            Some(3)
+        );
+        assert_eq!(
+            pd_fanout_width(&tokenspeed_request(1, None), tokenspeed),
+            None
+        );
+        assert_eq!(
+            pd_fanout_width(&tokenspeed_request(0, None), tokenspeed),
+            None
+        );
+
+        let sglang = ProtoGenerateRequest::Sglang(Box::new(sglang::GenerateRequest {
+            request_id: "req".to_string(),
+            sampling_params: Some(sglang::SamplingParams {
+                n: 2,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+        assert_eq!(
+            pd_fanout_width(
+                &sglang,
+                PdProtocol::for_runtime(RuntimeType::Sglang).unwrap()
+            ),
+            Some(2)
+        );
+
+        // A multimodal payload cannot be handed to n prefills.
+        let mut multimodal = tokenspeed_request(3, None);
+        if let ProtoGenerateRequest::TokenSpeed(req) = &mut multimodal {
+            req.mm_inputs = Some(ts::MultimodalInputs::default());
+        }
+        assert_eq!(pd_fanout_width(&multimodal, tokenspeed), None);
+
+        // The sequential (vLLM) path relays one KV handoff and already
+        // skips it for n>1; no fan-out there.
+        let vllm = ProtoGenerateRequest::Vllm(Box::new(vllm::GenerateRequest {
+            request_id: "req".to_string(),
+            sampling_params: Some(vllm::SamplingParams {
+                n: 3,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+        assert_eq!(
+            pd_fanout_width(&vllm, PdProtocol::for_runtime(RuntimeType::Vllm).unwrap()),
+            None
+        );
+    }
+
+    #[test]
+    fn fan_out_pd_request_gives_each_sample_its_own_id_seed_and_room() {
+        let request = tokenspeed_request(3, Some(7));
+        let mut next_room = 100;
+        let subs = fan_out_pd_request(&request, 3, |sub| {
+            sub.set_kv_bootstrap_info("prefill".to_string(), 8998, next_room);
+            next_room += 1;
+        });
+        assert_eq!(subs.len(), 3);
+        let mut rooms = Vec::new();
+        for (i, sub) in subs.iter().enumerate() {
+            assert_eq!(sub.request_id(), format!("req-{i}"));
+            assert_eq!(sub.sampling_n(), 1);
+            let ProtoGenerateRequest::TokenSpeed(req) = sub else {
+                panic!("sub-request changed runtime");
+            };
+            let params = req.sampling_params.as_ref().unwrap();
+            assert_eq!(params.sampling_seed, Some(7 + i as u64));
+            rooms.push(req.kv_bootstrap_info.as_ref().unwrap().bootstrap_room);
+        }
+        assert_eq!(rooms, vec![100, 101, 102]);
+        // The original still asks for its three samples.
+        assert_eq!(request.sampling_n(), 3);
+    }
+
+    #[test]
+    fn fan_out_pd_request_leaves_an_unset_seed_unset() {
+        for sub in &fan_out_pd_request(&tokenspeed_request(2, None), 2, |_| {}) {
+            let ProtoGenerateRequest::TokenSpeed(req) = sub else {
+                panic!("sub-request changed runtime");
+            };
+            assert_eq!(req.sampling_params.as_ref().unwrap().sampling_seed, None);
+        }
+    }
+
+    #[test]
+    fn plan_sub_requests_counts_fanned_out_samples() {
+        let workers = tokenspeed_pair();
+        let fanned = ExecutionPlan::PrefillDecode(tokenspeed_request(4, None));
+        assert_eq!(plan_sub_requests(&fanned, Some(&workers)), 4);
+        let (ids, complete) = trace_engine_ids(&mut fanned.clone(), Some(&workers));
+        let dispatched: Vec<_> = fan_out_pd_request(&tokenspeed_request(4, None), 4, |_| {})
+            .iter()
+            .map(|request| request.request_id().to_owned())
+            .collect();
+        assert_eq!(ids, dispatched);
+        assert!(complete);
+        let (ids, complete) = trace_engine_ids(
+            &mut ExecutionPlan::PrefillDecode(tokenspeed_request(33, None)),
+            Some(&workers),
+        );
+        assert_eq!(ids.len(), 32);
+        assert!(!complete);
+        // Without a disaggregated selection there is no PD protocol to fan out on.
+        assert_eq!(plan_sub_requests(&fanned, None), 1);
+
+        let plain = ExecutionPlan::PrefillDecode(tokenspeed_request(1, None));
+        assert_eq!(plan_sub_requests(&plain, Some(&workers)), 1);
+
+        let batch = ExecutionPlan::Batch {
+            kind: ExecutionPlanKind::PrefillDecode,
+            shared_request_id: "cmpl-1".to_string(),
+            requests: vec![tokenspeed_request(2, None), tokenspeed_request(1, None)],
+        };
+        assert_eq!(plan_sub_requests(&batch, Some(&workers)), 3);
+    }
+
+    /// A side that never answers — the decode side stuck behind the engine's
+    /// transfer deadline while the prefill side has already given up.
+    fn never_answers() -> SideDispatch {
+        Box::pin(std::future::pending())
+    }
+
+    fn fails_now(message: &'static str) -> SideDispatch {
+        Box::pin(async move { Err(tonic::Status::deadline_exceeded(message)) })
+    }
+
+    fn answers_after(delay: Duration) -> SideDispatch {
+        Box::pin(async move {
+            tokio::time::sleep(delay).await;
+            Err(tonic::Status::unavailable("late side"))
+        })
+    }
+
+    /// A prefill that times out must be reported without waiting for the
+    /// decode side, and the decode's dispatch must come back so its room can
+    /// be released instead of being left to the engine's own deadline.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_prefill_answers_without_waiting_for_the_decode_side() {
+        let started = tokio::time::Instant::now();
+        let outcome = dispatch_pd_sides(fails_now("bootstrap timeout"), never_answers()).await;
+
+        assert_eq!(
+            started.elapsed(),
+            Duration::ZERO,
+            "the prefill error must not wait on the decode side"
+        );
+        match outcome {
+            PdDispatchOutcome::FailedFirst { side, error, .. } => {
+                assert_eq!(side, PdSide::Prefill);
+                assert_eq!(error.message(), "bootstrap timeout");
+            }
+            PdDispatchOutcome::Both(..) => panic!("expected a fail-fast outcome"),
+        }
+    }
+
+    /// The mirror case: a decode side that cannot start is answered without
+    /// waiting out the prefill's bootstrap deadline.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_decode_answers_without_waiting_for_the_prefill_side() {
+        let outcome = dispatch_pd_sides(
+            answers_after(Duration::from_secs(120)),
+            fails_now("decode refused"),
+        )
+        .await;
+
+        match outcome {
+            PdDispatchOutcome::FailedFirst { side, error, .. } => {
+                assert_eq!(side, PdSide::Decode);
+                assert_eq!(error.message(), "decode refused");
+            }
+            PdDispatchOutcome::Both(..) => panic!("expected a fail-fast outcome"),
+        }
+    }
+
+    /// The failure a dispatch ended with (a stream has no `Debug`).
+    fn failure(result: StreamResult) -> tonic::Status {
+        match result {
+            Err(status) => status,
+            Ok(_) => panic!("expected the dispatch to fail"),
+        }
+    }
+
+    fn three_second_bound() -> PrefillBound {
+        bound_from(Instant::now(), Duration::from_secs(3))
+    }
+
+    /// A prefill side's bound of `bound` from `dispatched`.
+    fn bound_from(dispatched: Instant, bound: Duration) -> PrefillBound {
+        PrefillBound::of(bound, dispatched).expect("a bound within the clock's range")
+    }
+
+    /// A prefill call that has returned no stream by its bound is given up on
+    /// at the bound, not at the request's timeout: the verdict names the
+    /// silence, and the attempt answers a 504 under its own code that the
+    /// retry layer may take to another prefill worker, this one excluded.
+    #[tokio::test(start_paused = true)]
+    async fn a_prefill_dispatch_past_its_bound_is_given_up_on_at_the_bound() {
+        let workers = tokenspeed_pair();
+        let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
+        let started = tokio::time::Instant::now();
+        let result = dispatch_prefill_within(
+            Some(three_second_bound()),
+            never_answers(),
+            Some(Arc::clone(&prefill)),
+            None,
+            metrics_labels::CONNECTION_GRPC,
+            "chatcmpl-silent".to_string(),
+            256,
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_secs(3) && elapsed < Duration::from_secs(4),
+            "given up on at the bound, not later: {elapsed:?}"
+        );
+        let status = failure(result);
+        assert_eq!(status.code(), tonic::Code::DeadlineExceeded);
+        assert!(is_prefill_silence(&status), "{status:?}");
+
+        let response = pd_side_error(
+            PdSide::Prefill,
+            metrics_labels::CONNECTION_GRPC,
+            &status,
+            &workers,
+        );
+        assert_eq!(response.status(), http::StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(
+            response
+                .headers()
+                .get(error::HEADER_X_SMG_ERROR_CODE)
+                .and_then(|value| value.to_str().ok()),
+            Some("prefill_worker_silent")
+        );
+        assert!(
+            response.extensions().get::<FailedSide>().is_some(),
+            "the retry window closes on the prefill worker alone"
+        );
+        assert!(
+            is_retryable_response(&response),
+            "another prefill worker may take the request"
+        );
+    }
+
+    /// A prefill that answers, or fails on its own, within its bound passes
+    /// through as it is; an engine's own deadline is not the verdict; without
+    /// a bound the call is awaited as before.
+    #[tokio::test(start_paused = true)]
+    async fn a_prefill_that_answers_within_its_bound_passes_through() {
+        let workers = tokenspeed_pair();
+        let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
+        let status = failure(
+            dispatch_prefill_within(
+                Some(three_second_bound()),
+                answers_after(Duration::from_secs(1)),
+                Some(prefill),
+                None,
+                metrics_labels::CONNECTION_GRPC,
+                "chatcmpl-late".to_string(),
+                256,
+            )
+            .await,
+        );
+        assert_eq!(status.message(), "late side");
+        assert!(!is_prefill_silence(&status));
+        assert!(!is_prefill_silence(&tonic::Status::deadline_exceeded(
+            "bootstrap timeout"
+        )));
+        let status = failure(
+            dispatch_prefill_within(
+                None,
+                fails_now("refused"),
+                None,
+                None,
+                metrics_labels::CONNECTION_GRPC,
+                "chatcmpl-unbounded".to_string(),
+                256,
+            )
+            .await,
+        );
+        assert_eq!(status.message(), "refused");
+    }
+
+    /// A prefill stream that answers (here: ends) within its bound is left
+    /// for its reader as it was, and what came is named: the end is not a
+    /// response the breaker would sample a success for.
+    #[tokio::test]
+    async fn a_prefill_stream_that_answers_within_its_bound_is_left_for_its_reader() {
+        let workers = tokenspeed_pair();
+        let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
+        let mut stream = ProtoStream::Fanout(FanoutStream::new(Vec::new()))
+            .tracked_prefill_side(Arc::clone(&prefill), 256);
+        let first = first_prefill_response_within(
+            &mut stream,
+            Some(three_second_bound()),
+            Some(&prefill),
+            None,
+            metrics_labels::CONNECTION_GRPC,
+            "chatcmpl-ended",
+            256,
+        )
+        .await
+        .expect("ended within the bound");
+        assert_eq!(first, FirstItem::End);
+        assert!(stream.next().await.is_none(), "the end is replayed");
+    }
+
+    /// A prefill call past its bound waits on while its worker answers other
+    /// sides: the verdict is on the worker, not the side. The worker answers
+    /// another side half a second in, so the call is given up on a bound
+    /// after that answer, not at its own bound. (Real time: the worker's
+    /// stamps are on the gateway clock, which a paused runtime does not
+    /// move.)
+    #[tokio::test]
+    async fn a_prefill_dispatch_past_its_bound_waits_on_while_its_worker_answers() {
+        let workers = tokenspeed_pair();
+        let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
+        let bound = Duration::from_secs(1);
+        let answered_at = Duration::from_millis(500);
+        let other_side = async {
+            tokio::time::sleep(answered_at).await;
+            prefill.note_prefill_started(256, true);
+            prefill.note_prefill_ended(256, true, Some(0));
+        };
+        let started = Instant::now();
+        let (result, ()) = tokio::join!(
+            dispatch_prefill_within(
+                Some(bound_from(started, bound)),
+                never_answers(),
+                Some(Arc::clone(&prefill)),
+                None,
+                metrics_labels::CONNECTION_GRPC,
+                "chatcmpl-queued".to_string(),
+                256,
+            ),
+            other_side
+        );
+        let elapsed = started.elapsed();
+        let status = failure(result);
+        assert!(is_prefill_silence(&status), "{status:?}");
+        assert!(
+            elapsed >= answered_at + bound && elapsed < answered_at + 3 * bound,
+            "given up on a bound after the worker's latest answer, not at its own bound: {elapsed:?}"
+        );
+    }
+
+    /// A side's bound is read at its dispatch. The longest prompt yet landing
+    /// on the worker behind it blocks the engine for the side too while it
+    /// builds, so the side is not given up on at its own bound: it waits out
+    /// the cold-shape grace a bound at a time, and once the shape is shown
+    /// (the longer prompt's first token) it is judged by the worker's
+    /// answers as before, a bound after that answer. (Real time, as above.)
+    #[tokio::test]
+    async fn a_prefill_dispatch_in_flight_before_a_longer_prompt_waits_through_the_build() {
+        let workers = tokenspeed_pair();
+        let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
+        prefill.note_prefill_started(256, true);
+        prefill.note_prefill_ended(256, true, Some(0));
+        let bound = Duration::from_secs(1);
+        let landed_at = Duration::from_millis(500);
+        let shown_at = Duration::from_millis(2_500);
+        let longer_prompt = async {
+            tokio::time::sleep(landed_at).await;
+            prefill.note_prefill_started(8_192, true);
+            tokio::time::sleep(shown_at - landed_at).await;
+            prefill.note_prefill_ended(8_192, true, Some(0));
+        };
+        let started = Instant::now();
+        let (result, ()) = tokio::join!(
+            dispatch_prefill_within(
+                Some(bound_from(started, bound)),
+                never_answers(),
+                Some(Arc::clone(&prefill)),
+                None,
+                metrics_labels::CONNECTION_GRPC,
+                "chatcmpl-behind-a-build".to_string(),
+                256,
+            ),
+            longer_prompt
+        );
+        let elapsed = started.elapsed();
+        let status = failure(result);
+        assert!(is_prefill_silence(&status), "{status:?}");
+        assert!(
+            elapsed >= shown_at + bound && elapsed < shown_at + 3 * bound,
+            "given up on a bound after the shape was shown, not at its own bound: {elapsed:?}"
+        );
+    }
+
+    /// A worker that answered its last prompt and then sat idle, longer
+    /// than the backlog of its next run takes, gets that run: two 10k
+    /// prompts (two seconds at the cold prior), no longer than it has
+    /// answered (no cold shape). The first side was dispatched to an empty
+    /// book, so its bound is short, and the engine need not answer it first.
+    /// The idle spell is no silence: the run has gone unanswered for one
+    /// second at the side's bound, short of its backlog's two, so the side
+    /// waits on and its call lands (here with a failure of its own, which
+    /// passes through) instead of the silence verdict at its bound. Counted
+    /// from the answer before the idle spell, the worker would have been
+    /// silent past both. (Real time, as above.)
+    #[tokio::test]
+    async fn a_prefill_dispatch_in_a_burst_after_an_idle_spell_waits_on_past_its_bound() {
+        let workers = tokenspeed_pair();
+        let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
+        prefill.note_prefill_started(10_000, true);
+        prefill.note_prefill_ended(10_000, true, Some(0));
+        tokio::time::sleep(Duration::from_millis(2_500)).await;
+        for _ in 0..2 {
+            prefill.note_prefill_started(10_000, true);
+        }
+        let bound = Duration::from_secs(1);
+        let started = Instant::now();
+        let result = dispatch_prefill_within(
+            Some(bound_from(started, bound)),
+            answers_after(Duration::from_millis(1_500)),
+            Some(Arc::clone(&prefill)),
+            None,
+            metrics_labels::CONNECTION_GRPC,
+            "chatcmpl-burst-after-idle".to_string(),
+            10_000,
+        )
+        .await;
+        let status = failure(result);
+        assert!(
+            !is_prefill_silence(&status),
+            "a worker prefilling the run it got after an idle spell is not frozen: {status:?}"
+        );
+        assert_eq!(status.message(), "late side");
+    }
+
+    /// A burst on a worker that has answered nothing yet (a gateway that
+    /// just started, or a fresh worker): its run waits for its first answer
+    /// from the burst, and the side waits on while the burst has the time
+    /// it needs. (Real time, as above.)
+    #[tokio::test]
+    async fn a_prefill_dispatch_in_a_burst_on_a_worker_that_never_answered_waits_on_past_its_bound()
+    {
+        let workers = tokenspeed_pair();
+        let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
+        for _ in 0..40 {
+            prefill.note_prefill_started(100_000, true);
+        }
+        let bound = Duration::from_secs(1);
+        let started = Instant::now();
+        let result = dispatch_prefill_within(
+            Some(bound_from(started, bound)),
+            answers_after(Duration::from_millis(2_500)),
+            Some(Arc::clone(&prefill)),
+            None,
+            metrics_labels::CONNECTION_GRPC,
+            "chatcmpl-cold-burst".to_string(),
+            100_000,
+        )
+        .await;
+        let status = failure(result);
+        assert!(
+            !is_prefill_silence(&status),
+            "a cold worker prefilling a burst is not frozen: {status:?}"
+        );
+        assert_eq!(status.message(), "late side");
+    }
+
+    /// A frozen worker is still given up on: with 20k prompt tokens pending
+    /// (two seconds at the cold prior) and nothing ever answered, a side
+    /// bounded at one second waits until the run has gone unanswered for the
+    /// time that backlog takes, and no longer: prompts that go on arriving
+    /// once the backlog was read at the side's bound do not extend it.
+    /// (Real time, as above.)
+    #[tokio::test]
+    async fn a_prefill_dispatch_on_a_frozen_worker_is_given_up_on_once_its_backlog_had_its_time() {
+        let workers = tokenspeed_pair();
+        let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
+        for _ in 0..2 {
+            prefill.note_prefill_started(10_000, true);
+        }
+        let bound = Duration::from_secs(1);
+        let backlog = Duration::from_secs(2);
+        let started = Instant::now();
+        let arrivals = async {
+            tokio::time::sleep(bound + Duration::from_millis(500)).await;
+            loop {
+                prefill.note_prefill_started(2_000, true);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+        let result = tokio::select! {
+            result = dispatch_prefill_within(
+                Some(bound_from(started, bound)),
+                never_answers(),
+                Some(Arc::clone(&prefill)),
+                None,
+                metrics_labels::CONNECTION_GRPC,
+                "chatcmpl-frozen".to_string(),
+                10_000,
+            ) => result,
+            () = arrivals => unreachable!("the arrivals never end on their own"),
+        };
+        let elapsed = started.elapsed();
+        let status = failure(result);
+        assert!(is_prefill_silence(&status), "{status:?}");
+        assert!(
+            elapsed >= backlog && elapsed < backlog + bound,
+            "given up on once the backlog had its time: {elapsed:?}"
+        );
+        assert!(
+            status.message().contains("of a 2.0s window"),
+            "the verdict names the window that judged it: {status:?}"
+        );
+    }
+
+    /// A worker that was answering, then froze in the middle of a run while
+    /// prompts go on arriving faster than it ever prefilled: its run has
+    /// answered, so the side is judged by the worker's latest answer alone,
+    /// and given up on a bound after it whatever the backlog, as before the
+    /// run's first answer was allowed for. (Real time, as above.)
+    #[tokio::test]
+    async fn a_prefill_dispatch_on_a_worker_frozen_mid_run_is_given_up_on_a_bound_after_its_last_answer(
+    ) {
+        let workers = tokenspeed_pair();
+        let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
+        prefill.note_prefill_started(20_000, true);
+        prefill.note_prefill_started(2_000, true);
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        prefill.note_prefill_ended(20_000, true, Some(0));
+        let answered = Instant::now();
+        let bound = Duration::from_secs(1);
+        let arrivals = async {
+            loop {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                prefill.note_prefill_started(2_000, true);
+            }
+        };
+        let result = tokio::select! {
+            result = dispatch_prefill_within(
+                Some(bound_from(answered, bound)),
+                never_answers(),
+                Some(Arc::clone(&prefill)),
+                None,
+                metrics_labels::CONNECTION_GRPC,
+                "chatcmpl-frozen-mid-run".to_string(),
+                2_000,
+            ) => result,
+            () = arrivals => unreachable!("the arrivals never end on their own"),
+        };
+        let elapsed = answered.elapsed();
+        let status = failure(result);
+        assert!(is_prefill_silence(&status), "{status:?}");
+        assert!(
+            elapsed >= bound && elapsed < 2 * bound,
+            "given up on a bound after the latest answer: {elapsed:?}"
+        );
+    }
+
+    /// The same freeze at the start of a run (the answer that emptied the
+    /// worker's book was its last), prompts arriving at 40k tokens/s on a
+    /// worker that prefilled 18k/s: the run has not answered, so the side
+    /// waits for the backlog the worker held at its bound, read once, and
+    /// is given up on then; the backlog that keeps growing does not extend
+    /// the wait. (Real time, as above.)
+    #[tokio::test]
+    async fn a_prefill_dispatch_on_a_worker_frozen_at_a_runs_start_is_given_up_on_its_backlog_at_the_bound(
+    ) {
+        let workers = tokenspeed_pair();
+        let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
+        prefill.note_prefill_started(20_000, true);
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        prefill.note_prefill_ended(20_000, true, Some(0));
+        prefill.note_prefill_started(2_000, true);
+        let bound = Duration::from_secs(1);
+        let started = Instant::now();
+        let arrivals = async {
+            loop {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                prefill.note_prefill_started(2_000, true);
+            }
+        };
+        let result = tokio::select! {
+            result = dispatch_prefill_within(
+                Some(bound_from(started, bound)),
+                never_answers(),
+                Some(Arc::clone(&prefill)),
+                None,
+                metrics_labels::CONNECTION_GRPC,
+                "chatcmpl-frozen-at-run-start".to_string(),
+                2_000,
+            ) => result,
+            () = arrivals => unreachable!("the arrivals never end on their own"),
+        };
+        let elapsed = started.elapsed();
+        let status = failure(result);
+        assert!(is_prefill_silence(&status), "{status:?}");
+        assert!(
+            elapsed >= 2 * bound && elapsed < 4 * bound,
+            "given up on once the backlog read at the bound (about 2.3 s) had its time: {elapsed:?}"
+        );
+    }
+
+    /// Parallel shape: the decode partner stalls mid-stream, so the prefill
+    /// worker answers nothing while its prompts pile up, here at the start
+    /// of a run. Once the worker has answered nothing within the side's
+    /// bound, the stalled decode takes the verdict at once (504
+    /// `decode_worker_silent`), as it did, instead of waiting out the
+    /// growing backlog. (Real time, as above.)
+    #[tokio::test]
+    async fn a_stalled_decode_partner_behind_a_growing_prefill_backlog_is_charged_at_the_bound() {
+        let workers = tokenspeed_pair();
+        let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
+        let decode = Arc::clone(workers.decode_worker().expect("a pair"));
+        prefill.note_prefill_started(20_000, true);
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        prefill.note_prefill_ended(20_000, true, Some(0));
+        decode.note_output_started();
+        decode.note_token_progress();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        prefill.note_prefill_started(2_000, true);
+        let bound = Duration::from_secs(1);
+        let started = Instant::now();
+        let arrivals = async {
+            loop {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                prefill.note_prefill_started(2_000, true);
+            }
+        };
+        let result = tokio::select! {
+            result = dispatch_prefill_within(
+                Some(bound_from(started, bound)),
+                never_answers(),
+                Some(Arc::clone(&prefill)),
+                Some(Arc::clone(&decode)),
+                metrics_labels::CONNECTION_GRPC,
+                "chatcmpl-stalled-decode-backlog".to_string(),
+                2_000,
+            ) => result,
+            () = arrivals => unreachable!("the arrivals never end on their own"),
+        };
+        let elapsed = started.elapsed();
+        let status = failure(result);
+        assert!(is_decode_silence(&status), "{status:?}");
+        assert!(
+            elapsed >= bound && elapsed < 2 * bound,
+            "the decode verdict comes at the prefill's bound: {elapsed:?}"
+        );
+        decode.note_output_ended();
+    }
+
+    /// On the parallel shape a prefill side's first response waits for the
+    /// decode side, so a decode worker that stopped producing mid-stream
+    /// makes the prefill look silent. At the prefill's exhausted reprieve
+    /// the decode partner is read: holding a stream it had been producing
+    /// for and quiet for the bound, it takes the verdict (504
+    /// `decode_worker_silent`, the retry window closing on the decode
+    /// worker, one `timeout` on the decode's worker-error family and none on
+    /// the prefill's); a decode still producing, or one with no open
+    /// producing stream, leaves the verdict on the prefill as before. (Real
+    /// time: the workers' clocks are the gateway's.)
+    #[test]
+    fn a_parallel_prefill_past_its_bound_is_charged_to_a_decode_partner_that_stalled_mid_stream() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let bound = Duration::from_secs(1);
+        let at = |started: Instant| Some(bound_from(started, bound));
+        metrics::with_local_recorder(&recorder, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            rt.block_on(async {
+                let workers = tokenspeed_pair();
+                let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
+                let decode = Arc::clone(workers.decode_worker().expect("a pair"));
+
+                // The decode holds a stream it had been producing for, and
+                // has produced nothing since: stalled mid-stream.
+                decode.note_output_started();
+                decode.note_token_progress();
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let started = Instant::now();
+                let status = failure(
+                    dispatch_prefill_within(
+                        at(started),
+                        never_answers(),
+                        Some(Arc::clone(&prefill)),
+                        Some(Arc::clone(&decode)),
+                        metrics_labels::CONNECTION_GRPC,
+                        "chatcmpl-stalled-decode".to_string(),
+                        256,
+                    )
+                    .await,
+                );
+                let elapsed = started.elapsed();
+                assert!(
+                    elapsed >= bound && elapsed < 2 * bound,
+                    "the verdict comes at the prefill's bound, as before: {elapsed:?}"
+                );
+                assert!(is_decode_silence(&status), "{status:?}");
+                assert!(!is_prefill_silence(&status), "{status:?}");
+                let response = pd_side_error(
+                    PdSide::Prefill,
+                    metrics_labels::CONNECTION_GRPC,
+                    &status,
+                    &workers,
+                );
+                assert_eq!(response.status(), http::StatusCode::GATEWAY_TIMEOUT);
+                assert_eq!(
+                    response
+                        .headers()
+                        .get(error::HEADER_X_SMG_ERROR_CODE)
+                        .and_then(|value| value.to_str().ok()),
+                    Some("decode_worker_silent")
+                );
+                assert!(
+                    response.extensions().get::<FailedSide>().is_some(),
+                    "the retry window closes on the decode worker alone"
+                );
+                assert!(
+                    is_retryable_response(&response),
+                    "another decode worker may take the request"
+                );
+
+                // The same decode still producing while the prefill side
+                // waits: the prefill's verdict, as before. (The producer runs
+                // beside the dispatch and ends with it.)
+                let producing = async {
+                    loop {
+                        decode.note_token_progress();
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                };
+                let status = tokio::select! {
+                    result = dispatch_prefill_within(
+                        at(Instant::now()),
+                        never_answers(),
+                        Some(Arc::clone(&prefill)),
+                        Some(Arc::clone(&decode)),
+                        metrics_labels::CONNECTION_GRPC,
+                        "chatcmpl-live-decode".to_string(),
+                        256,
+                    ) => failure(result),
+                    () = producing => unreachable!("the producer never ends on its own"),
+                };
+                assert!(is_prefill_silence(&status), "{status:?}");
+
+                // The decode's producing stream ended (quiet since, but with
+                // nothing in flight it had shown output on): the prefill's
+                // verdict.
+                decode.note_output_ended();
+                assert!(decode.output_silence().is_none());
+                let status = failure(
+                    dispatch_prefill_within(
+                        at(Instant::now()),
+                        never_answers(),
+                        Some(Arc::clone(&prefill)),
+                        Some(Arc::clone(&decode)),
+                        metrics_labels::CONNECTION_GRPC,
+                        "chatcmpl-idle-decode".to_string(),
+                        256,
+                    )
+                    .await,
+                );
+                assert!(is_prefill_silence(&status), "{status:?}");
+            });
+        });
+        let rendered = handle.render();
+        let count = |worker_type: &str| -> f64 {
+            rendered
+                .lines()
+                .filter(|line| line.starts_with("smg_worker_errors_total{"))
+                .filter(|line| line.contains(&format!("worker_type=\"{worker_type}\"")))
+                .filter(|line| line.contains("error_type=\"timeout\""))
+                .filter_map(|line| line.rsplit(' ').next())
+                .filter_map(|value| value.parse::<f64>().ok())
+                .sum()
+        };
+        assert_eq!(
+            count("decode"),
+            1.0,
+            "one timeout on the stalled decode:\n{rendered}"
+        );
+        assert_eq!(
+            count("prefill"),
+            2.0,
+            "the two verdicts that stayed the prefill's:\n{rendered}"
+        );
+    }
+
+    /// When the decode's call returned its stream before the prefill's
+    /// dispatch ended with a verdict, both sides answered and the dispatch's
+    /// samples are taken together: a decode verdict is the decode worker's
+    /// breaker failure and no success for its dispatch, the prefill
+    /// untouched; a prefill verdict stays the prefill's, with the decode's
+    /// dispatch sampled as before.
+    #[test]
+    fn a_decode_verdict_on_the_prefills_dispatch_is_charged_to_the_decode_when_both_sides_answered()
+    {
+        use crate::worker::circuit_breaker::CircuitState;
+        let pair = || {
+            let worker = |url: &str, worker_type: WorkerType| -> Arc<dyn Worker> {
+                Arc::new(
+                    BasicWorkerBuilder::new(url)
+                        .worker_type(worker_type)
+                        .runtime_type(RuntimeType::TokenSpeed)
+                        .connection_mode(ConnectionMode::Grpc)
+                        .circuit_breaker_config(CircuitBreakerConfig {
+                            failure_threshold: 1,
+                            ..Default::default()
+                        })
+                        .build(),
+                )
+            };
+            WorkerSelection::Disaggregated {
+                encode_assignments: None,
+                prefill: worker("grpc://prefill:30000", WorkerType::Prefill),
+                decode: worker("grpc://decode:30000", WorkerType::Decode),
+                runtime_type: RuntimeType::TokenSpeed,
+            }
+        };
+        let decode_stream = || Ok(ProtoStream::Fanout(FanoutStream::new(Vec::new())));
+        let bound = Duration::from_secs(3);
+
+        let workers = pair();
+        let (prefill, decode) = workers.disaggregated_pair().expect("a pair");
+        let verdict = decode_partner_silent(
+            prefill,
+            decode,
+            metrics_labels::CONNECTION_GRPC,
+            "chatcmpl-both-decode",
+            bound,
+            bound,
+            "dispatch",
+        );
+        record_pd_dispatch_outcomes(
+            &workers,
+            &AttemptLedger::default(),
+            &Err(verdict),
+            &decode_stream(),
+        );
+        assert_eq!(
+            decode.circuit_breaker_state(),
+            CircuitState::Open,
+            "the verdict is the decode's breaker failure"
+        );
+        assert_eq!(
+            prefill.circuit_breaker_state(),
+            CircuitState::Closed,
+            "the prefill waited on its partner"
+        );
+
+        let workers = pair();
+        let (prefill, decode) = workers.disaggregated_pair().expect("a pair");
+        let verdict = prefill_side_silent(
+            prefill,
+            metrics_labels::CONNECTION_GRPC,
+            "chatcmpl-both-prefill",
+            256,
+            PrefillSilence {
+                bound,
+                waited: bound,
+                silent: None,
+                window: bound,
+            },
+            "dispatch",
+        );
+        record_pd_dispatch_outcomes(
+            &workers,
+            &AttemptLedger::default(),
+            &Err(verdict),
+            &decode_stream(),
+        );
+        assert_eq!(prefill.circuit_breaker_state(), CircuitState::Open);
+        assert_eq!(decode.circuit_breaker_state(), CircuitState::Closed);
+    }
+
+    fn three_second_decode_bound() -> DecodeBound {
+        DecodeBound {
+            deadline: Instant::now() + Duration::from_secs(3),
+            bound: Duration::from_secs(3),
+        }
+    }
+
+    /// A sequential decode call that has returned no stream by its bound is
+    /// given up on at the bound, not at the request's timeout: the verdict
+    /// names the silence, and the attempt answers a 504 under its own code
+    /// that the retry layer may take to another decode worker, this one
+    /// excluded.
+    #[tokio::test(start_paused = true)]
+    async fn a_sequential_decode_dispatch_past_its_bound_is_given_up_on_at_the_bound() {
+        let workers = tokenspeed_pair();
+        let decode = Arc::clone(workers.decode_worker().expect("a pair"));
+        let started = tokio::time::Instant::now();
+        let result = dispatch_decode_within(
+            Some(three_second_decode_bound()),
+            never_answers(),
+            Some(Arc::clone(&decode)),
+            metrics_labels::CONNECTION_GRPC,
+            "chatcmpl-decode-silent".to_string(),
+            256,
+        )
+        .await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_secs(3) && elapsed < Duration::from_secs(4),
+            "given up on at the bound, not later: {elapsed:?}"
+        );
+        let status = failure(result);
+        assert_eq!(status.code(), tonic::Code::DeadlineExceeded);
+        assert!(is_decode_side_silence(&status), "{status:?}");
+        assert!(!is_prefill_silence(&status), "{status:?}");
+
+        let ledger = AttemptLedger::default();
+        let response =
+            sequential_decode_failure(&status, &workers, &ledger, metrics_labels::CONNECTION_GRPC);
+        assert_eq!(response.status(), http::StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(
+            response
+                .headers()
+                .get(error::HEADER_X_SMG_ERROR_CODE)
+                .and_then(|value| value.to_str().ok()),
+            Some("decode_worker_silent")
+        );
+        assert!(
+            response.extensions().get::<FailedSide>().is_some(),
+            "the retry window closes on the decode worker alone"
+        );
+        assert!(
+            is_retryable_response(&response),
+            "another decode worker may take the request"
+        );
+    }
+
+    /// A decode call that answers, or fails on its own, within its bound
+    /// passes through as it is; an engine's own deadline is not the verdict;
+    /// without a bound the call is awaited as before.
+    #[tokio::test(start_paused = true)]
+    async fn a_decode_that_answers_within_its_bound_passes_through() {
+        let workers = tokenspeed_pair();
+        let decode = Arc::clone(workers.decode_worker().expect("a pair"));
+        let status = failure(
+            dispatch_decode_within(
+                Some(three_second_decode_bound()),
+                answers_after(Duration::from_secs(1)),
+                Some(decode),
+                metrics_labels::CONNECTION_GRPC,
+                "chatcmpl-decode-late".to_string(),
+                256,
+            )
+            .await,
+        );
+        assert_eq!(status.message(), "late side");
+        assert!(!is_decode_side_silence(&status));
+        assert!(!is_decode_side_silence(&tonic::Status::deadline_exceeded(
+            "bootstrap timeout"
+        )));
+        let status = failure(
+            dispatch_decode_within(
+                None,
+                fails_now("refused"),
+                None,
+                metrics_labels::CONNECTION_GRPC,
+                "chatcmpl-decode-unbounded".to_string(),
+                256,
+            )
+            .await,
+        );
+        assert_eq!(status.message(), "refused");
+    }
+
+    /// A decode stream that answers (here: ends) within its bound is left
+    /// for its reader as it was, and what came is named.
+    #[tokio::test]
+    async fn a_decode_stream_that_answers_within_its_bound_is_left_for_its_reader() {
+        let workers = tokenspeed_pair();
+        let decode = Arc::clone(workers.decode_worker().expect("a pair"));
+        let mut stream = ProtoStream::Fanout(FanoutStream::new(Vec::new()))
+            .tracked_decode_side(Arc::clone(&decode));
+        let first = first_decode_response_within(
+            &mut stream,
+            Some(three_second_decode_bound()),
+            Some(&decode),
+            metrics_labels::CONNECTION_GRPC,
+            "chatcmpl-decode-ended",
+            256,
+        )
+        .await
+        .expect("ended within the bound");
+        assert_eq!(first, FirstItem::End);
+        assert!(stream.next().await.is_none(), "the end is replayed");
+    }
+
+    /// Admission and the load guards read the same count, so a batched plan
+    /// claims one room per prompt instead of walking past a gate that only
+    /// asked about one.
+    #[test]
+    fn plan_sub_requests_counts_every_batched_prompt() {
+        let single = ExecutionPlan::PrefillDecode(ProtoGenerateRequest::Vllm(Box::default()));
+        assert_eq!(plan_sub_requests(&single, None), 1);
+
+        let batch = ExecutionPlan::Batch {
+            kind: ExecutionPlanKind::PrefillDecode,
+            shared_request_id: "cmpl-1".to_string(),
+            requests: (0..4)
+                .map(|_| ProtoGenerateRequest::Vllm(Box::default()))
+                .collect(),
+        };
+        assert_eq!(plan_sub_requests(&batch, None), 4);
+    }
+
+    #[test]
+    fn pd_side_labels_reflect_each_sides_transport() {
         let prefill: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new("ipc:///tmp/smg-test-prefill")
                 .worker_type(WorkerType::Prefill)
@@ -757,12 +4146,59 @@ mod tests {
             runtime_type: RuntimeType::TokenSpeed,
         };
         assert_eq!(
-            pd_leg_labels(&selection),
+            pd_side_labels(&selection),
             (
                 metrics_labels::CONNECTION_ZMQ,
                 metrics_labels::CONNECTION_GRPC
             ),
-            "each PD leg must carry its own transport label"
+            "each PD side must carry its own transport label"
+        );
+    }
+
+    /// The decode side's first-token bound is sized from the prefill worker
+    /// only when the decode side pulls its prompt KV from it: a handoff on a
+    /// request the KV parameters were relayed for. A fan-out the legacy
+    /// Mooncake arm hands off in name only, and any side without a handoff,
+    /// recompute the prompt on the decode worker, whose rate sizes the bound.
+    #[test]
+    fn the_decode_bound_follows_the_worker_that_prefills_the_prompt() {
+        let prefill: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://prefill:30000")
+                .worker_type(WorkerType::Prefill)
+                .connection_mode(ConnectionMode::Grpc)
+                .build(),
+        );
+        let decode: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://decode:30000")
+                .worker_type(WorkerType::Decode)
+                .connection_mode(ConnectionMode::Grpc)
+                .build(),
+        );
+        let selection = WorkerSelection::Disaggregated {
+            encode_assignments: None,
+            prefill,
+            decode,
+            runtime_type: RuntimeType::Vllm,
+        };
+        let prefilling = |handed_off, relay_kv_params| {
+            worker_prefilling_before_decode(&selection, handed_off, relay_kv_params)
+                .map(|worker| worker.url().to_string())
+        };
+        assert_eq!(
+            prefilling(true, true).as_deref(),
+            Some("grpc://prefill:30000")
+        );
+        assert_eq!(
+            prefilling(true, false).as_deref(),
+            Some("grpc://decode:30000")
+        );
+        assert_eq!(
+            prefilling(false, true).as_deref(),
+            Some("grpc://decode:30000")
+        );
+        assert_eq!(
+            prefilling(false, false).as_deref(),
+            Some("grpc://decode:30000")
         );
     }
 
@@ -812,22 +4248,221 @@ mod tests {
         let ProtoGenerateRequest::Vllm(decode) = clone else {
             panic!("expected vLLM clone");
         };
-        assert!(original.mm_inputs.is_some(), "prefill leg keeps pixels");
+        assert!(original.mm_inputs.is_some(), "prefill side keeps pixels");
         assert!(
             decode.mm_inputs.is_none(),
-            "hash-less mm payload is dropped whole on the decode leg"
+            "hash-less mm payload is dropped whole on the decode side"
         );
         assert_eq!(decode.request_id, "pd-1");
     }
 
     #[test]
+    fn clone_without_mm_pixels_keeps_vllm_media_refs() {
+        // The clone keeps the references; on the sequential path they are
+        // replaced by the prefill side's identity before decode is sent.
+        let refs = vllm::MediaRefs {
+            items: vec![vllm::MediaRef {
+                modality: smg_grpc_client::common_proto::Modality::Image as i32,
+                url: "https://a/1.png".to_string(),
+            }],
+        };
+        let mut request = ProtoGenerateRequest::Vllm(Box::new(vllm::GenerateRequest {
+            request_id: "pd-refs".to_string(),
+            ..Default::default()
+        }));
+        request
+            .set_vllm_media_refs(refs.clone())
+            .expect("vLLM request accepts media refs");
+        assert!(request.has_vllm_media_refs());
+        let clone = request.clone_without_mm_pixels();
+        let ProtoGenerateRequest::Vllm(decode) = clone else {
+            panic!("expected vLLM clone");
+        };
+        assert_eq!(decode.media_refs, Some(refs));
+        assert!(decode.mm_inputs.is_none());
+    }
+
+    fn media_refs_request(id: &str, n: u32) -> ProtoGenerateRequest {
+        let mut request = ProtoGenerateRequest::Vllm(Box::new(vllm::GenerateRequest {
+            request_id: id.to_string(),
+            input: Some(vllm::generate_request::Input::Tokenized(
+                vllm::TokenizedInput {
+                    original_text: "describe <|image|>".to_string(),
+                    input_ids: vec![7, 8, 9],
+                },
+            )),
+            sampling_params: Some(vllm::SamplingParams {
+                n,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+        request
+            .set_vllm_media_refs(vllm::MediaRefs {
+                items: vec![vllm::MediaRef {
+                    modality: smg_grpc_client::common_proto::Modality::Image as i32,
+                    url: "https://a/1.png".to_string(),
+                }],
+            })
+            .expect("vLLM request accepts media refs");
+        request
+    }
+
+    fn identity() -> vllm::MediaIdentity {
+        vllm::MediaIdentity {
+            prompt_token_ids: vec![7, 8, 100, 100, 100, 9],
+            mm_inputs: Some(vllm::MultimodalInputs {
+                mm_hashes: vec!["h1".to_string(), "h2".to_string()],
+                mm_placeholders: vec![
+                    vllm::PlaceholderRange {
+                        offset: 2,
+                        length: 2,
+                    },
+                    vllm::PlaceholderRange {
+                        offset: 4,
+                        length: 1,
+                    },
+                ],
+                model_specific_tensors: std::collections::HashMap::from([(
+                    "image_grid_thw".to_string(),
+                    vllm::TensorData {
+                        shape: vec![2, 3],
+                        dtype: "int64".to_string(),
+                        payload: Some(vllm::tensor_data::Payload::Inline(vec![0; 48].into())),
+                    },
+                )]),
+                batched_keys: vec!["image_grid_thw".to_string()],
+                modality: smg_grpc_client::common_proto::Modality::Image as i32,
+                ..Default::default()
+            }),
+            extra_mm_inputs: vec![],
+        }
+    }
+
+    /// A media_refs request under parallel PD dispatch would otherwise become
+    /// n pairs, each processing the media on both sides.
+    #[test]
+    fn media_refs_request_never_fans_out() {
+        let sglang = PdProtocol::for_runtime(RuntimeType::Sglang).unwrap();
+        assert_eq!(sglang.dispatch, PdDispatch::Parallel);
+        assert_eq!(pd_fanout_width(&media_refs_request("fan", 3), sglang), None);
+    }
+
+    /// Without a KV handoff decode recomputes the prompt locally, so it needs
+    /// the media itself and the identity must not replace its references:
+    /// n>1 never relays, and a NIXL prefill that returned no params does not
+    /// hand off either, even when it did return an identity.
+    #[test]
+    fn n_greater_than_one_keeps_media_refs_on_decode() {
+        let mut decode = media_refs_request("n2", 2).clone_without_mm_pixels();
+        apply_prefill_media_identity(&mut decode, false, false, false, Some(&identity()));
+        assert!(decode.has_vllm_media_refs());
+        let ProtoGenerateRequest::Vllm(request) = &decode else {
+            panic!("expected vLLM request");
+        };
+        assert!(request.mm_inputs.is_none());
+    }
+
+    /// Legacy Mooncake injects its host and port into every decode side, n>1
+    /// included, so `handed_off` alone does not say that decode will pull
+    /// its prompt KV from prefill: an n>1 side recomputes locally and keeps
+    /// its references whatever the prefill returned.
+    #[test]
+    fn n_greater_than_one_keeps_media_refs_despite_a_legacy_mooncake_handoff() {
+        let mut decode = media_refs_request("n2-mooncake", 2).clone_without_mm_pixels();
+        apply_prefill_media_identity(&mut decode, true, false, false, Some(&identity()));
+        assert!(decode.has_vllm_media_refs());
+        let ProtoGenerateRequest::Vllm(request) = &decode else {
+            panic!("expected vLLM request");
+        };
+        assert!(request.mm_inputs.is_none());
+    }
+
+    #[test]
+    fn an_identity_without_a_kv_handoff_keeps_the_references() {
+        let mut decode = media_refs_request("no-kv", 1).clone_without_mm_pixels();
+        apply_prefill_media_identity(&mut decode, false, true, true, Some(&identity()));
+        assert!(decode.has_vllm_media_refs());
+        let ProtoGenerateRequest::Vllm(request) = &decode else {
+            panic!("expected vLLM request");
+        };
+        assert!(request.mm_inputs.is_none());
+    }
+
+    #[test]
+    fn decode_side_from_media_identity_has_no_refs_and_no_pixels() {
+        let mut decode = media_refs_request("relay", 1).clone_without_mm_pixels();
+        apply_prefill_media_identity(&mut decode, true, true, true, Some(&identity()));
+        assert!(!decode.has_vllm_media_refs());
+        let ProtoGenerateRequest::Vllm(request) = &decode else {
+            panic!("expected vLLM request");
+        };
+        assert!(request.media_refs.is_none());
+        let mm = request.mm_inputs.as_ref().expect("identity mm_inputs");
+        assert!(mm.pixel_values.is_none());
+        assert_eq!(mm.mm_hashes.len(), 2);
+        assert_eq!(mm.mm_placeholders.len(), 2);
+        assert!(mm.model_specific_tensors.contains_key("image_grid_thw"));
+        let Some(vllm::generate_request::Input::Tokenized(tokenized)) = &request.input else {
+            panic!("expected tokenized input");
+        };
+        assert_eq!(tokenized.input_ids, vec![7, 8, 100, 100, 100, 9]);
+        assert_eq!(tokenized.original_text, "describe <|image|>");
+    }
+
+    /// An identity the side cannot take, empty ids or a side that is not
+    /// tokenized, leaves the references in place: better a reprocessed
+    /// decode than an empty prompt.
+    #[test]
+    fn an_unusable_identity_leaves_the_decode_side_untouched() {
+        let mut empty = identity();
+        empty.prompt_token_ids.clear();
+        let mut decode = media_refs_request("empty", 1).clone_without_mm_pixels();
+        apply_prefill_media_identity(&mut decode, true, true, true, Some(&empty));
+        assert!(decode.has_vllm_media_refs());
+        let ProtoGenerateRequest::Vllm(request) = &decode else {
+            panic!("expected vLLM request");
+        };
+        assert!(request.mm_inputs.is_none());
+
+        let mut decode = media_refs_request("text", 1).clone_without_mm_pixels();
+        if let ProtoGenerateRequest::Vllm(request) = &mut decode {
+            request.input = Some(vllm::generate_request::Input::Text(
+                "describe <|image|>".to_string(),
+            ));
+        }
+        apply_prefill_media_identity(&mut decode, true, true, true, Some(&identity()));
+        assert!(decode.has_vllm_media_refs());
+        let ProtoGenerateRequest::Vllm(request) = &decode else {
+            panic!("expected vLLM request");
+        };
+        assert!(request.mm_inputs.is_none());
+        assert!(matches!(
+            request.input,
+            Some(vllm::generate_request::Input::Text(_))
+        ));
+    }
+
+    /// An older servicer returns no identity: the decode side keeps its
+    /// references and reprocesses, as before; the same when no identity was
+    /// asked for (a prefill request without KV params).
+    #[test]
+    fn missing_identity_leaves_the_decode_side_untouched() {
+        for solicited in [true, false] {
+            let mut decode = media_refs_request("old", 1).clone_without_mm_pixels();
+            apply_prefill_media_identity(&mut decode, true, true, solicited, None);
+            assert!(decode.has_vllm_media_refs(), "solicited={solicited}");
+        }
+    }
+
+    #[test]
     fn clone_without_mm_pixels_keeps_vllm_identity_and_grid_tensors() {
-        // The decode leg drops the pixel tensors but keeps the per-image
+        // The decode side drops the pixel tensors but keeps the per-image
         // identity and the inline M-RoPE grid tensors.
         let grid = vllm::TensorData {
             shape: vec![1, 3],
             dtype: "int64".to_string(),
-            payload: Some(vllm::tensor_data::Payload::Inline(vec![0; 24])),
+            payload: Some(vllm::tensor_data::Payload::Inline(vec![0; 24].into())),
         };
         let mut request = ProtoGenerateRequest::Vllm(Box::new(vllm::GenerateRequest {
             request_id: "pd-2".to_string(),
@@ -840,7 +4475,10 @@ mod tests {
                     ("aspect_ratios".to_string(), grid.clone()),
                     // Flat-classified grid keys keep their sizes tensor.
                     ("second_per_grid_ts".to_string(), grid.clone()),
-                    ("ts_sizes".to_string(), grid),
+                    ("ts_sizes".to_string(), grid.clone()),
+                    // The Omni family's and the router's own spelling of the
+                    // video timing.
+                    ("video_second_per_grid".to_string(), grid),
                 ]),
                 flat_keys: std::collections::HashMap::from([(
                     "second_per_grid_ts".to_string(),
@@ -869,23 +4507,28 @@ mod tests {
         let ProtoGenerateRequest::Vllm(decode) = clone else {
             panic!("expected vLLM clone");
         };
-        let original_mm = original.mm_inputs.expect("prefill leg keeps mm_inputs");
+        let original_mm = original.mm_inputs.expect("prefill side keeps mm_inputs");
         assert!(
             original_mm.pixel_values.is_some(),
-            "prefill leg keeps pixels"
+            "prefill side keeps pixels"
         );
-        assert_eq!(original_mm.model_specific_tensors.len(), 5);
+        assert_eq!(original_mm.model_specific_tensors.len(), 6);
         assert_eq!(original_mm.batched_keys.len(), 3);
-        let decode_mm = decode.mm_inputs.expect("decode leg keeps identity");
+        let decode_mm = decode.mm_inputs.expect("decode side keeps identity");
         assert!(
             decode_mm.pixel_values.is_none(),
-            "decode leg never carries pixels"
+            "decode side never carries pixels"
         );
         let mut decode_keys: Vec<_> = decode_mm.model_specific_tensors.keys().collect();
         decode_keys.sort();
         assert_eq!(
             decode_keys,
-            vec!["image_grid_thw", "second_per_grid_ts", "ts_sizes"]
+            vec![
+                "image_grid_thw",
+                "second_per_grid_ts",
+                "ts_sizes",
+                "video_second_per_grid"
+            ]
         );
         assert_eq!(decode_mm.batched_keys, vec!["image_grid_thw".to_string()]);
         assert_eq!(
@@ -925,18 +4568,287 @@ mod tests {
         let original_item = &original.mm_inputs.as_ref().unwrap().items[0];
         assert!(
             original_item.encoder_input.is_some(),
-            "prefill leg keeps encoder input"
+            "prefill side keeps encoder input"
         );
         let decode_item = &decode.mm_inputs.as_ref().unwrap().items[0];
         assert!(
             decode_item.encoder_input.is_none(),
-            "decode leg drops encoder input"
+            "decode side drops encoder input"
         );
         assert_eq!(
             decode_item.placeholder_token_id,
             Some(7),
-            "decode leg keeps per-item metadata"
+            "decode side keeps per-item metadata"
         );
+    }
+
+    /// A full vLLM multimodal request: expanded token ids, pixels, grids,
+    /// an extra video batch, media refs and a relayed KV handoff.
+    fn vllm_pd_mm_request() -> ProtoGenerateRequest {
+        let grid = vllm::TensorData {
+            shape: vec![1, 3],
+            dtype: "int64".to_string(),
+            payload: Some(vllm::tensor_data::Payload::Inline(vec![0; 24].into())),
+        };
+        let mut request = ProtoGenerateRequest::Vllm(Box::new(vllm::GenerateRequest {
+            request_id: "pd-lmo".to_string(),
+            input: Some(vllm::generate_request::Input::Tokenized(
+                vllm::TokenizedInput {
+                    original_text: String::new(),
+                    input_ids: vec![1, 2, 151_655, 151_655, 3],
+                },
+            )),
+            mm_inputs: Some(vllm::MultimodalInputs {
+                pixel_values: Some(vllm::TensorData::default()),
+                model_specific_tensors: std::collections::HashMap::from([(
+                    "image_grid_thw".to_string(),
+                    grid,
+                )]),
+                im_token_id: Some(151_655),
+                mm_placeholders: vec![vllm::PlaceholderRange {
+                    offset: 2,
+                    length: 2,
+                }],
+                mm_hashes: vec!["img-hash".to_string()],
+                ..Default::default()
+            }),
+            extra_mm_inputs: vec![vllm::MultimodalInputs {
+                mm_hashes: vec!["vid-hash".to_string()],
+                modality: smg_grpc_client::common_proto::Modality::Video as i32,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }));
+        request.set_kv_transfer_params_json("{\"do_remote_prefill\":true}".to_string());
+        request
+            .set_vllm_media_refs(vllm::MediaRefs {
+                items: vec![vllm::MediaRef {
+                    modality: smg_grpc_client::common_proto::Modality::Image as i32,
+                    url: "https://a/1.png".to_string(),
+                }],
+            })
+            .expect("vLLM request accepts media refs");
+        request
+    }
+
+    #[test]
+    fn clone_without_mm_keeps_only_hashes_ids_and_kv_params() {
+        let mut request = vllm_pd_mm_request();
+        let clone = request.clone_without_mm();
+        let ProtoGenerateRequest::Vllm(original) = request else {
+            panic!("expected vLLM request");
+        };
+        let ProtoGenerateRequest::Vllm(decode) = clone else {
+            panic!("expected vLLM clone");
+        };
+
+        // The original (prefill side) is untouched.
+        let original_mm = original
+            .mm_inputs
+            .as_ref()
+            .expect("prefill keeps mm_inputs");
+        assert!(original_mm.pixel_values.is_some());
+        assert!(original.media_refs.is_some());
+
+        // The expanded placeholder-token run survives: it names the sequence
+        // whose KV the decode worker pulls from prefill.
+        let Some(vllm::generate_request::Input::Tokenized(tokenized)) = &decode.input else {
+            panic!("decode side stays tokenized");
+        };
+        assert_eq!(tokenized.input_ids, vec![1, 2, 151_655, 151_655, 3]);
+
+        // The KV handoff survives verbatim.
+        assert_eq!(
+            decode.kv_transfer_params_json.as_deref(),
+            Some("{\"do_remote_prefill\":true}")
+        );
+
+        // Media references never reach a language-model-only decode worker.
+        assert!(decode.media_refs.is_none());
+
+        // Each batch keeps exactly its content hashes (the servicer folds
+        // them into cache_salt) and modality; pixels, placeholders, grids and
+        // the placeholder token id are gone.
+        let decode_mm = decode.mm_inputs.expect("hash identity kept");
+        assert_eq!(decode_mm.mm_hashes, vec!["img-hash".to_string()]);
+        assert!(decode_mm.pixel_values.is_none());
+        assert!(decode_mm.model_specific_tensors.is_empty());
+        assert!(decode_mm.mm_placeholders.is_empty());
+        assert!(decode_mm.im_token_id.is_none());
+        assert!(decode_mm.batched_keys.is_empty());
+        assert!(decode_mm.flat_keys.is_empty());
+        assert_eq!(decode.extra_mm_inputs.len(), 1);
+        let extra = &decode.extra_mm_inputs[0];
+        assert_eq!(extra.mm_hashes, vec!["vid-hash".to_string()]);
+        assert_eq!(
+            extra.modality,
+            smg_grpc_client::common_proto::Modality::Video as i32
+        );
+    }
+
+    #[test]
+    fn clone_without_mm_drops_hashless_batches_whole() {
+        let mut request = ProtoGenerateRequest::Vllm(Box::new(vllm::GenerateRequest {
+            mm_inputs: Some(vllm::MultimodalInputs {
+                pixel_values: Some(vllm::TensorData::default()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+        let clone = request.clone_without_mm();
+        let ProtoGenerateRequest::Vllm(decode) = clone else {
+            panic!("expected vLLM clone");
+        };
+        assert!(
+            decode.mm_inputs.is_none(),
+            "a hash-less batch carries no identity worth keeping"
+        );
+    }
+
+    #[test]
+    fn has_vllm_mrope_grids_reads_every_batch() {
+        let plain = ProtoGenerateRequest::Vllm(Box::new(vllm::GenerateRequest {
+            mm_inputs: Some(vllm::MultimodalInputs {
+                mm_hashes: vec!["h".to_string()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+        assert!(!plain.has_vllm_mrope_grids());
+
+        // Grids hiding in a non-primary batch (mixed-modality request) count.
+        let mut mixed = vllm_pd_mm_request();
+        let ProtoGenerateRequest::Vllm(req) = &mut mixed else {
+            panic!("expected vLLM request");
+        };
+        req.mm_inputs
+            .as_mut()
+            .unwrap()
+            .model_specific_tensors
+            .clear();
+        req.extra_mm_inputs[0]
+            .model_specific_tensors
+            .insert("video_grid_thw".to_string(), vllm::TensorData::default());
+        assert!(mixed.has_vllm_mrope_grids());
+
+        let text = ProtoGenerateRequest::Vllm(Box::default());
+        assert!(!text.has_vllm_mrope_grids());
+    }
+
+    #[test]
+    fn sequential_pd_decode_form_picks_the_side_for_the_worker() {
+        let mm_request = vllm_pd_mm_request();
+
+        // Full-vision decode worker: today's forms, untouched.
+        assert_eq!(
+            sequential_pd_decode_form(&mm_request, false, true).expect("vision decode"),
+            SequentialPdDecodeForm::IdentityOnly
+        );
+        assert_eq!(
+            sequential_pd_decode_form(&mm_request, false, false).expect("vision decode n>1"),
+            SequentialPdDecodeForm::Full
+        );
+
+        // Language-model-only decode worker, no grids (MiniMax-style): the
+        // fully stripped side. A text request takes the same side harmlessly.
+        let mut stripable = vllm_pd_mm_request();
+        let ProtoGenerateRequest::Vllm(req) = &mut stripable else {
+            panic!("expected vLLM request");
+        };
+        req.media_refs = None;
+        req.mm_inputs
+            .as_mut()
+            .unwrap()
+            .model_specific_tensors
+            .clear();
+        assert_eq!(
+            sequential_pd_decode_form(&stripable, true, true).expect("stripped side"),
+            SequentialPdDecodeForm::TextPlusHashes
+        );
+        let text = ProtoGenerateRequest::Vllm(Box::default());
+        assert_eq!(
+            sequential_pd_decode_form(&text, true, true).expect("text request"),
+            SequentialPdDecodeForm::TextPlusHashes
+        );
+        assert_eq!(
+            sequential_pd_decode_form(&text, true, false).expect("text n>1"),
+            SequentialPdDecodeForm::TextPlusHashes
+        );
+    }
+
+    #[test]
+    fn has_kv_transfer_params_reads_both_wire_forms() {
+        let mut json = ProtoGenerateRequest::Vllm(Box::default());
+        assert!(!json.has_kv_transfer_params());
+        json.set_kv_transfer_params_json("{\"do_remote_prefill\":true}".to_string());
+        assert!(json.has_kv_transfer_params());
+
+        let mut typed = ProtoGenerateRequest::Vllm(Box::default());
+        typed.set_kv_transfer_params("10.0.0.1".to_string(), 8998);
+        assert!(typed.has_kv_transfer_params());
+
+        // Non-vLLM backends carry no connector handoff field.
+        assert!(!tokenspeed_request(1, None).has_kv_transfer_params());
+    }
+
+    /// The refusals of a pool with no vision-capable decode worker (worker
+    /// selection pairs one when the model has it): each names its code and
+    /// says that none is paired.
+    #[tokio::test]
+    async fn sequential_pd_decode_form_rejects_incompatible_pairings() {
+        async fn refusal(response: Response) -> String {
+            assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body");
+            let text = String::from_utf8(body.to_vec()).expect("utf-8 body");
+            assert!(
+                text.contains("no decode worker with a vision encoder is paired"),
+                "{text}"
+            );
+            text
+        }
+
+        // M-RoPE grids + language-model-only decode: cannot strip (positions
+        // would be wrong), cannot send (encoder-cache budget 0).
+        let gridded = vllm_pd_mm_request();
+        let response = sequential_pd_decode_form(&gridded, true, true)
+            .expect_err("mRoPE grids need a vision-capable decode worker");
+        assert!(refusal(response)
+            .await
+            .contains("pd_decode_language_model_only_mrope"));
+
+        // Media references + language-model-only decode: the side would have
+        // to expand the anchors itself.
+        let mut refs_only = vllm_pd_mm_request();
+        let ProtoGenerateRequest::Vllm(req) = &mut refs_only else {
+            panic!("expected vLLM request");
+        };
+        req.mm_inputs = None;
+        req.extra_mm_inputs.clear();
+        let response = sequential_pd_decode_form(&refs_only, true, true)
+            .expect_err("media refs need a processing decode worker");
+        assert!(refusal(response)
+            .await
+            .contains("pd_decode_language_model_only_media_refs"));
+
+        // n>1 + mm + language-model-only decode: no KV handoff, no local
+        // recompute either.
+        let mut fanout = vllm_pd_mm_request();
+        let ProtoGenerateRequest::Vllm(req) = &mut fanout else {
+            panic!("expected vLLM request");
+        };
+        req.media_refs = None;
+        req.mm_inputs
+            .as_mut()
+            .unwrap()
+            .model_specific_tensors
+            .clear();
+        let response = sequential_pd_decode_form(&fanout, true, false)
+            .expect_err("n>1 cannot recompute on a pixel-less decode worker");
+        assert!(refusal(response)
+            .await
+            .contains("pd_decode_language_model_only_n_samples"));
     }
 
     #[test]
@@ -1007,22 +4919,79 @@ mod tests {
     fn kv_transfer_params_json_complete_accessor_filters_empty() {
         use crate::routers::grpc::proto_wrapper::ProtoGenerateComplete;
 
-        let complete = ProtoGenerateComplete::Vllm(vllm::GenerateComplete {
+        let complete = ProtoGenerateComplete::Vllm(Box::new(vllm::GenerateComplete {
             kv_transfer_params_json: Some(r#"{"do_remote_prefill":true}"#.to_string()),
             ..Default::default()
-        });
+        }));
         assert_eq!(
             complete.kv_transfer_params_json(),
             Some(r#"{"do_remote_prefill":true}"#)
         );
 
-        let empty = ProtoGenerateComplete::Vllm(vllm::GenerateComplete {
+        let empty = ProtoGenerateComplete::Vllm(Box::new(vllm::GenerateComplete {
             kv_transfer_params_json: Some(String::new()),
             ..Default::default()
-        });
+        }));
         assert_eq!(empty.kv_transfer_params_json(), None);
 
-        let unset = ProtoGenerateComplete::Vllm(vllm::GenerateComplete::default());
+        let unset = ProtoGenerateComplete::Vllm(Box::default());
         assert_eq!(unset.kv_transfer_params_json(), None);
+    }
+
+    /// The regular dispatch books the request on its worker before its call
+    /// is polled: the gRPC servicers answer the call together with the first
+    /// message, so a prefill in progress on the worker sees the prompt
+    /// pending and a streaming request in the pile the whole time; the
+    /// stream takes the booking over, a failed call gives it back.
+    #[tokio::test]
+    async fn a_single_dispatch_is_booked_on_its_worker_before_its_call_answers() {
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("grpc://w1:30000").build());
+        fn books(worker: &Arc<dyn Worker>) -> (Duration, usize) {
+            (worker.prefill_backlog(), worker.tracked_load())
+        }
+        // 4,096 prompt tokens at the cold prior read as 409 ms of backlog.
+        let pending = Duration::from_millis(409);
+        let none = (Duration::ZERO, 0);
+        for (streaming, pile) in [(true, 1), (false, 0)] {
+            let seen = Arc::new(std::sync::Mutex::new(None));
+            let call = {
+                let worker = Arc::clone(&worker);
+                let seen = Arc::clone(&seen);
+                async move {
+                    *seen.lock().unwrap() = Some(books(&worker));
+                    Ok(ProtoStream::Fanout(FanoutStream::<ProtoStream>::new(
+                        Vec::new(),
+                    )))
+                }
+            };
+            let stream = dispatch_single_booked(call, Some(&worker), 4_096, streaming)
+                .await
+                .expect("the call answered");
+            assert_eq!(
+                seen.lock().unwrap().take(),
+                Some((pending, pile)),
+                "pending prefill and in the pile while the call runs (streaming {streaming})"
+            );
+            assert_eq!(
+                books(&worker),
+                (pending, pile),
+                "handed to the stream: booked once, not again"
+            );
+            drop(stream);
+            assert_eq!(books(&worker), none, "released with the stream");
+        }
+        let failed = dispatch_single_booked(
+            async { Err(tonic::Status::unavailable("refused")) },
+            Some(&worker),
+            4_096,
+            true,
+        )
+        .await;
+        assert!(failed.is_err(), "the call's failure is the dispatch's");
+        assert_eq!(
+            books(&worker),
+            none,
+            "a call that fails gives the booking back"
+        );
     }
 }

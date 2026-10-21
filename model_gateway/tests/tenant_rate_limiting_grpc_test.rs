@@ -24,20 +24,18 @@ mod common;
 
 use std::{sync::Arc, time::Duration};
 
-use llm_tokenizer::{traits::Tokenizer, MockTokenizer, TokenizerRegistry};
+use common::grpc_harness::{
+    build_grpc_router, grpc_router_config, grpc_worker, serve_canned_worker, Canned,
+};
 use openai_protocol::{
     completion::CompletionRequest, generate::GenerateRequest, model_card::ModelCard,
-    worker::HealthCheckConfig,
 };
-use portpicker::pick_unused_port;
 use smg::{
-    config::RouterConfig,
     middleware::TenantRequestMeta,
-    routers::{RouterFactory, RouterTrait},
+    routers::RouterTrait,
     tenant::TenantKey,
-    worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, WorkerType},
+    worker::{RuntimeType, WorkerType},
 };
-use tokio::net::TcpStream;
 
 /// "Hello world" through `MockTokenizer`'s fixed vocab ("Hello"=1, "world"=2)
 /// tokenizes to exactly 2 ids -- the gateway's reserve-time estimate.
@@ -45,51 +43,16 @@ const PROMPT_TEXT: &str = "Hello world";
 const ESTIMATED_INPUT_TOKENS: u32 = 2;
 const MODEL: &str = "tenant-rl-test-model";
 
-#[expect(
-    clippy::panic,
-    reason = "test helper - panicking on failure is intentional"
-)]
-async fn wait_for_port(port: u16) {
-    let addr = format!("127.0.0.1:{port}");
-    for _ in 0..100 {
-        if TcpStream::connect(&addr).await.is_ok() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("mock gRPC worker on {addr} never came up");
-}
-
 /// Spawn a real (mock) gRPC worker in-process, canned mode: always reports
 /// `prompt_tokens: 1` and `completion_tokens: output_tokens`, regardless of
 /// what was actually sent.
-#[expect(
-    clippy::expect_used,
-    clippy::disallowed_methods,
-    reason = "test helper - panicking on failure is intentional; the spawned \
-              mock server task is fire-and-forget for the test process's lifetime"
-)]
 async fn start_mock_grpc_worker(output_tokens: u32) -> u16 {
-    let port = pick_unused_port().expect("no free port for mock gRPC worker");
-    let cfg = Arc::new(mock_worker::config::Config {
-        host: "127.0.0.1".to_string(),
-        http_base_port: 0,
-        http_count: 0,
-        grpc_base_port: port,
-        grpc_count: 1,
-        zmq_handshake: None,
-        zmq_count: 0,
-        zmq_start_index: 0,
-        model_id: MODEL.to_string(),
-        tokenizer_path: MODEL.to_string(),
+    serve_canned_worker(Canned {
+        model: MODEL,
         gen_delay: Duration::ZERO,
         output_tokens,
-        realistic: false,
-        engine: mock_worker::engine::EngineParams::default(),
-    });
-    tokio::spawn(mock_worker::grpc::serve(cfg, "127.0.0.1".to_string(), port));
-    wait_for_port(port).await;
-    port
+    })
+    .await
 }
 
 /// Build a real gRPC router with tenant rate limiting configured against a
@@ -99,20 +62,15 @@ async fn start_mock_grpc_worker(output_tokens: u32) -> u16 {
 /// it bound for the caller's whole test avoids any doubt about timing).
 #[expect(
     clippy::unwrap_used,
-    clippy::expect_used,
     reason = "test helper - panicking on failure is intentional"
 )]
 async fn build_router(
     tokens_per_minute: Option<u32>,
     grpc_port: u16,
 ) -> (Box<dyn RouterTrait>, Option<tempfile::TempDir>) {
-    let mut builder = RouterConfig::builder()
-        .grpc_connection()
+    let mut builder = grpc_router_config()
         .regular_mode(vec![])
         .random_policy()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(1024 * 1024)
         .request_timeout_secs(60)
         .worker_startup_timeout_secs(5)
         .worker_startup_check_interval_secs(1)
@@ -135,42 +93,15 @@ async fn build_router(
         None
     };
 
-    let mut config = builder.build_unchecked();
-    config.health_check.disable_health_check = true;
-
-    let tokenizer_registry = Arc::new(TokenizerRegistry::new());
-    let tokenizer = Arc::new(MockTokenizer::new()) as Arc<dyn Tokenizer>;
-    tokenizer_registry
-        .load(
-            "tokenizer-id",
-            MODEL,
-            "test",
-            || async move { Ok(tokenizer) },
-        )
-        .await
-        .unwrap();
-
-    let app_context =
-        common::create_test_context_with_tokenizer_registry(config, tokenizer_registry).await;
-
-    let worker = BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{grpc_port}"))
-        .worker_type(WorkerType::Regular)
-        .connection_mode(ConnectionMode::Grpc)
-        .runtime_type(RuntimeType::TokenSpeed)
-        .model(ModelCard::new(MODEL))
-        .health_config(HealthCheckConfig {
-            disable_health_check: true,
-            ..Default::default()
-        })
-        .build();
-    app_context
-        .worker_registry
-        .register(Arc::new(worker))
-        .unwrap();
-
-    let router = RouterFactory::create_router(&app_context)
-        .await
-        .expect("gRPC router should build");
+    let config = builder.build_unchecked();
+    let worker = grpc_worker(
+        grpc_port,
+        WorkerType::Regular,
+        RuntimeType::TokenSpeed,
+        ModelCard::new(MODEL),
+    )
+    .build();
+    let router = build_grpc_router(config, MODEL, vec![Arc::new(worker)]).await;
     (router, dir)
 }
 
@@ -321,16 +252,11 @@ async fn feature_disabled_is_a_no_op() {
 /// the stage is actually live on a second wired pipeline too, not just
 /// constructed and never reached.
 ///
-/// Chat and Messages are deliberately not covered the same way here: both
-/// need `apply_chat_template` to turn their `messages` array into a prompt
-/// before preparation ever reaches the reserve stage, and `MockTokenizer`
-/// (`crates/tokenizer/src/mock.rs`) doesn't implement it -- confirmed by
-/// running this exact test against `route_chat`, which fails earlier with
-/// `process_messages_failed: Chat template not supported by this
-/// tokenizer`, a 400 from the Chat preparation stage, not a 429 from rate
-/// limiting. That's a pre-existing gap in the shared mock tokenizer,
-/// unrelated to this PR; extending it (or swapping in a template-capable
-/// fake) is out of scope here. Harmony and PD dispatch are also not covered:
+/// Chat and Messages are not covered the same way here. `MockTokenizer`
+/// (`crates/tokenizer/src/mock.rs`) renders a minimal `role: content`
+/// template, so a `route_chat` mirror of this case would reach the reserve
+/// stage; the mechanics it would exercise are the ones Completion already
+/// proves. Harmony and PD dispatch are also not covered:
 /// Harmony needs a harmony-flavored model registered so `HarmonyDetector`
 /// routes into it, and PD needs a distinct prefill+decode worker pair --
 /// both larger harness investments than this suite carries for its other

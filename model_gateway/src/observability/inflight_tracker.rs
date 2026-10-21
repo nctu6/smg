@@ -1,13 +1,15 @@
 use std::{
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, LazyLock, OnceLock,
     },
     time::{Duration, Instant},
 };
 
 use dashmap::DashMap;
+use serde::Serialize;
 use tokio::sync::Notify;
+use uuid::Uuid;
 
 use super::gauge_histogram::{BucketBounds, GaugeHistogramHandle, GaugeHistogramVec};
 use crate::policies::utils::PeriodicTask;
@@ -20,7 +22,12 @@ static INFLIGHT_AGE_HANDLE: LazyLock<GaugeHistogramHandle> =
     LazyLock::new(|| INFLIGHT_AGE_HISTOGRAM.register_no_labels());
 
 pub struct InFlightRequestTracker {
+    instance_id: Uuid,
     requests: DashMap<u64, Instant>,
+    /// Live request count. `DashMap::len()`/`is_empty()` lock every shard, and
+    /// the metrics middleware reads the count at request start and end, so it
+    /// is kept in one atomic instead.
+    count: AtomicUsize,
     next_id: AtomicU64,
     sampler: OnceLock<PeriodicTask>,
     /// Monotonic flag: false → true. Never reset.
@@ -32,7 +39,9 @@ pub struct InFlightRequestTracker {
 impl InFlightRequestTracker {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
+            instance_id: Uuid::now_v7(),
             requests: DashMap::new(),
+            count: AtomicUsize::new(0),
             next_id: AtomicU64::new(0),
             sampler: OnceLock::new(),
             draining: AtomicBool::new(false),
@@ -56,6 +65,8 @@ impl InFlightRequestTracker {
 
     pub fn track(self: &Arc<Self>) -> InFlightGuard {
         let request_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        // Count first: a drain check must never see zero once admission began.
+        self.count.fetch_add(1, Ordering::AcqRel);
         self.requests.insert(request_id, Instant::now());
         InFlightGuard {
             tracker: self.clone(),
@@ -64,11 +75,24 @@ impl InFlightRequestTracker {
     }
 
     pub fn len(&self) -> usize {
-        self.requests.len()
+        self.count.load(Ordering::Acquire)
     }
 
     pub fn is_empty(&self) -> bool {
-        self.requests.is_empty()
+        self.len() == 0
+    }
+
+    /// Observe requests through response-body completion. To drain a worker,
+    /// first stop new routing to it, then retain this snapshot's IDs and poll
+    /// until none remain. Later arrivals do not prolong that cohort's drain.
+    /// A different instance ID invalidates a previous snapshot.
+    /// Upgraded connections outlive their HTTP response and require separate,
+    /// protocol-specific drain tracking.
+    pub fn snapshot(&self) -> InFlightSnapshot {
+        InFlightSnapshot {
+            instance_id: self.instance_id,
+            request_ids: self.requests.iter().map(|entry| *entry.key()).collect(),
+        }
     }
 
     /// Begin graceful shutdown: mark as draining. Idempotent.
@@ -86,7 +110,7 @@ impl InFlightRequestTracker {
     ///
     /// Returns `true` if all requests drained, `false` if timed out.
     pub async fn wait_for_drain(&self, max_timeout: Duration) -> bool {
-        if self.requests.is_empty() {
+        if self.is_empty() {
             return true;
         }
         tokio::time::timeout(max_timeout, async {
@@ -94,7 +118,7 @@ impl InFlightRequestTracker {
                 // Create the notified future BEFORE checking the condition
                 // to avoid TOCTOU race where a guard drops between check and wait.
                 let notified = self.drain_complete.notified();
-                if self.requests.is_empty() {
+                if self.is_empty() {
                     return;
                 }
                 notified.await;
@@ -123,6 +147,13 @@ impl InFlightRequestTracker {
     }
 }
 
+/// Opaque process-local identities, unrelated to client request IDs or content.
+#[derive(Serialize)]
+pub struct InFlightSnapshot {
+    pub instance_id: Uuid,
+    pub request_ids: Vec<u64>,
+}
+
 pub struct InFlightGuard {
     tracker: Arc<InFlightRequestTracker>,
     request_id: u64,
@@ -131,12 +162,13 @@ pub struct InFlightGuard {
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
         self.tracker.requests.remove(&self.request_id);
+        let was = self.tracker.count.fetch_sub(1, Ordering::AcqRel);
         // Notify drain waiters when we hit zero. `wait_for_drain()` re-checks
         // the condition after waking, so spurious wakeups are harmless.
         // We unconditionally notify (without checking is_draining()) to avoid a
         // race where the last guard drops before begin_drain()'s Release store
         // is visible, which would skip the notification entirely.
-        if self.tracker.requests.is_empty() {
+        if was == 1 {
             self.tracker.drain_complete.notify_waiters();
         }
     }
@@ -245,6 +277,10 @@ mod tests {
         assert_ne!(g1.request_id, g2.request_id);
         assert_ne!(g2.request_id, g3.request_id);
         assert_eq!(tracker.len(), 3);
+        assert_ne!(
+            tracker.snapshot().instance_id,
+            InFlightRequestTracker::new().snapshot().instance_id
+        );
     }
 
     #[test]

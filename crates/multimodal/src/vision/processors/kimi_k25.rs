@@ -2,8 +2,11 @@
 //!
 //! Matches the HuggingFace `KimiK25VisionProcessor` preprocessing pipeline; the
 //! pipeline itself lives in [`super::moonvit`], which Kimi-K3 shares. K2.5
-//! ships no `transparent_bg_config`, so alpha is dropped rather than
-//! composited — the reference's `image.convert("RGB")` behavior.
+//! ships no `transparent_bg_config`: a frame that still carries an alpha
+//! channel (one decoded under `TransparencyPolicy::KeepAlpha`, the rule of an
+//! engine whose loader keeps it) has it dropped rather than composited, the
+//! reference's `image.convert("RGB")` behavior; an engine whose loader
+//! composites hands the processor RGB already.
 
 use image::DynamicImage;
 
@@ -80,11 +83,17 @@ impl VisionPreProcessor for KimiK25Processor {
         moonvit::preprocess(self.params.resolved(config), images, config, None)
     }
 
-    fn calculate_num_tokens(&self, width: u32, height: u32, config: &PreProcessorConfig) -> usize {
-        self.params
+    fn calculate_num_tokens(
+        &self,
+        width: u32,
+        height: u32,
+        config: &PreProcessorConfig,
+    ) -> Result<usize, TransformError> {
+        Ok(self
+            .params
             .resolved(config)
             .compute_resize_config(width as usize, height as usize)
-            .num_tokens
+            .num_tokens)
     }
 
     fn model_name(&self) -> &'static str {
@@ -232,7 +241,7 @@ mod tests {
     fn test_calculate_num_tokens() {
         let p = KimiK25Processor::new();
         let config = PreProcessorConfig::default();
-        let tokens = p.calculate_num_tokens(600, 400, &config);
+        let tokens = p.calculate_num_tokens(600, 400, &config).unwrap();
         assert_eq!(tokens, 330);
     }
 
@@ -331,7 +340,7 @@ mod tests {
         for p in 0..patches {
             for y in 0..ph {
                 for x in 0..pw {
-                    let px = [0, 1, 2].map(|c| result.encoder_input[[p, c, y, x]]);
+                    let px = [0, 1, 2].map(|c| result.encoder_input.as_f32()[[p, c, y, x]]);
                     // mean = std = 0.5, so 255 -> +1.0 and 0 -> -1.0.
                     assert!(
                         (px[0] - 1.0).abs() < 1e-3 && px[1] < -0.99 && px[2] < -0.99,
@@ -351,8 +360,10 @@ mod tests {
             .extra
             .insert("in_patch_limit".to_string(), serde_json::json!(65536));
 
-        let default_tokens = p.calculate_num_tokens(4000, 3000, &PreProcessorConfig::default());
-        let raised_tokens = p.calculate_num_tokens(4000, 3000, &config);
+        let default_tokens = p
+            .calculate_num_tokens(4000, 3000, &PreProcessorConfig::default())
+            .unwrap();
+        let raised_tokens = p.calculate_num_tokens(4000, 3000, &config).unwrap();
         assert!(
             raised_tokens > default_tokens,
             "raising in_patch_limit should raise the token count \

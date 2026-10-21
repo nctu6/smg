@@ -28,7 +28,11 @@ use serde_json::json;
 use tracing::{debug, trace, warn};
 
 use super::types::HarmonyBuildOutput;
-use crate::routers::grpc::{proto_wrapper::ProtoOutputLogProbs, utils};
+use crate::routers::grpc::{
+    common::responses::{history::hosted_call_result, utils::extract_tools_from_response_tools},
+    proto_wrapper::ProtoOutputLogProbs,
+    utils,
+};
 
 /// Global Harmony encoding (lazy-initialized)
 static HARMONY_ENCODING: OnceLock<HarmonyEncoding> = OnceLock::new();
@@ -38,7 +42,8 @@ fn reject_chat_audio(messages: &[ChatMessage]) -> Result<(), String> {
         ChatMessage::System { content, .. }
         | ChatMessage::User { content, .. }
         | ChatMessage::Tool { content, .. }
-        | ChatMessage::Developer { content, .. } => content_contains_audio(content),
+        | ChatMessage::Developer { content, .. }
+        | ChatMessage::Root { content, .. } => content_contains_audio(content),
         ChatMessage::Assistant { content, .. } => {
             content.as_ref().is_some_and(content_contains_audio)
         }
@@ -74,6 +79,12 @@ static HARMONY_ENCODING_INIT: Mutex<()> = Mutex::new(());
 /// The vocab may come from disk (`TIKTOKEN_ENCODINGS_BASE`) or a cached
 /// download; loading is triggered at gpt-oss worker registration
 /// (`EnsureHarmonyEncodingStep`), so request paths hit the loaded fast path.
+/// A request path can still reach a cold load (a request name-matched to the
+/// Harmony pipeline before any of its workers registered, or after that step
+/// failed them all). The load then runs here, under the init lock, on a thread
+/// of its own (see [`on_its_own_thread`]), so a caller inside a runtime gets
+/// the loader's result (or its error) instead of a panic. The caller's thread
+/// (a runtime worker, on a request path) blocks until the load finishes.
 pub(crate) fn try_harmony_encoding() -> Result<&'static HarmonyEncoding, String> {
     if let Some(encoding) = HARMONY_ENCODING.get() {
         return Ok(encoding);
@@ -84,9 +95,58 @@ pub(crate) fn try_harmony_encoding() -> Result<&'static HarmonyEncoding, String>
     if let Some(encoding) = HARMONY_ENCODING.get() {
         return Ok(encoding);
     }
-    let encoding = openai_harmony::load_harmony_encoding(HarmonyEncodingName::HarmonyGptOss)
-        .map_err(|e| format!("Failed to load Harmony encoding: {e:#}"))?;
+    let encoding = on_its_own_thread(|| {
+        openai_harmony::load_harmony_encoding(HarmonyEncodingName::HarmonyGptOss)
+    })
+    .map_err(|e| format!("Failed to load Harmony encoding: its thread could not start: {e}"))?
+    .map_err(|e| format!("Failed to load Harmony encoding: {e:#}"))?;
     Ok(HARMONY_ENCODING.get_or_init(|| encoding))
+}
+
+/// Runs `load` on a thread of its own and returns what it returns.
+///
+/// The vocab loader is synchronous and, on a cache miss, downloads with a
+/// blocking HTTP client that builds and drops an async runtime of its own.
+/// Dropped on a thread that drives a current-thread runtime, as a
+/// `#[tokio::test]` body does, that runtime is a panic ("Cannot drop a
+/// runtime in a context where blocking is not allowed"), so a test that
+/// encodes a Harmony turn passed only once the sync builder tests of the same
+/// binary had filled the cell: test order, not a guarantee, and a failure by
+/// name on a cold machine. A thread of its own drives no runtime, so the load
+/// is the same from any caller. The thread is named, so a panic inside the
+/// loader is reported under it, and a thread the OS refuses to start is an
+/// error for the caller, not a panic.
+fn on_its_own_thread<T: Send>(load: impl FnOnce() -> T + Send) -> std::io::Result<T> {
+    std::thread::scope(|scope| {
+        let loader = std::thread::Builder::new()
+            .name("harmony-encoding-load".into())
+            .spawn_scoped(scope, load)?;
+        Ok(loader
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic)))
+    })
+}
+
+#[cfg(test)]
+mod own_thread_tests {
+    use super::on_its_own_thread;
+
+    /// What the loader's own thread is for: a runtime dropped on a thread that
+    /// drives one (this test's) is a panic; dropped on the loader's thread it
+    /// is nothing, and the load's result comes back.
+    #[tokio::test]
+    async fn a_load_may_build_and_drop_a_runtime() {
+        let answer = on_its_own_thread(|| {
+            drop(
+                tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .expect("a runtime"),
+            );
+            42
+        })
+        .expect("the loader's thread starts");
+        assert_eq!(answer, 42);
+    }
 }
 
 /// Convert ProtoOutputLogProbs to OpenAI ChatLogProbs format using Harmony's tokenizer
@@ -150,6 +210,11 @@ trait ToolLike {
 
     /// Convert to ToolDescription
     fn to_tool_description(&self) -> Option<ToolDescription>;
+
+    /// Expand grouped tools into individual model-visible declarations.
+    fn to_tool_descriptions(&self) -> Vec<ToolDescription> {
+        self.to_tool_description().into_iter().collect()
+    }
 }
 
 /// Implement ToolLike for Chat Completion Tool
@@ -193,8 +258,21 @@ impl ToolLike for ResponseTool {
         // dispatch. See [`BUILTIN_TOOLS`] above.
         matches!(
             self,
-            ResponseTool::Function(_) | ResponseTool::ImageGeneration(_)
+            ResponseTool::Function(_)
+                | ResponseTool::Namespace(_)
+                | ResponseTool::ImageGeneration(_)
         )
+    }
+
+    fn to_tool_descriptions(&self) -> Vec<ToolDescription> {
+        if matches!(self, ResponseTool::Namespace(_)) {
+            extract_tools_from_response_tools(Some(std::slice::from_ref(self)))
+                .iter()
+                .filter_map(ToolLike::to_tool_description)
+                .collect()
+        } else {
+            self.to_tool_description().into_iter().collect()
+        }
     }
 
     fn to_tool_description(&self) -> Option<ToolDescription> {
@@ -278,6 +356,15 @@ fn has_custom_tools(tool_types: &[&str]) -> bool {
     !tool_types.iter().all(|t| BUILTIN_TOOLS.contains(t))
 }
 
+/// The tools a chat request offers, wherever it declares them (at the request
+/// level or on a message: `ChatCompletionRequest::declares_tools`), in the order
+/// the model sees them; `None` when it declares none.
+fn chat_tools(request: &ChatCompletionRequest) -> Option<Vec<Tool>> {
+    request
+        .declares_tools()
+        .then(|| request.effective_tools().cloned().collect())
+}
+
 /// Harmony request builder
 ///
 /// Converts OpenAI-format requests into Harmony-encoded format with input_ids,
@@ -325,6 +412,7 @@ impl HarmonyBuilder {
         &self,
         request: &ChatCompletionRequest,
     ) -> Result<HarmonyBuildOutput, String> {
+        utils::validate_chat_content_parts(&request.messages)?;
         reject_chat_audio(&request.messages)?;
         let encoding = try_harmony_encoding()?;
 
@@ -333,7 +421,7 @@ impl HarmonyBuilder {
         let sys_msg = self.build_system_message_from_chat(request);
         all_messages.push(sys_msg);
 
-        let dev_msg = self.build_developer_message_from_chat(request.tools.as_ref());
+        let dev_msg = self.build_developer_message_from_chat(chat_tools(request).as_ref());
         all_messages.push(dev_msg);
 
         let mut user_messages = self.convert_chat_messages(&request.messages);
@@ -466,8 +554,7 @@ impl HarmonyBuilder {
             .as_deref()
             .map(harmony_reasoning_effort_from_str);
 
-        let has_tools = request.tools.is_some();
-        self.build_system_message(reasoning_effort, has_tools)
+        self.build_system_message(reasoning_effort, request.declares_tools())
     }
 
     /// Build system message from ResponsesRequest
@@ -538,7 +625,7 @@ impl HarmonyBuilder {
         let tool_descriptions: Vec<ToolDescription> = tools
             .iter()
             .filter(|t| t.is_custom())
-            .filter_map(|t| t.to_tool_description())
+            .flat_map(|t| t.to_tool_descriptions())
             .filter(|td| seen_names.insert(td.name.clone()))
             .collect();
 
@@ -639,6 +726,16 @@ impl HarmonyBuilder {
                 let mut prev_outputs: Vec<&ResponseInputOutputItem> = Vec::new();
 
                 for item in items {
+                    // The gateway's own record of a hosted tool session (the
+                    // tools it listed, the approval it asked for): nothing
+                    // the model said or was told.
+                    if matches!(
+                        item,
+                        ResponseInputOutputItem::McpListTools { .. }
+                            | ResponseInputOutputItem::McpApprovalRequest { .. }
+                    ) {
+                        continue;
+                    }
                     let msg = self.parse_response_item_to_harmony_message(item, &prev_outputs)?;
                     all_messages.push(msg);
 
@@ -742,58 +839,32 @@ impl HarmonyBuilder {
             // Function tool call (with optional output)
             ResponseInputOutputItem::FunctionToolCall {
                 name,
+                namespace,
                 arguments,
                 output,
                 ..
             } => {
-                // If there's an output, this represents the tool result
-                // Otherwise, it's the tool call itself
-                if let Some(output_str) = output {
-                    // Tool result - use Tool role with "functions.{name}" as author name
-                    // IMPORTANT: Must include recipient="assistant" for parser to recognize it.
-                    // We keep channel=None to minimize what the model might copy.
-                    let author_name = format!("functions.{name}");
-                    debug!(
-                        tool_name = %name,
-                        author_name = %author_name,
-                        output_preview = %output_str.chars().take(100).collect::<String>(),
-                        "Building tool result message with Tool role (recipient=assistant, no channel)"
-                    );
-                    Ok(HarmonyMessage {
-                        author: Author {
-                            role: Role::Tool,
-                            name: Some(author_name),
-                        },
-                        recipient: Some("assistant".to_string()),
-                        content: vec![Content::Text(TextContent {
-                            text: output_str.clone(),
-                        })],
-                        channel: None,
-                        content_type: None,
-                    })
-                } else {
-                    // Tool call - assistant message in commentary channel with recipient
-                    // msg.with_channel("commentary").with_recipient(f"functions.{name}")
-                    let recipient = format!("functions.{name}");
-                    debug!(
-                        tool_name = %name,
-                        recipient = %recipient,
-                        "Building tool call message with recipient"
-                    );
-                    Ok(HarmonyMessage {
-                        author: Author {
-                            role: Role::Assistant,
-                            name: None,
-                        },
-                        recipient: Some(recipient),
-                        content: vec![Content::Text(TextContent {
-                            text: arguments.clone(),
-                        })],
-                        channel: Some("commentary".to_string()),
-                        content_type: Some("json".to_string()),
-                    })
-                }
+                let name = match namespace {
+                    Some(namespace) => format!("{namespace}.{name}"),
+                    None => name.clone(),
+                };
+                Ok(tool_call_message(name, arguments, output.as_deref()))
             }
+
+            // A hosted tool call of a stored turn replays the same way, under
+            // the name the model called it by.
+            ResponseInputOutputItem::McpCall {
+                name,
+                arguments,
+                output,
+                error,
+                status,
+                ..
+            } => Ok(tool_call_message(
+                name.clone(),
+                arguments,
+                hosted_call_result(output.as_deref(), error.as_ref(), status.as_deref()).as_deref(),
+            )),
 
             // Function call output (separate from call) - requires looking up the original call
             ResponseInputOutputItem::FunctionCallOutput {
@@ -807,8 +878,12 @@ impl HarmonyBuilder {
                         ResponseInputOutputItem::FunctionToolCall {
                             call_id: item_call_id,
                             name,
+                            namespace,
                             ..
-                        } if item_call_id == call_id => Some(name.clone()),
+                        } if item_call_id == call_id => Some(match namespace {
+                            Some(namespace) => format!("{namespace}.{name}"),
+                            None => name.clone(),
+                        }),
                         _ => None,
                     })
                     .ok_or_else(|| format!("No function call found for call_id: {call_id}"))?;
@@ -823,7 +898,7 @@ impl HarmonyBuilder {
                     },
                     recipient: Some("assistant".to_string()),
                     content: vec![Content::Text(TextContent {
-                        text: output.clone(),
+                        text: output.to_text_only()?,
                     })],
                     channel: None,
                     content_type: None,
@@ -874,15 +949,18 @@ impl HarmonyBuilder {
             }
 
             ResponseInputOutputItem::McpApprovalResponse { .. }
-            | ResponseInputOutputItem::McpApprovalRequest { .. }
             | ResponseInputOutputItem::ComputerCall { .. }
-            | ResponseInputOutputItem::ComputerCallOutput { .. }
-            | ResponseInputOutputItem::McpCall { .. }
-            | ResponseInputOutputItem::McpListTools { .. } => {
+            | ResponseInputOutputItem::ComputerCallOutput { .. } => {
                 warn!(
                     function = "parse_response_item_to_harmony_message",
                     "Approval item reached Harmony conversion"
                 );
+                Err("Unsupported input item type".to_string())
+            }
+            // Left out before this conversion (see the item loop of
+            // `construct_input_messages_with_harmony`).
+            ResponseInputOutputItem::McpListTools { .. }
+            | ResponseInputOutputItem::McpApprovalRequest { .. } => {
                 Err("Unsupported input item type".to_string())
             }
 
@@ -961,7 +1039,7 @@ impl HarmonyBuilder {
 
         for msg in messages {
             match msg {
-                ChatMessage::System { content, name } => {
+                ChatMessage::System { content, name, .. } | ChatMessage::Root { content, name } => {
                     // System messages stay as-is
                     let harmony_msg = HarmonyMessage {
                         author: Author {
@@ -977,11 +1055,7 @@ impl HarmonyBuilder {
                     };
                     harmony_messages.push(harmony_msg);
                 }
-                ChatMessage::Developer {
-                    content,
-                    name,
-                    tools: _,
-                } => {
+                ChatMessage::Developer { content, name, .. } => {
                     // Developer messages stay as-is
                     let harmony_msg = HarmonyMessage {
                         author: Author {
@@ -998,7 +1072,7 @@ impl HarmonyBuilder {
                     harmony_messages.push(harmony_msg);
                 }
 
-                ChatMessage::User { content, name } => {
+                ChatMessage::User { content, name, .. } => {
                     // Extract text from user content
                     let text = match content {
                         MessageContent::Text(text) => text.clone(),
@@ -1036,6 +1110,7 @@ impl HarmonyBuilder {
                     name,
                     tool_calls,
                     reasoning_content,
+                    ..
                 } => {
                     if let Some(calls) = tool_calls.as_ref().filter(|c| !c.is_empty()) {
                         // Per Harmony spec: when tool calls are present, include
@@ -1191,6 +1266,58 @@ impl Default for HarmonyBuilder {
     }
 }
 
+/// The harmony message of a tool call the assistant issued, by the name the
+/// model called it by: its result once it ran (a Tool message under
+/// `functions.{name}`, addressed to the assistant), the call itself otherwise
+/// (a commentary message addressed to `functions.{name}`).
+fn tool_call_message(name: String, arguments: &str, output: Option<&str>) -> HarmonyMessage {
+    if let Some(output_str) = output {
+        // Tool result - use Tool role with "functions.{name}" as author name
+        // IMPORTANT: Must include recipient="assistant" for parser to recognize it.
+        // We keep channel=None to minimize what the model might copy.
+        let author_name = format!("functions.{name}");
+        debug!(
+            tool_name = %name,
+            author_name = %author_name,
+            output_preview = %output_str.chars().take(100).collect::<String>(),
+            "Building tool result message with Tool role (recipient=assistant, no channel)"
+        );
+        HarmonyMessage {
+            author: Author {
+                role: Role::Tool,
+                name: Some(author_name),
+            },
+            recipient: Some("assistant".to_string()),
+            content: vec![Content::Text(TextContent {
+                text: output_str.to_string(),
+            })],
+            channel: None,
+            content_type: None,
+        }
+    } else {
+        // Tool call - assistant message in commentary channel with recipient
+        // msg.with_channel("commentary").with_recipient(f"functions.{name}")
+        let recipient = format!("functions.{name}");
+        debug!(
+            tool_name = %name,
+            recipient = %recipient,
+            "Building tool call message with recipient"
+        );
+        HarmonyMessage {
+            author: Author {
+                role: Role::Assistant,
+                name: None,
+            },
+            recipient: Some(recipient),
+            content: vec![Content::Text(TextContent {
+                text: arguments.to_string(),
+            })],
+            channel: Some("commentary".to_string()),
+            content_type: Some("json".to_string()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Regression coverage for the `image_generation` → function-tool
@@ -1219,6 +1346,126 @@ mod tests {
     };
 
     use super::*;
+    use crate::routers::grpc::common::responses::utils::namespace_test_request;
+
+    #[test]
+    fn function_call_output_rejects_unmatched_resolved_history() {
+        for input in [
+            json!([{"type": "function_call_output", "call_id": "call_weather", "output": "sunny"}]),
+            json!([
+                {"role": "user", "content": "What is the weather?"},
+                {"type": "function_call_output", "call_id": "call_weather", "output": "sunny"}
+            ]),
+            json!([
+                {"type": "function_call", "call_id": "call_other", "name": "weather", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_weather", "output": "sunny"}
+            ]),
+        ] {
+            let request: ResponsesRequest = serde_json::from_value(json!({
+                "model": "test-model", "input": input
+            }))
+            .unwrap();
+            let error = HarmonyBuilder::new()
+                .construct_input_messages_with_harmony(&request)
+                .expect_err("An unmatched tool result must fail after history resolution");
+            assert_eq!(error, "No function call found for call_id: call_weather");
+        }
+    }
+
+    #[test]
+    fn function_call_output_uses_matching_resolved_history() {
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "input": [
+                {"role": "user", "content": "What is the weather?"},
+                {"type": "function_call", "call_id": "call_weather", "name": "weather", "arguments": "{}"},
+                {"type": "function_call", "call_id": "call_other", "name": "other", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_weather", "output": "sunny"}
+            ]
+        }))
+        .unwrap();
+        let messages = HarmonyBuilder::new()
+            .construct_input_messages_with_harmony(&request)
+            .expect("A matching tool result should convert successfully");
+        let tool = messages.last().unwrap();
+        assert_eq!(tool.author.role, Role::Tool);
+        assert_eq!(tool.author.name.as_deref(), Some("functions.weather"));
+        assert_eq!(tool.recipient.as_deref(), Some("assistant"));
+        assert!(matches!(&tool.content[..], [Content::Text(text)] if text.text == "sunny"));
+    }
+
+    /// A hosted tool call of a stored turn replays as its result under the
+    /// name the model called it by; the tools listing stored next to it is
+    /// left out.
+    #[test]
+    fn stored_hosted_tool_calls_replay_as_their_result() {
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "input": [
+                {"role": "user", "content": "search it"},
+                {"type": "mcp_list_tools", "id": "mcpl_1", "server_label": "wiki", "tools": []},
+                {"type": "mcp_call", "id": "mcp_1", "name": "search", "server_label": "wiki",
+                 "arguments": "{}", "output": "found", "status": "completed"}
+            ]
+        }))
+        .unwrap();
+        let messages = HarmonyBuilder::new()
+            .construct_input_messages_with_harmony(&request)
+            .expect("a stored hosted tool call converts");
+        let user = messages
+            .iter()
+            .position(|message| message.author.role == Role::User)
+            .expect("the user's message");
+        let tool = messages.last().unwrap();
+        assert!(user < messages.len() - 1);
+        assert_eq!(messages.len() - user, 2, "{messages:?}");
+        assert_eq!(tool.author.role, Role::Tool);
+        assert_eq!(tool.author.name.as_deref(), Some("functions.search"));
+        assert_eq!(tool.recipient.as_deref(), Some("assistant"));
+        assert!(matches!(&tool.content[..], [Content::Text(text)] if text.text == "found"));
+    }
+
+    /// A hosted tool call that failed replays as a result that says so, not
+    /// as a successful empty result.
+    #[test]
+    fn a_failed_stored_hosted_tool_call_replays_its_error_as_the_result() {
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "input": [
+                {"role": "user", "content": "search it"},
+                {"type": "mcp_call", "id": "mcp_1", "name": "search", "server_label": "wiki",
+                 "arguments": "{}", "output": "", "status": "failed",
+                 "error": {"type": "mcp_protocol_error", "code": -32000, "message": "no such tool"}}
+            ]
+        }))
+        .unwrap();
+        let messages = HarmonyBuilder::new()
+            .construct_input_messages_with_harmony(&request)
+            .expect("a failed hosted tool call converts");
+        let tool = messages.last().unwrap();
+        assert_eq!(tool.author.role, Role::Tool);
+        assert_eq!(tool.author.name.as_deref(), Some("functions.search"));
+        assert!(
+            matches!(&tool.content[..], [Content::Text(text)]
+                if text.text == "The tool call failed (protocol error -32000): no such tool"),
+            "{tool:?}"
+        );
+    }
+
+    #[test]
+    fn build_from_chat_rejects_unknown_content_parts_before_loading_encoding() {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "gpt-oss-120b",
+            "messages": [{
+                "role": "user",
+                "content": [{"type": "vendor_media", "payload": "media_1"}]
+            }]
+        }))
+        .unwrap();
+        let error = HarmonyBuilder::new().build_from_chat(&request).unwrap_err();
+        assert!(error.contains("vendor_media"));
+        assert!(error.contains("gRPC"));
+    }
 
     #[test]
     fn chat_audio_is_explicitly_rejected() {
@@ -1238,6 +1485,7 @@ mod tests {
 
         for part in audio_parts {
             let messages = vec![ChatMessage::User {
+                ext: Default::default(),
                 content: MessageContent::Parts(vec![part]),
                 name: None,
             }];
@@ -1429,6 +1677,7 @@ mod tests {
                             "required": ["prompt"]
                         }),
                         strict: None,
+                        extra: Default::default(),
                     },
                 }),
             ]),
@@ -1482,5 +1731,98 @@ mod tests {
             harmony_reasoning_effort_from_str("bogus"),
             ReasoningEffort::Medium
         );
+    }
+    #[test]
+    fn namespace_only_request_advertises_qualified_functions() {
+        let request: ResponsesRequest = namespace_test_request();
+        let output = HarmonyBuilder::new()
+            .build_from_responses(&request)
+            .unwrap();
+        let decoded = try_harmony_encoding()
+            .unwrap()
+            .tokenizer()
+            .decode_utf8(&output.input_ids)
+            .unwrap();
+        assert!(decoded.contains("type weather.lookup = ("), "{decoded}");
+        assert!(decoded.contains("type travel.lookup = ("), "{decoded}");
+    }
+
+    #[test]
+    fn chat_tools_are_read_wherever_the_request_declares_them() {
+        let tool = |name: &str| json!({"type": "function", "function": {"name": name, "parameters": {"type": "object"}}});
+        let user = json!({"role": "user", "content": "weather?"});
+        let declaring = json!({"role": "system", "content": "", "tools": [tool("get_weather")]});
+        let request = |body: serde_json::Value| -> ChatCompletionRequest {
+            serde_json::from_value(body).expect("request deserializes")
+        };
+        let cases = [
+            (
+                "request-level only",
+                request(
+                    json!({"model": "kimi-k3", "messages": [user], "tools": [tool("get_time")]}),
+                ),
+                vec!["get_time"],
+            ),
+            (
+                "message-level only",
+                request(json!({"model": "kimi-k3", "messages": [declaring, user]})),
+                vec!["get_weather"],
+            ),
+            (
+                "both",
+                request(json!({
+                    "model": "kimi-k3",
+                    "messages": [declaring, user],
+                    "tools": [tool("get_time")]
+                })),
+                vec!["get_time", "get_weather"],
+            ),
+            (
+                "a declaration the profile does not read",
+                request(json!({"model": "gpt-oss-120b", "messages": [declaring, user]})),
+                vec![],
+            ),
+        ];
+        let builder = HarmonyBuilder::new();
+        for (case, request, expected) in cases {
+            assert_eq!(request.declares_tools(), !expected.is_empty(), "{case}");
+            let tools = chat_tools(&request);
+            let names: Vec<&str> = tools
+                .iter()
+                .flatten()
+                .map(|tool| tool.function.name.as_str())
+                .collect();
+            assert_eq!(names, expected, "{case}");
+            // The system message opens the commentary channel for a request with tools.
+            let system = builder.build_system_message_from_chat(&request);
+            let commentary = system.content.iter().any(|content| match content {
+                Content::SystemContent(content) => {
+                    content.channel_config.as_ref().is_some_and(|channels| {
+                        channels.valid_channels.iter().any(|c| c == "commentary")
+                    })
+                }
+                _ => false,
+            });
+            assert_eq!(commentary, !expected.is_empty(), "{case}");
+            // The developer message describes the same tools.
+            let developer = builder.build_developer_message_from_chat(tools.as_ref());
+            assert_eq!(developer.content.len(), 1, "{case}");
+            let described: Vec<String> = developer
+                .content
+                .iter()
+                .filter_map(|content| match content {
+                    Content::DeveloperContent(content) => Some(content),
+                    _ => None,
+                })
+                .flat_map(|content| {
+                    content
+                        .tools
+                        .iter()
+                        .flat_map(|namespaces| namespaces.values())
+                })
+                .flat_map(|namespace| namespace.tools.iter().map(|tool| tool.name.clone()))
+                .collect();
+            assert_eq!(described, expected, "{case}");
+        }
     }
 }

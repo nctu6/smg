@@ -1,7 +1,7 @@
 """Anthropic Messages API tests for PD (Prefill-Decode) disaggregated routing.
 
 /v1/messages enters PD dual dispatch like chat completions: the HTTP PD
-router forwards the request to both legs with bootstrap fields injected,
+router forwards the request to both sides with bootstrap fields injected,
 and the gRPC PD router runs the mode-parameterized Messages pipeline. Every
 create below exercises prefill/decode pair selection and dual dispatch.
 
@@ -86,7 +86,7 @@ class MessagesOverPD:
 
 @pytest.mark.skip(
     reason="SGLang's /v1/messages does not carry PD bootstrap fields through "
-    "to the scheduler yet: the decode leg rejects with 'Disaggregated request "
+    "to the scheduler yet: the decode side rejects with 'Disaggregated request "
     "received without bootstrap room id'. Unskip when the engine forwards them."
 )
 @pytest.mark.engine("sglang")
@@ -99,9 +99,9 @@ class TestPDMessagesHttp(MessagesOverPD):
     """Messages API through the HTTP PD router's dual dispatch."""
 
 
-@pytest.mark.engine("sglang", "vllm")
+@pytest.mark.engine("sglang", "vllm", "tokenspeed")
 @pytest.mark.gpu(2)
-@pytest.mark.model("meta-llama/Llama-3.1-8B-Instruct")
+@pytest.mark.model("meta-llama/Llama-3.1-8B-Instruct", tokenspeed="Qwen/Qwen3.5-9B")
 @pytest.mark.e2e
 @pytest.mark.parametrize("setup_backend", ["pd_grpc"], indirect=True)
 class TestPDMessagesGrpc(MessagesOverPD):

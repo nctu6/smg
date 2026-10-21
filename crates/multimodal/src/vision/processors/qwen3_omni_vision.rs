@@ -10,6 +10,7 @@ use image::DynamicImage;
 
 use super::qwen_vl_base::{QwenVLConfig, QwenVLProcessorBase, QwenVideoResizeMode};
 use crate::{
+    encoder_inputs::EncoderDtype,
     types::RgbFrameRef,
     vision::{
         preprocessor_config::PreProcessorConfig,
@@ -136,6 +137,10 @@ impl Qwen3OmniVisionProcessor {
 }
 
 impl VisionPreProcessor for Qwen3OmniVisionProcessor {
+    fn emits_pixel_bytes(&self) -> bool {
+        true
+    }
+
     fn default_mean(&self) -> [f64; 3] {
         self.inner.default_mean()
     }
@@ -152,6 +157,17 @@ impl VisionPreProcessor for Qwen3OmniVisionProcessor {
         self.with_image_preprocessor_config(config)
             .inner
             .preprocess(images, config)
+    }
+
+    fn preprocess_wire(
+        &self,
+        images: &[DynamicImage],
+        config: &PreProcessorConfig,
+        dtype: EncoderDtype,
+    ) -> Option<Result<PreprocessedEncoderInputs, TransformError>> {
+        self.with_image_preprocessor_config(config)
+            .inner
+            .preprocess_wire(images, config, dtype)
     }
 
     fn preprocess_video(
@@ -174,7 +190,12 @@ impl VisionPreProcessor for Qwen3OmniVisionProcessor {
             .preprocess_video_rgb(frames, config)
     }
 
-    fn calculate_num_tokens(&self, width: u32, height: u32, config: &PreProcessorConfig) -> usize {
+    fn calculate_num_tokens(
+        &self,
+        width: u32,
+        height: u32,
+        config: &PreProcessorConfig,
+    ) -> Result<usize, TransformError> {
         self.with_image_preprocessor_config(config)
             .inner
             .calculate_num_tokens(width, height, config)
@@ -267,6 +288,7 @@ mod tests {
 
         assert!(output
             .encoder_input
+            .as_f32()
             .iter()
             .all(|value| (*value + 1.0).abs() < 1e-6));
     }

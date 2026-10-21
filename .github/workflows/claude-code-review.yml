@@ -39,19 +39,10 @@ jobs:
           fetch-depth: 0
 
       - name: Export API key from pod env
-        run: |
-          echo "::add-mask::${ANTHROPIC_API_KEY}"
-          echo "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}" >> "$GITHUB_ENV"
+        uses: ./.github/actions/export-pod-api-key
 
       - name: Install gh CLI
-        run: |
-          if ! command -v gh &>/dev/null; then
-            mkdir -p "$HOME/.local/bin"
-            GH_VERSION="2.74.0"
-            curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz" \
-              | tar xz --strip-components=2 -C "$HOME/.local/bin" "gh_${GH_VERSION}_linux_amd64/bin/gh"
-            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          fi
+        uses: ./.github/actions/setup-gh
 
       - name: Record run start time
         id: run-start
@@ -191,7 +182,7 @@ jobs:
                Do NOT approve on "synchronize" (incremental) reviews — only
                full reviews have enough context to approve.
           claude_args: |
-            --model claude-opus-5
+            --model claude-opus-5-5
             --effort xhigh
             --max-turns 50
             --allowedTools "Read,Glob,Grep,Bash,Agent,Skill,ToolSearch,TaskCreate,TaskUpdate,TaskGet,mcp__github_inline_comment__create_inline_comment"
@@ -315,25 +306,16 @@ jobs:
           fetch-depth: 0
 
       - name: Export API key from pod env
-        run: |
-          echo "::add-mask::${ANTHROPIC_API_KEY}"
-          echo "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}" >> "$GITHUB_ENV"
+        uses: ./.github/actions/export-pod-api-key
 
       - name: Install gh CLI
-        run: |
-          if ! command -v gh &>/dev/null; then
-            mkdir -p "$HOME/.local/bin"
-            GH_VERSION="2.74.0"
-            curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz" \
-              | tar xz --strip-components=2 -C "$HOME/.local/bin" "gh_${GH_VERSION}_linux_amd64/bin/gh"
-            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          fi
+        uses: ./.github/actions/setup-gh
 
       - uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ env.ANTHROPIC_API_KEY }}
           claude_args: |
-            --model claude-opus-5
+            --model claude-opus-5-5
             --max-turns 30
             --allowedTools "Read,Glob,Grep,Bash,Agent,Skill,ToolSearch,TaskCreate,TaskUpdate,TaskGet,mcp__github_inline_comment__create_inline_comment"
           plugins: |

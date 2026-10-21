@@ -1,4 +1,9 @@
 // tests/common/mock_mcp_server.rs - Mock MCP server for testing
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
+
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::*,
@@ -96,6 +101,7 @@ impl Drop for MockServerHarness {
 /// Mock MCP server that returns hardcoded responses for testing
 pub struct MockMCPServer {
     harness: MockServerHarness,
+    calls: Arc<AtomicUsize>,
 }
 
 /// Mock MCP server that always fails tool execution with a caller-provided marker.
@@ -111,6 +117,7 @@ pub struct MockSearchResponseMCPServer {
 /// Simple test server with mock search tools
 #[derive(Clone)]
 pub struct MockSearchServer {
+    calls: Arc<AtomicUsize>,
     tool_router: ToolRouter<MockSearchServer>,
 }
 
@@ -167,6 +174,7 @@ impl MockSearchResponseServer {
 impl MockSearchServer {
     pub fn new() -> Self {
         Self {
+            calls: Arc::default(),
             tool_router: Self::tool_router(),
         }
     }
@@ -176,6 +184,7 @@ impl MockSearchServer {
         &self,
         Parameters(params): Parameters<serde_json::Map<String, serde_json::Value>>,
     ) -> Result<CallToolResult, McpError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
         let query = params
             .get("query")
             .and_then(|v| v.as_str())
@@ -190,6 +199,7 @@ impl MockSearchServer {
         &self,
         Parameters(_params): Parameters<serde_json::Map<String, serde_json::Value>>,
     ) -> Result<CallToolResult, McpError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(CallToolResult::success(vec![Content::text(
             "Mock local search results",
         )]))
@@ -278,9 +288,14 @@ impl ServerHandler for MockSearchServer {
 }
 
 impl MockMCPServer {
-    fn router() -> axum::Router {
+    fn router(calls: Arc<AtomicUsize>) -> axum::Router {
         let service = StreamableHttpService::new(
-            || Ok(MockSearchServer::new()),
+            move || {
+                Ok(MockSearchServer {
+                    calls: calls.clone(),
+                    ..MockSearchServer::new()
+                })
+            },
             LocalSessionManager::default().into(),
             Default::default(),
         );
@@ -290,9 +305,15 @@ impl MockMCPServer {
 
     /// Start a mock MCP server on an available port
     pub async fn start() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let calls = Arc::default();
         Ok(Self {
-            harness: MockServerHarness::start(Self::router()).await?,
+            harness: MockServerHarness::start(Self::router(Arc::clone(&calls))).await?,
+            calls,
         })
+    }
+
+    pub fn call_count(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
     }
 
     pub fn port(&self) -> u16 {
@@ -429,7 +450,19 @@ impl MockSearchResponseMCPServer {
 
 #[cfg(test)]
 mod tests {
+    use rmcp::transport::{
+        streamable_http_client::StreamableHttpClientTransportConfig, StreamableHttpClientTransport,
+    };
+
     use super::{MockFailingMCPServer, MockMCPServer};
+
+    /// A client transport to `url` over the test binary's HTTP client.
+    fn client_transport(url: &str) -> StreamableHttpClientTransport<reqwest::Client> {
+        StreamableHttpClientTransport::with_client(
+            smg::clients::http_client(),
+            StreamableHttpClientTransportConfig::with_uri(url),
+        )
+    }
 
     #[tokio::test]
     async fn test_mock_server_startup() {
@@ -443,9 +476,9 @@ mod tests {
     async fn test_mock_server_with_rmcp_client() {
         let mut server = MockMCPServer::start().await.unwrap();
 
-        use rmcp::{transport::StreamableHttpClientTransport, ServiceExt};
+        use rmcp::ServiceExt;
 
-        let transport = StreamableHttpClientTransport::from_uri(server.url().as_str());
+        let transport = client_transport(server.url().as_str());
         let client = ().serve(transport).await;
 
         assert!(client.is_ok(), "Should be able to connect to mock server");
@@ -469,15 +502,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_mock_failing_server_startup() {
-        use rmcp::{
-            model::CallToolRequestParams, transport::StreamableHttpClientTransport, ServiceExt,
-        };
+        use rmcp::{model::CallToolRequestParams, ServiceExt};
 
         let mut server = MockFailingMCPServer::start("marker").await.unwrap();
         assert!(server.port() > 0);
         assert!(server.url().contains(&server.port().to_string()));
 
-        let transport = StreamableHttpClientTransport::from_uri(server.url().as_str());
+        let transport = client_transport(server.url().as_str());
         let client = ().serve(transport).await.expect("connect failing mock server");
 
         let err = client

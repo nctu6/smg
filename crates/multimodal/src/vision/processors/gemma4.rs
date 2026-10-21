@@ -1,279 +1,431 @@
-//! Gemma 4 image / video preprocessor (Gemma4ImageProcessor parity).
+//! Gemma 4 image and video preprocessing.
 //!
-//! Aspect-ratio-preserving resize into a patch budget of
-//! ``max_soft_tokens * pooling_kernel^2``, patchify to ``patch_size`` squares,
-//! pad to ``max_patches``. Emits ``pixel_values`` as ``[N, max_patches, P]``
-//! (P = patch_size^2 * 3) plus ``image_position_ids`` and per-image soft-token
-//! counts.
+//! Port of transformers' `Gemma4ImageProcessor` (its torchvision backend, the
+//! one the serving engine runs) in the form the engine's Gemma 4 model consumes: per image a
+//! flat `(max_patches, patch_pixels)` tensor of `patch_size` x `patch_size`
+//! RGB patches in row-major order, zero-padded to `max_patches =
+//! max_soft_tokens * pooling_kernel_size^2`, and per patch its `(x, y)` grid
+//! coordinates, `-1` for the padding (`pixel_position_ids` on the engine
+//! side). The image is resized with its aspect ratio kept to the largest size
+//! whose sides are multiples of `pooling_kernel_size * patch_size` within the
+//! patch budget (the reference `get_aspect_ratio_preserving_size`), rescaled
+//! by `rescale_factor` and not normalized (the encoder standardizes on device).
+//! The vision tower pools every `pooling_kernel_size`^2 block of patches into
+//! one soft token, so an image costs `num_patches / pooling_kernel_size^2`
+//! tokens: 280 at most with the default budget, 256 for a square image.
 //!
-//! Optional pan-and-scan (gemma3-style crops, gated by ``do_pan_and_scan``)
-//! expands one logical image into original + crops, each patchified at the
-//! image soft-token budget. Video frames use ``max_soft_tokens=70`` and carry
-//! per-frame timestamps for prompt expansion.
+//! Video has no processor of its own in the engine: it runs the image
+//! processor over the sampled frames with the video budget (70 soft tokens per
+//! frame by default), so a clip is encoded here as its frames stacked along
+//! the first dimension, with `video_frame_counts` saying how many belong to
+//! each clip.
+
+use std::borrow::Cow;
 
 use image::{imageops::FilterType, DynamicImage, GenericImageView};
-use ndarray::{Array2, Array3};
+use ndarray::Array3;
 
 use crate::{
     encoder_inputs::ModelSpecificValue,
+    types::RgbFrameRef,
     vision::{
         preprocessor_config::PreProcessorConfig,
         processor::{PreprocessedEncoderInputs, VisionPreProcessor},
-        processors::gemma3::Gemma3Processor,
-        transforms::{pil_to_filter, resize, TransformError},
+        transforms::{
+            pil_to_filter, resize_bicubic_torch_aa_rgb, resize_rgb_bytes, rgb_bytes, TransformError,
+        },
     },
 };
 
-const DEFAULT_PATCH: u32 = 16;
-const DEFAULT_SOFT: usize = 280;
-const DEFAULT_POOL: u32 = 3;
-const VIDEO_MAX_SOFT_TOKENS: usize = 70;
-const VIDEO_MAX_FRAMES: usize = 32;
-const SUPPORTED_SOFT: [usize; 5] = [70, 140, 280, 560, 1120];
+const DEFAULT_PATCH_SIZE: usize = 16;
+const DEFAULT_POOLING_KERNEL_SIZE: usize = 3;
+const DEFAULT_IMAGE_SOFT_TOKENS: usize = 280;
+/// The per-frame budget the engine applies to video, the reference video
+/// processor's default; the engine does not read it from the config.
+const DEFAULT_VIDEO_SOFT_TOKENS: usize = 70;
+/// The budgets the reference processor accepts (`_SUPPORTED_SOFT_TOKENS`).
+const SUPPORTED_SOFT_TOKENS: [usize; 5] = [70, 140, 280, 560, 1120];
+const CHANNELS: usize = 3;
 
-#[derive(Debug, Clone)]
-pub struct Gemma4Processor {
-    pub patch_size: u32,
-    pub max_soft_tokens: usize,
-    pub pooling_kernel_size: u32,
+/// The geometry a config pins: patch size, pooling kernel and token budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Params {
+    patch: usize,
+    pool: usize,
+    max_soft_tokens: usize,
 }
 
-impl Default for Gemma4Processor {
-    fn default() -> Self {
-        Self::new()
+impl Params {
+    fn from_config(config: &PreProcessorConfig, video: bool) -> Result<Self, TransformError> {
+        let patch = config.get_patch_size(DEFAULT_PATCH_SIZE);
+        let pool = extra_usize(config, "pooling_kernel_size", DEFAULT_POOLING_KERNEL_SIZE)?;
+        // The engine feeds frames to the image processor at the video processor's
+        // default budget whatever the configs say; the video processor's own
+        // config is honoured when it is the one handed in (its budget is that
+        // default on the released checkpoints), the image config's budget is
+        // not applied to frames.
+        let max_soft_tokens = if video && !config.extra.contains_key("video_processor_type") {
+            DEFAULT_VIDEO_SOFT_TOKENS
+        } else {
+            let default = if video {
+                DEFAULT_VIDEO_SOFT_TOKENS
+            } else {
+                DEFAULT_IMAGE_SOFT_TOKENS
+            };
+            extra_usize(config, "max_soft_tokens", default)?
+        };
+        if patch == 0 || pool == 0 {
+            return Err(shape(
+                "Gemma 4 patch_size and pooling_kernel_size must be positive",
+            ));
+        }
+        if !SUPPORTED_SOFT_TOKENS.contains(&max_soft_tokens) {
+            return Err(shape(format!(
+                "Gemma 4 max_soft_tokens must be one of {SUPPORTED_SOFT_TOKENS:?}, got {max_soft_tokens}"
+            )));
+        }
+        Ok(Self {
+            patch,
+            pool,
+            max_soft_tokens,
+        })
+    }
+
+    fn max_patches(self) -> usize {
+        self.max_soft_tokens * self.pool * self.pool
+    }
+
+    /// The multiple each resized side is rounded down to.
+    fn side_mult(self) -> usize {
+        self.pool * self.patch
+    }
+
+    fn patch_pixels(self) -> usize {
+        CHANNELS * self.patch * self.patch
+    }
+
+    /// The reference `get_aspect_ratio_preserving_size`: the `(height, width)`
+    /// an image of this size is resized to. The largest size that keeps the
+    /// aspect ratio, fits `max_patches` patches and has both sides divisible
+    /// by `pooling_kernel_size * patch_size`; a side that rounds to nothing
+    /// becomes one block and the other side the aspect ratio's worth, within
+    /// the budget.
+    fn target_size(self, height: usize, width: usize) -> Result<(usize, usize), TransformError> {
+        if height == 0 || width == 0 {
+            return Err(shape(format!(
+                "Gemma 4 cannot resize an empty {width}x{height} image"
+            )));
+        }
+        let side = self.side_mult();
+        let target_px = (self.max_patches() * self.patch * self.patch) as f64;
+        let factor = (target_px / (height * width) as f64).sqrt();
+        let round_down = |ideal: f64| (ideal / side as f64).floor() as usize * side;
+        let mut target_h = round_down(factor * height as f64);
+        let mut target_w = round_down(factor * width as f64);
+        if target_h == 0 && target_w == 0 {
+            return Err(shape(format!(
+                "Gemma 4 cannot resize {width}x{height} to a multiple of {side} pixels"
+            )));
+        }
+        let max_side = (self.max_patches() / (self.pool * self.pool)) * side;
+        if target_h == 0 {
+            target_h = side;
+            target_w = ((width / height) * side).min(max_side);
+        } else if target_w == 0 {
+            target_w = side;
+            target_h = ((height / width) * side).min(max_side);
+        }
+        if (target_h * target_w) as f64 > target_px {
+            return Err(shape(format!(
+                "Gemma 4 resize of {width}x{height} to {target_w}x{target_h} exceeds {} patches",
+                self.max_patches()
+            )));
+        }
+        Ok((target_h, target_w))
+    }
+
+    /// Soft tokens for a resized `(height, width)`: the pooled patch grid.
+    fn soft_tokens(self, target: (usize, usize)) -> usize {
+        (target.0 / self.patch) * (target.1 / self.patch) / (self.pool * self.pool)
     }
 }
+
+/// The pixel transform as a per-channel table: `rescale_factor` times the
+/// byte, and the fused normalization of the reference when it is not the
+/// identity. An identity normalization (mean 0, std 1) is skipped: the
+/// engine's image processor never normalizes, and `x * rescale` is its
+/// arithmetic where `(x - 0) / (1 / rescale)` could differ in the last bit.
+fn pixel_lut(config: &PreProcessorConfig) -> Result<[[f32; 256]; 3], TransformError> {
+    let rescale = if config.do_rescale.unwrap_or(true) {
+        config.rescale_factor.unwrap_or(1.0 / 255.0)
+    } else {
+        1.0
+    };
+    let mean = config.image_mean.clone().unwrap_or_else(|| vec![0.0; 3]);
+    let std = config.image_std.clone().unwrap_or_else(|| vec![1.0; 3]);
+    let identity = mean.iter().all(|value| *value == 0.0) && std.iter().all(|value| *value == 1.0);
+    let normalize = config.do_normalize.unwrap_or(false) && !identity;
+    if mean.len() < CHANNELS || std.len() < CHANNELS {
+        return Err(shape(
+            "Gemma 4 image_mean and image_std need three channels",
+        ));
+    }
+    if !rescale.is_finite()
+        || (normalize
+            && (mean.iter().any(|value| !value.is_finite())
+                || std.iter().any(|value| !value.is_finite() || *value == 0.0)))
+    {
+        return Err(shape(
+            "invalid Gemma 4 pixel rescale or normalization values",
+        ));
+    }
+    let lut = std::array::from_fn(|channel| {
+        if normalize {
+            // The reference fuses the rescale into the normalization:
+            // `(x - mean / rescale) / (std / rescale)`, in float32.
+            let fused_mean = mean[channel] as f32 * (1.0 / rescale) as f32;
+            let fused_std = std[channel] as f32 * (1.0 / rescale) as f32;
+            std::array::from_fn(|value| (value as f32 - fused_mean) / fused_std)
+        } else {
+            let scale = rescale as f32;
+            std::array::from_fn(|value| value as f32 * scale)
+        }
+    });
+    lut.iter()
+        .flatten()
+        .all(|value| value.is_finite())
+        .then_some(lut)
+        .ok_or_else(|| shape("Gemma 4 pixel transform overflow"))
+}
+
+trait RgbSource {
+    fn dimensions(&self) -> (u32, u32);
+    fn rgb(&self) -> Result<Cow<'_, [u8]>, TransformError>;
+}
+
+impl RgbSource for DynamicImage {
+    fn dimensions(&self) -> (u32, u32) {
+        GenericImageView::dimensions(self)
+    }
+
+    fn rgb(&self) -> Result<Cow<'_, [u8]>, TransformError> {
+        let (_, _, data) = rgb_bytes(self);
+        Ok(data)
+    }
+}
+
+impl RgbSource for RgbFrameRef<'_> {
+    fn dimensions(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
+    fn rgb(&self) -> Result<Cow<'_, [u8]>, TransformError> {
+        let expected = (self.width as usize)
+            .saturating_mul(self.height as usize)
+            .saturating_mul(CHANNELS);
+        if self.data.len() != expected {
+            return Err(shape(format!(
+                "Gemma 4 RGB frame has {} bytes, expected {expected} for {}x{}",
+                self.data.len(),
+                self.width,
+                self.height
+            )));
+        }
+        Ok(Cow::Borrowed(self.data))
+    }
+}
+
+/// One encoded image or frame: `max_patches * patch_pixels` values,
+/// `max_patches * 2` positions and the soft-token count.
+struct Encoded {
+    values: Vec<f32>,
+    positions: Vec<i64>,
+    tokens: usize,
+}
+
+/// The resized, patchified and padded form of one image or frame.
+fn encode<F: RgbSource>(
+    frame: &F,
+    params: Params,
+    config: &PreProcessorConfig,
+    lut: &[[f32; 256]; 3],
+) -> Result<Encoded, TransformError> {
+    let (source_w, source_h) = frame.dimensions();
+    let (source_w, source_h) = (source_w as usize, source_h as usize);
+    let raw = frame.rgb()?;
+    let (height, width) = if config.do_resize.unwrap_or(true) {
+        params.target_size(source_h, source_w)?
+    } else {
+        (source_h, source_w)
+    };
+    let side = params.side_mult();
+    if height == 0 || width == 0 || !height.is_multiple_of(side) || !width.is_multiple_of(side) {
+        return Err(shape(format!(
+            "Gemma 4 input {width}x{height} is not a multiple of {side} pixels"
+        )));
+    }
+    let (grid_h, grid_w) = (height / params.patch, width / params.patch);
+    let num_patches = grid_h * grid_w;
+    if num_patches > params.max_patches() {
+        return Err(shape(format!(
+            "Gemma 4 input {width}x{height} has {num_patches} patches, above the budget of {}",
+            params.max_patches()
+        )));
+    }
+    let pixels: Cow<'_, [u8]> = if (height, width) == (source_h, source_w) {
+        raw
+    } else {
+        let filter = pil_to_filter(config.resampling.or(Some(3)));
+        let resized = if filter == FilterType::CatmullRom {
+            resize_bicubic_torch_aa_rgb(
+                raw.as_ref(),
+                source_w as u32,
+                source_h as u32,
+                width as u32,
+                height as u32,
+            )?
+        } else {
+            resize_rgb_bytes(
+                raw.as_ref(),
+                source_w as u32,
+                source_h as u32,
+                width as u32,
+                height as u32,
+                filter,
+            )?
+        };
+        Cow::Owned(resized.into_raw())
+    };
+
+    let patch_pixels = params.patch_pixels();
+    let mut values = vec![0.0_f32; params.max_patches() * patch_pixels];
+    let row_bytes = width * CHANNELS;
+    for patch_y in 0..grid_h {
+        for patch_x in 0..grid_w {
+            // Patch elements run `[dy][dx][channel]`, the interleaved layout
+            // of the source rows (the reference's `(ph, pw, p, p, c)` view).
+            let patch = &mut values[(patch_y * grid_w + patch_x) * patch_pixels..][..patch_pixels];
+            for dy in 0..params.patch {
+                let source =
+                    (patch_y * params.patch + dy) * row_bytes + patch_x * params.patch * CHANNELS;
+                let row = &pixels[source..source + params.patch * CHANNELS];
+                let out = &mut patch[dy * params.patch * CHANNELS..][..params.patch * CHANNELS];
+                for (out, (value, lut)) in out.iter_mut().zip(row.iter().zip(lut.iter().cycle())) {
+                    *out = lut[*value as usize];
+                }
+            }
+        }
+    }
+    // `(x, y)` per patch in reading order, `-1` for the padding.
+    let mut positions = vec![-1_i64; params.max_patches() * 2];
+    for (index, position) in positions[..num_patches * 2]
+        .as_chunks_mut::<2>()
+        .0
+        .iter_mut()
+        .enumerate()
+    {
+        position[0] = (index % grid_w) as i64;
+        position[1] = (index / grid_w) as i64;
+    }
+    Ok(Encoded {
+        values,
+        positions,
+        tokens: num_patches / (params.pool * params.pool),
+    })
+}
+
+/// Stack encoded items along the first dimension.
+fn stack(
+    encoded: Vec<Encoded>,
+    params: Params,
+) -> Result<(Array3<f32>, ModelSpecificValue, Vec<usize>), TransformError> {
+    let count = encoded.len();
+    let (max_patches, patch_pixels) = (params.max_patches(), params.patch_pixels());
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(count * max_patches * patch_pixels)
+        .map_err(|error| shape(format!("cannot reserve Gemma 4 patch output: {error}")))?;
+    let mut positions = Vec::with_capacity(count * max_patches * 2);
+    let mut tokens = Vec::with_capacity(count);
+    for item in encoded {
+        values.extend_from_slice(&item.values);
+        positions.extend_from_slice(&item.positions);
+        tokens.push(item.tokens);
+    }
+    let tensor = Array3::from_shape_vec((count, max_patches, patch_pixels), values)
+        .map_err(|error| shape(format!("failed to build Gemma 4 patches: {error}")))?;
+    let positions = ModelSpecificValue::IntTensor {
+        data: positions,
+        shape: vec![count, max_patches, 2],
+    };
+    Ok((tensor, positions, tokens))
+}
+
+fn preprocess_video_frames<F: RgbSource>(
+    frames: &[F],
+    config: &PreProcessorConfig,
+) -> Result<PreprocessedEncoderInputs, TransformError> {
+    let first = frames.first().ok_or(TransformError::EmptyBatch)?;
+    let (width, height) = first.dimensions();
+    if frames
+        .iter()
+        .any(|frame| frame.dimensions() != (width, height))
+    {
+        return Err(shape("Gemma 4 video frames must have identical dimensions"));
+    }
+    let params = Params::from_config(config, true)?;
+    let lut = pixel_lut(config)?;
+    let encoded = frames
+        .iter()
+        .map(|frame| encode(frame, params, config, &lut))
+        .collect::<Result<Vec<_>, _>>()?;
+    let (tensor, positions, tokens) = stack(encoded, params)?;
+    Ok(
+        PreprocessedEncoderInputs::new(tensor, vec![tokens.iter().sum()], vec![(width, height)])
+            .with_extra("pixel_position_ids_videos", positions)
+            .with_extra(
+                "video_frame_counts",
+                ModelSpecificValue::int_1d(vec![frames.len() as i64]),
+            ),
+    )
+}
+
+/// A `usize` extra key under [`PreProcessorConfig::extra_usize`]'s rule, absent -> `default`.
+fn extra_usize(
+    config: &PreProcessorConfig,
+    key: &str,
+    default: usize,
+) -> Result<usize, TransformError> {
+    config
+        .extra_usize(key)
+        .map(|value| value.unwrap_or(default))
+        .map_err(|value| {
+            shape(format!(
+                "Gemma 4 preprocessor key {key} must be a non-negative integer, got {value}"
+            ))
+        })
+}
+
+fn shape(message: impl Into<String>) -> TransformError {
+    TransformError::ShapeError(message.into())
+}
+
+/// Gemma 4 image and video preprocessor.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Gemma4Processor;
 
 impl Gemma4Processor {
     pub fn new() -> Self {
-        Self {
-            patch_size: DEFAULT_PATCH,
-            max_soft_tokens: DEFAULT_SOFT,
-            pooling_kernel_size: DEFAULT_POOL,
-        }
-    }
-
-    fn max_patches_for(&self, soft: usize) -> usize {
-        soft * (self.pooling_kernel_size as usize).pow(2)
-    }
-
-    fn max_patches(&self) -> usize {
-        self.max_patches_for(self.max_soft_tokens)
-    }
-
-    fn soft_budget(config: &PreProcessorConfig, default: usize) -> usize {
-        let raw = config
-            .extra
-            .get("max_soft_tokens")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as usize)
-            .unwrap_or(default);
-        if SUPPORTED_SOFT.contains(&raw) {
-            raw
-        } else {
-            default
-        }
-    }
-
-    fn pas_enabled(config: &PreProcessorConfig) -> bool {
-        config
-            .extra
-            .get("do_pan_and_scan")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-    }
-
-    fn pas_params(config: &PreProcessorConfig) -> (u32, u32, f64) {
-        let min_crop = config
-            .extra
-            .get("pan_and_scan_min_crop_size")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as u32)
-            .unwrap_or(256);
-        let max_crops = config
-            .extra
-            .get("pan_and_scan_max_num_crops")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as u32)
-            .unwrap_or(4);
-        let min_ratio = config
-            .extra
-            .get("pan_and_scan_min_ratio_to_activate")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(1.2);
-        (min_crop, max_crops, min_ratio)
-    }
-
-    /// Resize so the patch grid fits in ``max_patches`` and is divisible by
-    /// ``pooling_kernel_size`` (HF ``aspect_ratio_preserving_resize``).
-    fn resize_for_budget(
-        &self,
-        image: &DynamicImage,
-        filter: FilterType,
-        soft_budget: usize,
-    ) -> DynamicImage {
-        let (w, h) = image.dimensions();
-        if w == 0 || h == 0 {
-            return image.clone();
-        }
-        let patch = self.patch_size as f64;
-        let pool = self.pooling_kernel_size as f64;
-        let max_patches = self.max_patches_for(soft_budget) as f64;
-        let aspect = w as f64 / h as f64;
-        let soft = soft_budget as f64;
-        let mut soft_w = (soft * aspect).sqrt().floor().max(1.0);
-        let soft_h = (soft / soft_w).floor().max(1.0);
-        if soft_w * soft_h > soft {
-            soft_w = (soft / soft_h).floor().max(1.0);
-        }
-        let target_w = ((soft_w * pool) * patch).round().max(patch) as u32;
-        let target_h = ((soft_h * pool) * patch).round().max(patch) as u32;
-        let step = self.patch_size * self.pooling_kernel_size;
-        let tw = ((target_w + step - 1) / step) * step;
-        let th = ((target_h + step - 1) / step) * step;
-        let tw = tw
-            .min((max_patches.sqrt() * patch).ceil() as u32 * 4)
-            .max(step);
-        let th = th
-            .min((max_patches.sqrt() * patch).ceil() as u32 * 4)
-            .max(step);
-        resize(image, tw, th, filter)
-    }
-
-    fn patchify(&self, image: &DynamicImage) -> (Array2<f32>, Array2<i64>, usize) {
-        let rgb = image.to_rgb8();
-        let (w, h) = rgb.dimensions();
-        let ps = self.patch_size;
-        let ph = h / ps;
-        let pw = w / ps;
-        let patch_dim = (ps * ps * 3) as usize;
-        let n = (ph * pw) as usize;
-        let mut patches = Array2::<f32>::zeros((n, patch_dim));
-        let mut positions = Array2::<i64>::zeros((n, 2));
-        let mut idx = 0usize;
-        for y in 0..ph {
-            for x in 0..pw {
-                let mut p = 0usize;
-                for py in 0..ps {
-                    for px in 0..ps {
-                        let pixel = rgb.get_pixel(x * ps + px, y * ps + py);
-                        patches[[idx, p]] = pixel[0] as f32 / 255.0;
-                        patches[[idx, p + 1]] = pixel[1] as f32 / 255.0;
-                        patches[[idx, p + 2]] = pixel[2] as f32 / 255.0;
-                        p += 3;
-                    }
-                }
-                positions[[idx, 0]] = x as i64;
-                positions[[idx, 1]] = y as i64;
-                idx += 1;
-            }
-        }
-        let soft = n / (self.pooling_kernel_size as usize).pow(2);
-        (patches, positions, soft)
-    }
-
-    fn patchify_into(
-        &self,
-        image: &DynamicImage,
-        filter: FilterType,
-        soft_budget: usize,
-        do_resize: bool,
-        batch: &mut Array3<f32>,
-        pos_batch: &mut Array3<i64>,
-        row: usize,
-    ) -> usize {
-        let resized = if do_resize {
-            self.resize_for_budget(image, filter, soft_budget)
-        } else {
-            image.clone()
-        };
-        let (patches, positions, soft) = self.patchify(&resized);
-        let max_patches = batch.shape()[1];
-        let patch_dim = batch.shape()[2];
-        let n = patches.nrows().min(max_patches);
-        for r in 0..n {
-            for c in 0..patch_dim {
-                batch[[row, r, c]] = patches[[r, c]];
-            }
-            pos_batch[[row, r, 0]] = positions[[r, 0]];
-            pos_batch[[row, r, 1]] = positions[[r, 1]];
-        }
-        soft.max(1).min(soft_budget)
-    }
-
-    fn build_batch(
-        &self,
-        views: &[DynamicImage],
-        config: &PreProcessorConfig,
-        soft_budget: usize,
-        item_sizes: Vec<(u32, u32)>,
-        num_patches: Vec<i64>,
-        num_crops: Vec<i64>,
-        timestamps: Option<Vec<f32>>,
-    ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        if views.is_empty() {
-            return Err(TransformError::EmptyBatch);
-        }
-        let filter = pil_to_filter(config.resampling);
-        let max_patches = self.max_patches_for(soft_budget);
-        let patch_dim = (self.patch_size * self.patch_size * 3) as usize;
-        let mut batch = Array3::<f32>::zeros((views.len(), max_patches, patch_dim));
-        let mut pos_batch = Array3::<i64>::zeros((views.len(), max_patches, 2));
-        pos_batch.fill(-1);
-        let mut feature_token_counts = Vec::with_capacity(num_patches.len());
-        let do_resize = config.do_resize.unwrap_or(true);
-
-        let mut view_idx = 0usize;
-        for &patches in &num_patches {
-            let p = patches.max(1) as usize;
-            let mut soft_sum = 0usize;
-            for _ in 0..p {
-                let soft = self.patchify_into(
-                    &views[view_idx],
-                    filter,
-                    soft_budget,
-                    do_resize,
-                    &mut batch,
-                    &mut pos_batch,
-                    view_idx,
-                );
-                soft_sum += soft;
-                view_idx += 1;
-            }
-            feature_token_counts.push(soft_sum.max(1));
-        }
-
-        let mut out = PreprocessedEncoderInputs::new(batch, feature_token_counts, item_sizes);
-        out.model_specific.insert(
-            "image_position_ids".to_string(),
-            ModelSpecificValue::IntTensor {
-                data: pos_batch.iter().copied().collect(),
-                shape: vec![views.len(), max_patches, 2],
-            },
-        );
-        out.model_specific.insert(
-            "num_patches".to_string(),
-            ModelSpecificValue::IntVec(num_patches),
-        );
-        out.model_specific.insert(
-            "pan_and_scan_num_crops".to_string(),
-            ModelSpecificValue::IntVec(num_crops),
-        );
-        if let Some(ts) = timestamps {
-            out.model_specific.insert(
-                "video_timestamps".to_string(),
-                ModelSpecificValue::FloatVec(ts),
-            );
-            out.model_specific.insert(
-                "video_max_soft_tokens".to_string(),
-                ModelSpecificValue::Int(VIDEO_MAX_SOFT_TOKENS as i64),
-            );
-        }
-        Ok(out)
+        Self
     }
 }
 
 impl VisionPreProcessor for Gemma4Processor {
+    /// Each image is resized, patchified and padded on its own.
+    fn supports_per_image_preprocessing(&self) -> bool {
+        true
+    }
+
     fn default_mean(&self) -> [f64; 3] {
         [0.0, 0.0, 0.0]
     }
@@ -290,37 +442,16 @@ impl VisionPreProcessor for Gemma4Processor {
         if images.is_empty() {
             return Err(TransformError::EmptyBatch);
         }
-        let soft_budget = Self::soft_budget(config, self.max_soft_tokens);
-        let do_pas = Self::pas_enabled(config);
-        let (min_crop, max_crops, min_ratio) = Self::pas_params(config);
-
-        let item_sizes: Vec<(u32, u32)> = images.iter().map(|i| i.dimensions()).collect();
-        let mut views: Vec<DynamicImage> = Vec::new();
-        let mut num_patches = Vec::with_capacity(images.len());
-        let mut num_crops = Vec::with_capacity(images.len());
-
-        for image in images {
-            let crops = if do_pas {
-                Gemma3Processor::pan_and_scan_crops(image, min_crop, max_crops, min_ratio)
-            } else {
-                Vec::new()
-            };
-            let n_crops = crops.len();
-            views.push(image.clone());
-            views.extend(crops);
-            num_patches.push((1 + n_crops) as i64);
-            num_crops.push(n_crops as i64);
-        }
-
-        self.build_batch(
-            &views,
-            config,
-            soft_budget,
-            item_sizes,
-            num_patches,
-            num_crops,
-            None,
-        )
+        let params = Params::from_config(config, false)?;
+        let lut = pixel_lut(config)?;
+        let encoded = images
+            .iter()
+            .map(|image| encode(image, params, config, &lut))
+            .collect::<Result<Vec<_>, _>>()?;
+        let (tensor, positions, tokens) = stack(encoded, params)?;
+        let sizes = images.iter().map(GenericImageView::dimensions).collect();
+        Ok(PreprocessedEncoderInputs::new(tensor, tokens, sizes)
+            .with_extra("pixel_position_ids", positions))
     }
 
     fn preprocess_video(
@@ -328,93 +459,296 @@ impl VisionPreProcessor for Gemma4Processor {
         frames: &[DynamicImage],
         config: &PreProcessorConfig,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        if frames.is_empty() {
-            return Err(TransformError::EmptyBatch);
-        }
-        let fps = config
-            .extra
-            .get("fps")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(1.0)
-            .max(1e-3) as f32;
-        let sampled: Vec<&DynamicImage> = if frames.len() > VIDEO_MAX_FRAMES {
-            // Uniform sample down to VIDEO_MAX_FRAMES.
-            (0..VIDEO_MAX_FRAMES)
-                .map(|i| {
-                    let idx = i * (frames.len() - 1) / (VIDEO_MAX_FRAMES - 1);
-                    &frames[idx]
-                })
-                .collect()
-        } else {
-            frames.iter().collect()
-        };
-        let n = sampled.len();
-        let timestamps: Vec<f32> = (0..n).map(|i| i as f32 / fps).collect();
-        let views: Vec<DynamicImage> = sampled.into_iter().cloned().collect();
-        let item_sizes = vec![views[0].dimensions()];
-        self.build_batch(
-            &views,
-            config,
-            VIDEO_MAX_SOFT_TOKENS,
-            item_sizes,
-            vec![n as i64],
-            vec![0],
-            Some(timestamps),
-        )
+        preprocess_video_frames(frames, config)
     }
 
+    fn preprocess_video_rgb(
+        &self,
+        frames: &[RgbFrameRef<'_>],
+        config: &PreProcessorConfig,
+    ) -> Result<PreprocessedEncoderInputs, TransformError> {
+        preprocess_video_frames(frames, config)
+    }
+
+    /// Soft tokens for an image of this size; the preprocessing error for a
+    /// config or a size the reference rule cannot resize.
     fn calculate_num_tokens(
         &self,
-        _width: u32,
-        _height: u32,
+        width: u32,
+        height: u32,
         config: &PreProcessorConfig,
-    ) -> usize {
-        Self::soft_budget(config, self.max_soft_tokens)
+    ) -> Result<usize, TransformError> {
+        let params = Params::from_config(config, false)?;
+        let target = params.target_size(height as usize, width as usize)?;
+        Ok(params.soft_tokens(target))
     }
 
     fn model_name(&self) -> &'static str {
         "gemma4"
     }
+
+    /// The size depends on the image's aspect ratio.
+    fn get_processed_size(&self, _config: &PreProcessorConfig) -> Option<(u32, u32)> {
+        None
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use serde_json::json;
+    use image::{Rgb, RgbImage};
 
+    use super::*;
+
+    const IMAGE_CONFIG: &str = r#"{
+        "do_convert_rgb": true, "do_normalize": false, "do_rescale": true, "do_resize": true,
+        "image_mean": [0.0, 0.0, 0.0], "image_std": [1.0, 1.0, 1.0],
+        "image_processor_type": "Gemma4ImageProcessor", "image_seq_length": 280,
+        "max_soft_tokens": 280, "patch_size": 16, "pooling_kernel_size": 3, "resample": 3,
+        "rescale_factor": 0.00392156862745098
+    }"#;
+
+    const VIDEO_CONFIG: &str = r#"{
+        "do_convert_rgb": true, "do_normalize": true, "do_rescale": true, "do_resize": true,
+        "do_sample_frames": true, "image_mean": [0.0, 0.0, 0.0], "image_std": [1.0, 1.0, 1.0],
+        "max_soft_tokens": 70, "num_frames": 32, "patch_size": 16, "pooling_kernel_size": 3,
+        "resample": 3, "rescale_factor": 0.00392156862745098, "return_metadata": false,
+        "video_processor_type": "Gemma4VideoProcessor"
+    }"#;
+
+    fn image_config() -> PreProcessorConfig {
+        PreProcessorConfig::from_json(IMAGE_CONFIG).unwrap()
+    }
+
+    fn video_config() -> PreProcessorConfig {
+        PreProcessorConfig::from_json(VIDEO_CONFIG).unwrap()
+    }
+
+    fn params() -> Params {
+        Params::from_config(&image_config(), false).unwrap()
+    }
+
+    fn solid(width: u32, height: u32, color: [u8; 3]) -> DynamicImage {
+        DynamicImage::ImageRgb8(RgbImage::from_pixel(width, height, Rgb(color)))
+    }
+
+    /// Target sizes and token counts of the reference `get_aspect_ratio_preserving_size`
+    /// (height, width in; height, width out), as transformers computes them.
     #[test]
-    fn video_preprocess_emits_timestamps() {
-        let proc = Gemma4Processor::new();
-        let frames = vec![
-            DynamicImage::new_rgb8(320, 240),
-            DynamicImage::new_rgb8(320, 240),
+    fn target_sizes_follow_the_reference_rule() {
+        let params = params();
+        let cases = [
+            ((512, 512), (768, 768), 256),
+            ((64, 64), (768, 768), 256),
+            ((1080, 1920), (576, 1056), 264),
+            ((300, 1200), (384, 1584), 264),
+            ((1200, 300), (1584, 384), 264),
+            ((128, 96), (912, 672), 266),
+            ((2000, 3000), (624, 960), 260),
+            ((3, 2), (960, 624), 260),
+            ((1, 1), (768, 768), 256),
+            // The zero-side rule: one block high, the aspect ratio wide, capped at the budget.
+            ((10, 3000), (48, 13440), 280),
+            ((3000, 10), (13440, 48), 280),
+            ((20, 3000), (48, 9792), 204),
         ];
-        let mut cfg = PreProcessorConfig::default();
-        cfg.extra.insert("fps".into(), json!(2.0));
-        let out = proc.preprocess_video(&frames, &cfg).unwrap();
-        assert_eq!(out.feature_token_counts.len(), 1);
-        assert!(out.feature_token_counts[0] >= 2);
-        match out.model_specific.get("num_patches") {
-            Some(ModelSpecificValue::IntVec(v)) => assert_eq!(v, &vec![2]),
-            other => panic!("bad num_patches {other:?}"),
+        for ((h, w), (th, tw), tokens) in cases {
+            let target = params.target_size(h, w).unwrap();
+            assert_eq!(target, (th, tw), "{w}x{h}");
+            assert_eq!(params.soft_tokens(target), tokens, "{w}x{h}");
         }
-        match out.model_specific.get("video_timestamps") {
-            Some(ModelSpecificValue::FloatVec(v)) => assert_eq!(v.len(), 2),
-            other => panic!("bad timestamps {other:?}"),
-        }
+        assert_eq!(params.max_patches(), 2520);
+        assert_eq!(params.side_mult(), 48);
+        assert!(params.target_size(0, 10).is_err());
     }
 
     #[test]
-    fn pas_expands_wide_image() {
-        let proc = Gemma4Processor::new();
-        let img = DynamicImage::new_rgb8(1800, 900);
-        let mut cfg = PreProcessorConfig::default();
-        cfg.extra.insert("do_pan_and_scan".into(), json!(true));
-        let out = proc.preprocess(&[img], &cfg).unwrap();
-        assert_eq!(out.feature_token_counts.len(), 1);
-        match out.model_specific.get("num_patches") {
-            Some(ModelSpecificValue::IntVec(v)) => assert_eq!(v[0], 3),
-            other => panic!("bad num_patches {other:?}"),
-        }
+    fn video_frames_take_the_video_budget() {
+        let video = Params::from_config(&video_config(), true).unwrap();
+        assert_eq!(video.max_soft_tokens, 70);
+        assert_eq!(video.max_patches(), 630);
+        // 320x240 frames: 336x432 -> 21 x 27 patches -> 63 tokens.
+        assert_eq!(video.target_size(240, 320).unwrap(), (336, 432));
+        assert_eq!(video.soft_tokens((336, 432)), 63);
+        // Handed the image config, frames keep the engine's video budget.
+        let from_image = Params::from_config(&image_config(), true).unwrap();
+        assert_eq!(from_image.max_soft_tokens, 70);
+        // An unsupported budget is refused like the reference refuses it.
+        let odd: PreProcessorConfig =
+            serde_json::from_value(serde_json::json!({"max_soft_tokens": 100})).unwrap();
+        assert!(Params::from_config(&odd, false).is_err());
+    }
+
+    #[test]
+    fn preprocess_emits_the_engine_contract() {
+        let image = solid(512, 512, [255, 0, 51]);
+        let out = Gemma4Processor::new()
+            .preprocess(std::slice::from_ref(&image), &image_config())
+            .unwrap();
+        assert_eq!(out.encoder_input.shape(), &[1, 2520, 768]);
+        assert_eq!(out.feature_token_counts, vec![256]);
+        assert_eq!(out.item_sizes, vec![(512, 512)]);
+        let values = out.encoder_input.as_f32();
+        // 768x768 -> 48 x 48 patches = 2304 real patches, then zero padding.
+        let red = 255.0_f32 * (1.0_f32 / 255.0);
+        let blue = 51.0_f32 * (1.0_f32 / 255.0);
+        assert_eq!(values[[0, 0, 0]], red);
+        assert_eq!(values[[0, 0, 1]], 0.0);
+        assert_eq!(values[[0, 0, 2]], blue);
+        assert_eq!(values[[0, 2303, 767]], blue);
+        assert_eq!(values[[0, 2304, 0]], 0.0);
+        assert_eq!(values[[0, 2519, 767]], 0.0);
+        let ModelSpecificValue::IntTensor { data, shape } =
+            &out.model_specific["pixel_position_ids"]
+        else {
+            panic!("pixel_position_ids must be an int tensor");
+        };
+        assert_eq!(shape, &[1, 2520, 2]);
+        assert_eq!(&data[..6], &[0, 0, 1, 0, 2, 0]);
+        assert_eq!(&data[96..100], &[0, 1, 1, 1]);
+        assert_eq!(&data[2303 * 2..2304 * 2], &[47, 47]);
+        assert!(data[2304 * 2..].iter().all(|&v| v == -1));
+    }
+
+    #[test]
+    fn batches_stack_images_of_different_sizes() {
+        let images = [solid(64, 64, [1, 2, 3]), solid(1920, 1080, [4, 5, 6])];
+        let out = Gemma4Processor::new()
+            .preprocess(&images, &image_config())
+            .unwrap();
+        assert_eq!(out.encoder_input.shape(), &[2, 2520, 768]);
+        assert_eq!(out.feature_token_counts, vec![256, 264]);
+        assert_eq!(out.item_sizes, vec![(64, 64), (1920, 1080)]);
+        let values = out.encoder_input.as_f32();
+        assert_eq!(values[[1, 0, 0]], 4.0 * (1.0_f32 / 255.0));
+        // 1056x576 -> 66 x 36 = 2376 patches; the rest is padding.
+        assert_eq!(values[[1, 2375, 0]], 4.0 * (1.0_f32 / 255.0));
+        assert_eq!(values[[1, 2376, 0]], 0.0);
+    }
+
+    #[test]
+    fn video_stacks_frames_and_counts_them() {
+        let frames = vec![solid(320, 240, [9, 9, 9]); 3];
+        let processor = Gemma4Processor::new();
+        let out = processor
+            .preprocess_video(&frames, &video_config())
+            .unwrap();
+        assert_eq!(out.encoder_input.shape(), &[3, 630, 768]);
+        assert_eq!(out.feature_token_counts, vec![3 * 63]);
+        assert_eq!(out.item_sizes, vec![(320, 240)]);
+        let ModelSpecificValue::IntTensor { data, shape } =
+            &out.model_specific["pixel_position_ids_videos"]
+        else {
+            panic!("pixel_position_ids_videos must be an int tensor");
+        };
+        assert_eq!(shape, &[3, 630, 2]);
+        // 432x336 -> 27 x 21 patches = 567 real, 63 padded, per frame.
+        assert_eq!(&data[566 * 2..567 * 2], &[26, 20]);
+        assert_eq!(&data[567 * 2..568 * 2], &[-1, -1]);
+        assert_eq!(&data[630 * 2..630 * 2 + 2], &[0, 0]);
+        let ModelSpecificValue::IntTensor { data, .. } = &out.model_specific["video_frame_counts"]
+        else {
+            panic!("video_frame_counts must be an int tensor");
+        };
+        assert_eq!(data, &[3]);
+
+        // The borrowed-frame path is the same computation.
+        let rgb: Vec<Vec<u8>> = frames.iter().map(|f| f.to_rgb8().into_raw()).collect();
+        let refs: Vec<RgbFrameRef<'_>> = rgb
+            .iter()
+            .map(|data| RgbFrameRef {
+                width: 320,
+                height: 240,
+                data,
+            })
+            .collect();
+        let borrowed = processor
+            .preprocess_video_rgb(&refs, &video_config())
+            .unwrap();
+        assert_eq!(
+            borrowed.encoder_input.as_f32().as_slice(),
+            out.encoder_input.as_f32().as_slice()
+        );
+        assert_eq!(borrowed.feature_token_counts, out.feature_token_counts);
+
+        let mixed = [solid(320, 240, [0; 3]), solid(321, 240, [0; 3])];
+        assert!(processor.preprocess_video(&mixed, &video_config()).is_err());
+        assert!(processor.preprocess_video(&[], &video_config()).is_err());
+    }
+
+    #[test]
+    fn token_count_reports_what_preprocessing_refuses() {
+        // A config the parameters cannot be read from is the same error for
+        // the count as for the preprocessing, not a count of zero.
+        let mut config = image_config();
+        config.extra.insert(
+            "pooling_kernel_size".to_string(),
+            serde_json::json!("three"),
+        );
+        let processor = Gemma4Processor::new();
+        let counted = processor
+            .calculate_num_tokens(512, 512, &config)
+            .unwrap_err()
+            .to_string();
+        let preprocessed = processor
+            .preprocess(&[solid(512, 512, [0; 3])], &config)
+            .err()
+            .unwrap()
+            .to_string();
+        assert_eq!(counted, preprocessed);
+    }
+
+    #[test]
+    fn token_counts_and_degenerate_inputs() {
+        let processor = Gemma4Processor::new();
+        let config = image_config();
+        assert_eq!(
+            processor.calculate_num_tokens(512, 512, &config).unwrap(),
+            256
+        );
+        assert_eq!(
+            processor.calculate_num_tokens(1920, 1080, &config).unwrap(),
+            264
+        );
+        assert_eq!(
+            processor.calculate_num_tokens(3000, 10, &config).unwrap(),
+            280
+        );
+        assert!(processor.calculate_num_tokens(0, 10, &config).is_err());
+        assert_eq!(processor.model_name(), "gemma4");
+        assert!(processor.supports_per_image_preprocessing());
+        assert_eq!(processor.get_processed_size(&config), None);
+        assert!(processor.preprocess(&[], &config).is_err());
+        // No resize: the input must already be block-aligned and within budget.
+        let no_resize: PreProcessorConfig =
+            serde_json::from_value(serde_json::json!({"do_resize": false})).unwrap();
+        assert!(processor
+            .preprocess(&[solid(100, 100, [0; 3])], &no_resize)
+            .is_err());
+        let aligned = processor
+            .preprocess(&[solid(96, 48, [0; 3])], &no_resize)
+            .unwrap();
+        assert_eq!(aligned.feature_token_counts, vec![2]);
+        // Aligned but over the budget of 2520 patches (180 x 60 = 10,800).
+        assert!(processor
+            .preprocess(&[solid(48 * 60, 48 * 20, [0; 3])], &no_resize)
+            .is_err());
+    }
+
+    #[test]
+    fn non_identity_normalization_is_fused_like_the_reference() {
+        let config: PreProcessorConfig = serde_json::from_value(serde_json::json!({
+            "do_normalize": true, "image_mean": [0.5, 0.5, 0.5], "image_std": [0.5, 0.5, 0.5]
+        }))
+        .unwrap();
+        let lut = pixel_lut(&config).unwrap();
+        assert_eq!(lut[0][255], (255.0_f32 - 127.5) / 127.5);
+        assert_eq!(lut[1][0], -1.0);
+        let identity = pixel_lut(&video_config()).unwrap();
+        assert_eq!(identity[2][255], 255.0_f32 * (1.0_f32 / 255.0));
+        let bad: PreProcessorConfig = serde_json::from_value(
+            serde_json::json!({"do_normalize": true, "image_mean": [0.0, 0.0, 0.0], "image_std": [0.0, 1.0, 1.0]}),
+        )
+        .unwrap();
+        assert!(pixel_lut(&bad).is_err());
     }
 }

@@ -9,9 +9,15 @@ use llm_multimodal::{
     MediaConnector, MediaConnectorConfig, Modality, ModelRegistry, PreProcessorConfig,
     VisionProcessorRegistry,
 };
+use openai_protocol::worker::MmProcessingMode;
 use tracing::{debug, warn};
 
-use super::pixel_cache::{pixel_cache_from_env, PixelCache};
+use super::{
+    inflight::MultimodalInflight,
+    pixel_cache::{pixel_cache_with_budget, PixelCache},
+    settings::MultimodalSettings,
+};
+use crate::worker::http_client::build_with;
 
 /// Cached model configuration files loaded from the tokenizer directory.
 #[derive(Debug, Clone)]
@@ -195,6 +201,12 @@ pub(crate) fn load_video_preprocessor_config(base_dir: &Path) -> Option<PreProce
 }
 
 pub(crate) fn load_image_preprocessor_config(base_dir: &Path) -> Option<PreProcessorConfig> {
+    with_feature_extractor_section(load_image_processor_section(base_dir), base_dir)
+}
+
+/// The image processor's config: the flat `preprocessor_config.json`, else
+/// the `image_processor` section of `processor_config.json`.
+fn load_image_processor_section(base_dir: &Path) -> Option<PreProcessorConfig> {
     let image_path = base_dir.join("preprocessor_config.json");
     if let Some(config) = load_preprocessor_config_file(&image_path, "preprocessor_config.json") {
         return Some(config);
@@ -232,6 +244,38 @@ pub(crate) fn load_image_preprocessor_config(base_dir: &Path) -> Option<PreProce
         .ok()
 }
 
+/// A `processor_config.json` that nests the audio feature extractor next to
+/// the image and video processors keeps the extractor's parameters
+/// (`sampling_rate`, `samples_per_token`, ...) in its `feature_extractor`
+/// section. Audio processors read them from the preprocessor config's
+/// extras, where a flat `preprocessor_config.json` would have put them, so
+/// the section's entries are merged in under the keys the image config does
+/// not set; a model with the section and no image config gets the defaults
+/// plus the section.
+fn with_feature_extractor_section(
+    config: Option<PreProcessorConfig>,
+    base_dir: &Path,
+) -> Option<PreProcessorConfig> {
+    let processor_path = base_dir.join("processor_config.json");
+    let section = std::fs::read_to_string(&processor_path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(
+            |processor_config| match processor_config.get("feature_extractor") {
+                Some(serde_json::Value::Object(section)) => Some(section.clone()),
+                _ => None,
+            },
+        );
+    let Some(section) = section else {
+        return config;
+    };
+    let mut config = config.unwrap_or_default();
+    for (key, value) in section {
+        config.extra.entry(key).or_insert(value);
+    }
+    Some(config)
+}
+
 /// Shared multimodal components injected at router creation time.
 pub(crate) struct MultimodalComponents {
     pub media_connector: Arc<MediaConnector>,
@@ -243,31 +287,100 @@ pub(crate) struct MultimodalComponents {
     pub pixel_cache: Option<Arc<PixelCache>>,
     /// Router-configured per-modality media-count limits replacing spec limits.
     pub modality_limit_overrides: HashMap<Modality, usize>,
+    /// Where media is fetched and preprocessed for vLLM gRPC workers.
+    pub processing: MmProcessingMode,
+    /// Cap on preprocessed media bytes in flight; `None` leaves it unbounded.
+    pub inflight: Option<Arc<MultimodalInflight>>,
+    /// The engine's own video frame budget, for the specs that sample a clip
+    /// the way its loader does (the worker-side pipeline knows it; `None`
+    /// keeps each spec's own constant).
+    pub video_frame_budget: Option<usize>,
 }
 
 impl MultimodalComponents {
     /// Create multimodal components with default registries and a reference
     /// to the shared `MultimodalConfigRegistry` owned by `AppContext`.
+    /// `settings` is the resolved flag > env > default bundle.
     pub fn new(
         config_registry: Arc<MultimodalConfigRegistry>,
         image_limit_override: Option<usize>,
+        max_inflight_bytes: Option<usize>,
+        settings: &MultimodalSettings,
     ) -> Result<Self> {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .context("Failed to create reqwest client")?;
-        let media_connector = MediaConnector::new(client, MediaConnectorConfig::default())
-            .context("Failed to create MediaConnector")?;
+        // The router fetches client-supplied media URLs itself here: the
+        // connector's host policy (the allow-list and the address policy)
+        // comes from the same resolved settings as the placement mode.
+        let connector_config = MediaConnectorConfig {
+            allowed_domains: settings.allowed_media_domains.value.clone(),
+            allow_private_hosts: settings.allow_private_media_hosts.value,
+            ..MediaConnectorConfig::default()
+        };
+        // The line shows the allow-list as the connector enforces it (trimmed,
+        // a list with no names being none), not as it was spelled.
+        tracing::info!(
+            allowed_media_domains =
+                ?llm_multimodal::effective_allowed_domains(connector_config.allowed_domains.as_deref()),
+            allow_private_media_hosts = connector_config.allow_private_hosts,
+            allow_private_media_hosts_source = settings.allow_private_media_hosts.source.as_str(),
+            "media fetch policy for router-side processing"
+        );
+        let media_connector = build_with(
+            || crate::clients::http_client_builder().timeout(std::time::Duration::from_secs(30)),
+            false,
+            "media HTTP client",
+            |client| MediaConnector::new(client, connector_config.clone()),
+        )
+        .map_err(anyhow::Error::msg)?;
+
+        super::report_jpeg_decoder();
+        super::enforce_jpeg_decoder_policy(settings.turbojpeg.value)?;
+        tracing::info!(
+            policy = %settings.turbojpeg.value,
+            source = settings.turbojpeg.source.as_str(),
+            "TurboJPEG policy"
+        );
+        let processing = settings.processing.value;
+        tracing::info!(
+            mode = %processing,
+            source = settings.processing.source.as_str(),
+            "multimodal processing mode"
+        );
+        // The switch is the way back to the two-pass write: say where it
+        // stands and who set it, so a rollback that did not take is seen.
+        tracing::info!(
+            on = settings.one_pass_wire.value,
+            source = settings.one_pass_wire.source.as_str(),
+            "multimodal one-pass wire write"
+        );
+
+        let inflight = max_inflight_bytes
+            .map(|bytes| {
+                let inflight = MultimodalInflight::new(bytes);
+                // Zero is not how an operator asks for no limit: it would
+                // refuse every request carrying media. Leaving the setting
+                // off is, so a budget too small to admit anything is more
+                // likely a mistake than an intent to serve nothing.
+                anyhow::ensure!(
+                    inflight.budget_bytes() > 0,
+                    "multimodal_max_inflight_bytes is {bytes}, too little to admit any request \
+                     carrying media; leave it unset to hold an unbounded amount"
+                );
+                Ok(Arc::new(inflight))
+            })
+            .transpose()?;
 
         Ok(Self {
             media_connector: Arc::new(media_connector),
             vision_processor_registry: Arc::new(VisionProcessorRegistry::with_defaults()),
             model_registry: Arc::new(ModelRegistry::default()),
             config_registry,
-            pixel_cache: pixel_cache_from_env(),
+            pixel_cache: pixel_cache_with_budget(settings.pixel_cache_mb.value),
             modality_limit_overrides: image_limit_override
                 .map(|limit| HashMap::from([(Modality::Image, limit)]))
                 .unwrap_or_default(),
+            processing,
+            inflight,
+            video_frame_budget: None,
         })
     }
 }
@@ -355,6 +468,67 @@ mod tests {
     }
 
     #[test]
+    fn load_image_preprocessor_config_merges_the_feature_extractor_section() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("processor_config.json"),
+            r#"{"feature_extractor":{"feature_extractor_type":"AudioFeatureExtractor","sampling_rate":24000,"samples_per_token":1920,"padding_value":0.0},
+                "image_processor":{"image_processor_type":"NestedImageProcessor","do_resize":true}}"#,
+        )
+        .unwrap();
+
+        let nested = load_image_preprocessor_config(tmp.path())
+            .expect("the image section with the extractor section merged in");
+        assert_eq!(
+            nested.image_processor_type.as_deref(),
+            Some("NestedImageProcessor")
+        );
+        assert_eq!(nested.do_resize, Some(true));
+        assert_eq!(nested.get_extra::<usize>("sampling_rate"), Some(24_000));
+        assert_eq!(nested.get_extra::<usize>("samples_per_token"), Some(1_920));
+        assert_eq!(
+            nested
+                .get_extra::<String>("feature_extractor_type")
+                .as_deref(),
+            Some("AudioFeatureExtractor")
+        );
+
+        // The image config's own keys win over the extractor section's.
+        fs::write(
+            tmp.path().join("preprocessor_config.json"),
+            r#"{"image_processor_type":"LegacyImageProcessor","sampling_rate":16000}"#,
+        )
+        .unwrap();
+        let legacy = load_image_preprocessor_config(tmp.path()).expect("legacy image config");
+        assert_eq!(
+            legacy.image_processor_type.as_deref(),
+            Some("LegacyImageProcessor")
+        );
+        assert_eq!(legacy.get_extra::<usize>("sampling_rate"), Some(16_000));
+        assert_eq!(legacy.get_extra::<usize>("samples_per_token"), Some(1_920));
+
+        // An extractor section without any image config: defaults plus the section.
+        fs::remove_file(tmp.path().join("preprocessor_config.json")).unwrap();
+        fs::write(
+            tmp.path().join("processor_config.json"),
+            r#"{"feature_extractor":{"sampling_rate":24000}}"#,
+        )
+        .unwrap();
+        let audio_only = load_image_preprocessor_config(tmp.path())
+            .expect("the extractor section alone is a config");
+        assert_eq!(audio_only.image_processor_type, None);
+        assert_eq!(audio_only.get_extra::<usize>("sampling_rate"), Some(24_000));
+
+        // No section: nothing is merged and a missing image config stays missing.
+        fs::write(
+            tmp.path().join("processor_config.json"),
+            r#"{"video_processor":{"image_processor_type":"VideoProcessor"}}"#,
+        )
+        .unwrap();
+        assert!(load_image_preprocessor_config(tmp.path()).is_none());
+    }
+
+    #[test]
     fn load_image_preprocessor_config_preserves_legacy_precedence_and_falls_back() {
         let tmp = TempDir::new().unwrap();
         fs::write(
@@ -436,5 +610,86 @@ mod tests {
             .await
             .expect("preloaded entry must be returned without touching source");
         assert!(Arc::ptr_eq(&got, &cfg));
+    }
+
+    /// The resolved settings, not the environment, decide the placement mode
+    /// and the pixel cache the components come up with.
+    #[test]
+    fn components_take_placement_and_pixel_cache_from_the_settings() {
+        use super::super::settings::{Setting, SettingSource};
+
+        let settings = MultimodalSettings {
+            processing: Setting {
+                value: MmProcessingMode::Worker,
+                source: SettingSource::Flag,
+            },
+            ..MultimodalSettings::default()
+        };
+        let components = MultimodalComponents::new(
+            Arc::new(MultimodalConfigRegistry::new()),
+            None,
+            None,
+            &settings,
+        )
+        .unwrap();
+        assert_eq!(components.processing, MmProcessingMode::Worker);
+        assert!(
+            components.pixel_cache.is_none(),
+            "0 MiB keeps the cache off"
+        );
+    }
+
+    /// Under `require` the components come up exactly when the library did:
+    /// a host without it is refused with the library and the gauge named, a
+    /// host with it starts as before.
+    #[test]
+    fn a_required_turbojpeg_is_refused_exactly_when_the_library_is_missing() {
+        use llm_multimodal::jpeg_turbo::{turbojpeg_available, TurboJpegPolicy};
+
+        use super::super::settings::{Setting, SettingSource};
+
+        let settings = MultimodalSettings {
+            turbojpeg: Setting {
+                value: TurboJpegPolicy::Require,
+                source: SettingSource::Flag,
+            },
+            ..MultimodalSettings::default()
+        };
+        let result = MultimodalComponents::new(
+            Arc::new(MultimodalConfigRegistry::new()),
+            None,
+            None,
+            &settings,
+        );
+        if turbojpeg_available() {
+            assert!(result.is_ok(), "{:#}", result.err().unwrap());
+        } else {
+            let error = format!("{:#}", result.err().expect("refused without the library"));
+            assert!(error.contains("libturbojpeg.so.0"), "{error}");
+            assert!(error.contains("smg_mm_turbojpeg_available"), "{error}");
+        }
+    }
+
+    fn components(max_inflight_bytes: Option<usize>) -> Result<MultimodalComponents> {
+        MultimodalComponents::new(
+            Arc::new(MultimodalConfigRegistry::new()),
+            None,
+            max_inflight_bytes,
+            &MultimodalSettings::default(),
+        )
+    }
+
+    /// A budget too small to admit anything would turn every request carrying
+    /// media away. Read as "no limit" it would do the opposite instead, so it
+    /// is refused and the operator is told which one to ask for.
+    #[test]
+    fn a_budget_that_admits_nothing_stops_startup() {
+        assert!(components(None).unwrap().inflight.is_none());
+        assert!(components(Some(0)).is_err());
+        assert!(components(Some(1)).is_err());
+
+        let sized = components(Some(8192)).unwrap();
+        let inflight = sized.inflight.expect("a usable budget is kept");
+        assert_eq!(inflight.budget_bytes(), 8192);
     }
 }

@@ -9,7 +9,7 @@ use image::DynamicImage;
 
 use super::{preprocessor_config::PreProcessorConfig, transforms::TransformError};
 pub use crate::encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs};
-use crate::types::RgbFrameRef;
+use crate::{encoder_inputs::EncoderDtype, types::RgbFrameRef};
 
 /// Helper to extract a dimension from encoder_input given an ndim-dependent axis index.
 /// Returns `Err` if the ndim is not 4 or 5.
@@ -64,11 +64,50 @@ impl PreprocessedEncoderInputs {
     }
 }
 
+/// Request-scoped inputs to one preprocessing call, beside the model's static
+/// [`PreProcessorConfig`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VisionPreprocessingContext {
+    /// Context tokens left for the call's images: the engine's context length
+    /// less the prompt's text tokens. A processor that sizes images by it keeps
+    /// back its own reserve and shares the rest among the call's images, so a
+    /// caller that sets it preprocesses a request's images in one call.
+    /// `None` sizes each image as if it were alone.
+    pub token_budget: Option<usize>,
+}
+
 /// Trait for model-specific vision preprocessors.
 ///
 /// Each vision model (LLaVA, Qwen-VL, Phi3-Vision, etc.) implements this trait
 /// to provide the correct preprocessing pipeline.
 pub trait VisionPreProcessor: Send + Sync {
+    /// Whether preprocessing individual images and concatenating their outputs
+    /// is equivalent to preprocessing the whole batch, including metadata.
+    ///
+    /// Opt in only when resize, padding and normalization are independent of
+    /// other images. An output field layout alone does not guarantee this.
+    fn supports_per_image_preprocessing(&self) -> bool {
+        false
+    }
+
+    /// Whether this processor produces the image's own bytes
+    /// ([`EncoderInput::U8`](crate::encoder_inputs::EncoderInput::U8)), so
+    /// a destination that normalizes on device can be served raw pixels
+    /// exactly; `false` means it produces normalized floats.
+    fn emits_pixel_bytes(&self) -> bool {
+        false
+    }
+
+    /// Whether this processor takes an image that carries an alpha channel as
+    /// decoded and composites or drops the channel itself, because its
+    /// reference is handed the image as stored by the serving engines'
+    /// loaders. A frame for such a processor is decoded under
+    /// [`TransparencyPolicy::KeepAlpha`](crate::TransparencyPolicy::KeepAlpha)
+    /// whatever the destination engine's own rule.
+    fn keeps_alpha(&self) -> bool {
+        false
+    }
+
     /// Default normalization mean for this model family.
     fn default_mean(&self) -> [f64; 3];
 
@@ -88,6 +127,34 @@ pub trait VisionPreProcessor: Send + Sync {
         images: &[DynamicImage],
         config: &PreProcessorConfig,
     ) -> Result<PreprocessedEncoderInputs, TransformError>;
+
+    /// [`preprocess`](Self::preprocess) under a request's context. A processor
+    /// whose output does not depend on the request keeps this default, which
+    /// ignores the context.
+    fn preprocess_with_context(
+        &self,
+        images: &[DynamicImage],
+        config: &PreProcessorConfig,
+        _context: &VisionPreprocessingContext,
+    ) -> Result<PreprocessedEncoderInputs, TransformError> {
+        self.preprocess(images, config)
+    }
+
+    /// Preprocess a batch of images straight into `dtype`, the wire's dtype,
+    /// when the processor can lay the patches out and normalize them in one
+    /// pass (an [`EncoderInput::Wire`](crate::encoder_inputs::EncoderInput::Wire)
+    /// result); `None` when it cannot, which leaves the caller
+    /// [`preprocess`](Self::preprocess) and the per-destination write. The
+    /// bytes a `Wire` carries are the bytes `preprocess` followed by a write
+    /// in `dtype` would produce.
+    fn preprocess_wire(
+        &self,
+        _images: &[DynamicImage],
+        _config: &PreProcessorConfig,
+        _dtype: EncoderDtype,
+    ) -> Option<Result<PreprocessedEncoderInputs, TransformError>> {
+        None
+    }
 
     /// Preprocess one decoded video clip represented as sampled frames.
     ///
@@ -122,13 +189,22 @@ pub trait VisionPreProcessor: Send + Sync {
     /// Calculate the number of vision tokens for a given image size.
     ///
     /// This is used to determine how many placeholder tokens to insert
-    /// in the text input before the image has been fully processed.
+    /// in the text input before the image has been fully processed. A
+    /// config the implementation cannot read, or a size its resize rule
+    /// refuses, is the error the preprocessing reports for it, never a count
+    /// of zero or one taken from other settings; the arithmetic itself
+    /// cannot fail.
     ///
     /// # Arguments
     /// * `width` - Image width after preprocessing
     /// * `height` - Image height after preprocessing
     /// * `config` - Preprocessor configuration
-    fn calculate_num_tokens(&self, width: u32, height: u32, config: &PreProcessorConfig) -> usize;
+    fn calculate_num_tokens(
+        &self,
+        width: u32,
+        height: u32,
+        config: &PreProcessorConfig,
+    ) -> Result<usize, TransformError>;
 
     /// Get the model family name for identification.
     fn model_name(&self) -> &'static str;
@@ -156,7 +232,10 @@ impl VisionProcessorRegistry {
 
     /// Register a processor for a model pattern.
     pub fn register(&mut self, pattern: impl Into<String>, processor: Box<dyn VisionPreProcessor>) {
-        self.processors.insert(pattern.into(), processor);
+        // Matching is case-insensitive on both sides; lowercase the pattern
+        // once here rather than every pattern on every lookup.
+        self.processors
+            .insert(pattern.into().to_lowercase(), processor);
     }
 
     /// Find a processor for the given model ID, falling back to model_type.
@@ -173,12 +252,10 @@ impl VisionProcessorRegistry {
 
     fn find_in_candidate(&self, candidate: &str) -> Option<&dyn VisionPreProcessor> {
         let candidate = candidate.to_lowercase();
-        for (pattern, processor) in &self.processors {
-            if candidate.contains(&pattern.to_lowercase()) {
-                return Some(processor.as_ref());
-            }
-        }
-        None
+        self.processors
+            .iter()
+            .find(|(pattern, _)| candidate.contains(pattern.as_str()))
+            .map(|(_, processor)| processor.as_ref())
     }
 
     /// Get list of supported model patterns.
@@ -193,221 +270,117 @@ impl Default for VisionProcessorRegistry {
     }
 }
 
-impl VisionProcessorRegistry {
-    /// Create a registry with all built-in processors registered.
-    ///
-    /// Currently registers:
-    /// - `glm-5.3-flash` / `glm5_next` -> Glm53FlashProcessor
-    /// - `llava-next` -> LlavaNextProcessor
-    /// - `llava-1.5` / `llava-v1.5` -> LlavaProcessor
-    /// - `qwen2-vl` -> Qwen2VLProcessor
-    /// - `qwen2.5-vl` -> Qwen2VLProcessor (same preprocessing as Qwen2-VL)
-    /// - `qwen3-vl` -> Qwen3VLProcessor (patch_size=16, [0.5,0.5,0.5] normalization)
-    /// - `qwen3.5` / `qwen3_5` -> Qwen3VLProcessor (Qwen3.5 reuses Qwen3-VL preprocessing)
-    /// - `qwen4_exp` / `qwen4-exp` -> Qwen3VLProcessor (same vision tower as Qwen3.5)
-    /// - `phi-3-vision` -> Phi3VisionProcessor (HD transform with 336x336 tiles)
-    pub fn with_defaults() -> Self {
-        let mut registry = Self::new();
+/// The constructor of a built-in processor, as the table of defaults holds it.
+type ProcessorConstructor = fn() -> Box<dyn VisionPreProcessor>;
 
-        for pattern in [
-            "gemma-3",
-            "gemma3",
-            "Gemma3ImageProcessor",
-        ] {
-            registry.register(
-                pattern,
-                Box::new(super::processors::Gemma3Processor::new()),
-            );
-        }
-        for pattern in [
-            "gemma-4",
-            "gemma4",
-            "Gemma4ImageProcessor",
-        ] {
-            registry.register(
-                pattern,
-                Box::new(super::processors::Gemma4Processor::new()),
-            );
-        }
-
-        for pattern in [
+/// The built-in processors and the patterns that select them: one row per
+/// processor family, the patterns a model id or model type is matched against
+/// (case-insensitively, as substrings) with the processor they select.
+/// [`VisionProcessorRegistry::with_defaults`] registers every row.
+const DEFAULT_PROCESSORS: &[(&[&str], ProcessorConstructor)] = &[
+    // DeepSeek-V4.1 vision variant (patch=14, 3x3 aligner downsample,
+    // gray-padded contain fit): the HF model_type and the marketing id.
+    (&["deepseek_v41", "deepseek-v4.1"], || {
+        Box::new(super::processors::DeepseekV41Processor::new())
+    }),
+    // Nemotron-H Omni (the HF model_type and the released ids' spelling).
+    (&["nemotronh_nano_omni", "nemotron-3-nano-omni"], || {
+        Box::new(super::processors::NemotronOmniProcessor::new())
+    }),
+    // Gemma 4 (the HF model_type and the released ids' spelling).
+    (&["gemma4", "gemma-4"], || {
+        Box::new(super::processors::Gemma4Processor::new())
+    }),
+    (
+        &[
             "glm-5.3-flash",
             "glm5.3-flash",
             "glm53_flash",
             "glm-5-next",
             "glm5-next",
             "glm5_next",
-        ] {
-            registry.register(
-                pattern,
-                Box::new(super::processors::Glm53FlashProcessor::new()),
-            );
-        }
-
-        // LLaVA-NeXT (v1.6+, anyres multi-crop)
-        registry.register(
-            "llava-next",
-            Box::new(super::processors::LlavaNextProcessor::new()),
-        );
-        registry.register(
-            "llava_next",
-            Box::new(super::processors::LlavaNextProcessor::new()),
-        );
-        registry.register(
-            "llava-v1.6",
-            Box::new(super::processors::LlavaNextProcessor::new()),
-        );
-
-        // Standard LLaVA (v1.5, single-patch).
-        // Use specific patterns so they don't accidentally match LLaVA-NeXT
-        // model IDs like "llava-v1.6-*".
-        registry.register(
-            "llava-1.5",
-            Box::new(super::processors::LlavaProcessor::new()),
-        );
-        registry.register(
-            "llava-v1.5",
-            Box::new(super::processors::LlavaProcessor::new()),
-        );
-
-        // Register Qwen3-VL first (more specific pattern - must match before qwen2)
-        registry.register(
-            "qwen3-vl",
-            Box::new(super::processors::Qwen3VLProcessor::new()),
-        );
-        registry.register(
-            "qwen3_vl",
-            Box::new(super::processors::Qwen3VLProcessor::new()),
-        );
-
-        // Qwen3-Omni uses the same patchification and normalization contract
-        // as Qwen3-VL for its image and video towers.
-        registry.register(
-            "qwen3-omni",
-            Box::new(super::processors::Qwen3OmniVisionProcessor::new()),
-        );
-        registry.register(
-            "qwen3_omni",
-            Box::new(super::processors::Qwen3OmniVisionProcessor::new()),
-        );
-
-        // Qwen3.5 family (and Qwen3.6: same arch) reuses Qwen3-VL preprocessing.
-        registry.register(
-            "qwen3.5",
-            Box::new(super::processors::Qwen3VLProcessor::new()),
-        );
-        registry.register(
-            "qwen3_5",
-            Box::new(super::processors::Qwen3VLProcessor::new()),
-        );
-        registry.register(
-            "qwen3.6",
-            Box::new(super::processors::Qwen3VLProcessor::new()),
-        );
-        registry.register(
-            "qwen3_6",
-            Box::new(super::processors::Qwen3VLProcessor::new()),
-        );
-
-        // Qwen4-Exp: same vision tower as Qwen3.5
-        registry.register(
-            "qwen4_exp",
-            Box::new(super::processors::Qwen3VLProcessor::new()),
-        );
-        registry.register(
-            "qwen4-exp",
-            Box::new(super::processors::Qwen3VLProcessor::new()),
-        );
-
-        // Inkling/TML multimodal model.
-        registry.register(
-            "inkling",
-            Box::new(super::processors::InklingImageProcessor::new()),
-        );
-        // MiniMax-M3 preprocesses images the Qwen2-VL way but with its own
-        // pixel bounds, so it gets a dedicated processor rather than reusing
-        // the Qwen2-VL defaults.
-        registry.register(
-            "minimax_m3",
-            Box::new(super::processors::MiniMaxM3VisionProcessor::new()),
-        );
-        registry.register(
-            "minimax-m3",
-            Box::new(super::processors::MiniMaxM3VisionProcessor::new()),
-        );
-        registry.register(
-            "minimax_m3_vl",
-            Box::new(super::processors::MiniMaxM3VisionProcessor::new()),
-        );
-
-        // Register Qwen2-VL (matches Qwen/Qwen2-VL-*, etc.)
-        registry.register(
+        ],
+        || Box::new(super::processors::Glm53FlashProcessor::new()),
+    ),
+    // LLaVA-NeXT (v1.6+, anyres multi-crop).
+    (&["llava-next", "llava_next", "llava-v1.6"], || {
+        Box::new(super::processors::LlavaNextProcessor::new())
+    }),
+    // Standard LLaVA (v1.5, single-patch), under patterns specific enough not
+    // to match LLaVA-NeXT model ids like "llava-v1.6-*".
+    (&["llava-1.5", "llava-v1.5"], || {
+        Box::new(super::processors::LlavaProcessor::new())
+    }),
+    // Muse Spark (the HF model_type and the released ids' spelling).
+    (&["muse_spark", "muse-spark"], || {
+        Box::new(super::processors::MuseSparkVisionProcessor::new())
+    }),
+    (&["qwen3-vl", "qwen3_vl"], || {
+        Box::new(super::processors::Qwen3VLProcessor::new())
+    }),
+    // Qwen3-Omni uses the same patchification and normalization contract as
+    // Qwen3-VL for its image and video towers.
+    (&["qwen3-omni", "qwen3_omni"], || {
+        Box::new(super::processors::Qwen3OmniVisionProcessor::new())
+    }),
+    // The Qwen3.5 family (and Qwen3.6: same arch) reuses Qwen3-VL
+    // preprocessing.
+    (&["qwen3.5", "qwen3_5", "qwen3.6", "qwen3_6"], || {
+        Box::new(super::processors::Qwen3VLProcessor::new())
+    }),
+    // Qwen4-Exp: the same vision tower as Qwen3.5.
+    (&["qwen4_exp", "qwen4-exp"], || {
+        Box::new(super::processors::Qwen3VLProcessor::new())
+    }),
+    // Inkling/TML multimodal model.
+    (&["inkling"], || {
+        Box::new(super::processors::InklingImageProcessor::new())
+    }),
+    // MiniMax-M3 preprocesses images the Qwen2-VL way but with its own pixel
+    // bounds, so it gets a dedicated processor rather than reusing the
+    // Qwen2-VL defaults.
+    (&["minimax_m3", "minimax-m3", "minimax_m3_vl"], || {
+        Box::new(super::processors::MiniMaxM3VisionProcessor::new())
+    }),
+    // Qwen2-VL (matches Qwen/Qwen2-VL-*, etc.) and Qwen2.5-VL, whose
+    // preprocessing is identical.
+    (
+        &[
             "qwen2-vl",
-            Box::new(super::processors::Qwen2VLProcessor::new()),
-        );
-        registry.register(
             "qwen2_vl",
-            Box::new(super::processors::Qwen2VLProcessor::new()),
-        );
-
-        // Register Qwen2.5-VL (uses identical preprocessing to Qwen2-VL)
-        registry.register(
             "qwen2.5-vl",
-            Box::new(super::processors::Qwen2VLProcessor::new()),
-        );
-        registry.register(
             "qwen2_5-vl",
-            Box::new(super::processors::Qwen2VLProcessor::new()),
-        );
-        registry.register(
             "qwen2_5_vl",
-            Box::new(super::processors::Qwen2VLProcessor::new()),
-        );
+        ],
+        || Box::new(super::processors::Qwen2VLProcessor::new()),
+    ),
+    (&["phi-3-vision", "phi3-vision", "phi3_v"], || {
+        Box::new(super::processors::Phi3VisionProcessor::new())
+    }),
+    (&["llama-4", "llama4"], || {
+        Box::new(super::processors::Llama4VisionProcessor::new())
+    }),
+    // The Kimi MoonViT family. K3 shares the stack but ships a larger patch
+    // budget and chessboard alpha compositing, so it gets its own processor
+    // rather than reusing K2.5's.
+    (&["kimi-k2", "kimi_k2"], || {
+        Box::new(super::processors::KimiK25Processor::new())
+    }),
+    (&["kimi-k3", "kimi_k3"], || {
+        Box::new(super::processors::KimiK3Processor::new())
+    }),
+];
 
-        // Register Phi3-Vision
-        registry.register(
-            "phi-3-vision",
-            Box::new(super::processors::Phi3VisionProcessor::new()),
-        );
-        registry.register(
-            "phi3-vision",
-            Box::new(super::processors::Phi3VisionProcessor::new()),
-        );
-        registry.register(
-            "phi3_v",
-            Box::new(super::processors::Phi3VisionProcessor::new()),
-        );
-
-        // Register LLaMA 4 Vision
-        registry.register(
-            "llama-4",
-            Box::new(super::processors::Llama4VisionProcessor::new()),
-        );
-        registry.register(
-            "llama4",
-            Box::new(super::processors::Llama4VisionProcessor::new()),
-        );
-
-        // Register the Kimi MoonViT family. K3 shares the stack but ships a
-        // larger patch budget and chessboard alpha compositing, so it gets its
-        // own processor rather than reusing K2.5's.
-        registry.register(
-            "kimi-k2",
-            Box::new(super::processors::KimiK25Processor::new()),
-        );
-        registry.register(
-            "kimi_k2",
-            Box::new(super::processors::KimiK25Processor::new()),
-        );
-        registry.register(
-            "kimi-k3",
-            Box::new(super::processors::KimiK3Processor::new()),
-        );
-        registry.register(
-            "kimi_k3",
-            Box::new(super::processors::KimiK3Processor::new()),
-        );
-
+impl VisionProcessorRegistry {
+    /// Create a registry with every built-in processor registered, each under
+    /// the patterns of its row in the table of defaults (`DEFAULT_PROCESSORS`).
+    pub fn with_defaults() -> Self {
+        let mut registry = Self::new();
+        for (patterns, constructor) in DEFAULT_PROCESSORS {
+            for pattern in *patterns {
+                registry.register(*pattern, constructor());
+            }
+        }
         registry
     }
 }
@@ -468,6 +441,86 @@ mod tests {
                 .expect("GLM-5.3-Flash processor");
             assert_eq!(processor.model_name(), "glm-5.3-flash");
         }
+    }
+
+    /// Every pattern of the table of defaults with the processor it selects,
+    /// as the registry resolved them when each was registered by hand.
+    #[test]
+    fn with_defaults_resolves_every_pattern_to_its_processor() {
+        let registry = VisionProcessorRegistry::with_defaults();
+        let expected = [
+            ("deepseek_v41", "deepseek_v41"),
+            ("deepseek-v4.1", "deepseek_v41"),
+            ("nemotronh_nano_omni", "nemotron_omni"),
+            ("nemotron-3-nano-omni", "nemotron_omni"),
+            ("gemma4", "gemma4"),
+            ("gemma-4", "gemma4"),
+            ("glm-5.3-flash", "glm-5.3-flash"),
+            ("glm5.3-flash", "glm-5.3-flash"),
+            ("glm53_flash", "glm-5.3-flash"),
+            ("glm-5-next", "glm-5.3-flash"),
+            ("glm5-next", "glm-5.3-flash"),
+            ("glm5_next", "glm-5.3-flash"),
+            ("llava-next", "llava-next"),
+            ("llava_next", "llava-next"),
+            ("llava-v1.6", "llava-next"),
+            ("llava-1.5", "llava"),
+            ("llava-v1.5", "llava"),
+            ("muse_spark", "muse_spark"),
+            ("muse-spark", "muse_spark"),
+            ("qwen3-vl", "qwen3-vl"),
+            ("qwen3_vl", "qwen3-vl"),
+            ("qwen3-omni", "qwen3-omni"),
+            ("qwen3_omni", "qwen3-omni"),
+            ("qwen3.5", "qwen3-vl"),
+            ("qwen3_5", "qwen3-vl"),
+            ("qwen3.6", "qwen3-vl"),
+            ("qwen3_6", "qwen3-vl"),
+            ("qwen4_exp", "qwen3-vl"),
+            ("qwen4-exp", "qwen3-vl"),
+            ("inkling", "inkling"),
+            ("minimax_m3", "minimax_m3"),
+            ("minimax-m3", "minimax_m3"),
+            ("minimax_m3_vl", "minimax_m3"),
+            ("qwen2-vl", "qwen2-vl"),
+            ("qwen2_vl", "qwen2-vl"),
+            ("qwen2.5-vl", "qwen2-vl"),
+            ("qwen2_5-vl", "qwen2-vl"),
+            ("qwen2_5_vl", "qwen2-vl"),
+            ("phi-3-vision", "phi3-vision"),
+            ("phi3-vision", "phi3-vision"),
+            ("phi3_v", "phi3-vision"),
+            ("llama-4", "llama4-vision"),
+            ("llama4", "llama4-vision"),
+            ("kimi-k2", "kimi-k2.5"),
+            ("kimi_k2", "kimi-k2.5"),
+            ("kimi-k3", "kimi-k3"),
+            ("kimi_k3", "kimi-k3"),
+        ];
+        assert_eq!(registry.supported_patterns().len(), expected.len());
+        for (pattern, model_name) in expected {
+            let processor = registry
+                .find(pattern, None)
+                .unwrap_or_else(|| panic!("{pattern} selects no processor"));
+            assert_eq!(processor.model_name(), model_name, "{pattern}");
+        }
+    }
+
+    #[test]
+    fn test_registry_finds_gemma4_by_id_and_model_type() {
+        let registry = VisionProcessorRegistry::with_defaults();
+        for (model_id, model_type) in [
+            ("google/gemma-4-26B-A4B-it", None),
+            ("/models/local-checkpoint", Some("gemma4")),
+        ] {
+            let processor = registry
+                .find(model_id, model_type)
+                .expect("Gemma 4 vision processor");
+            assert_eq!(processor.model_name(), "gemma4", "{model_id}");
+        }
+        assert!(registry
+            .find("/models/local-checkpoint", Some("gemma3"))
+            .is_none());
     }
 
     #[test]

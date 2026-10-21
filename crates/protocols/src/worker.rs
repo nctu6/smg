@@ -15,7 +15,7 @@ use axum::{
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 #[cfg(feature = "axum")]
-use serde_json::{json, Value};
+use serde_json::json;
 
 use super::model_card::ModelCard;
 
@@ -309,11 +309,11 @@ impl std::str::FromStr for RuntimeType {
 ///
 /// Different providers have different API formats and requirements.
 /// `None` (when used as `Option<ProviderType>`) means native/passthrough —
-/// no transformation needed (local SGLang backends).
+/// no transformation needed (local engine backends).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ProviderType {
-    /// OpenAI API — strip SGLang-specific fields.
+    /// OpenAI API — strip the engine-specific fields.
     #[serde(alias = "openai")]
     OpenAI,
     /// xAI/Grok — special handling for input items.
@@ -596,6 +596,69 @@ impl JsonSchema for WorkerModels {
     }
 }
 
+/// When the gateway hands a worker's engine a grammar: only when the request
+/// asks for one (a forced tool choice or a JSON response format), which every
+/// worker does unless told otherwise, or on every turn, for a model trained
+/// to be read through one. Set on the worker spec, as the `constrained_decoding`
+/// worker label, or reported by the engine's servicer in server info; the spec
+/// wins over the labels, and a configured label over a discovered one
+/// ([`ConstrainedDecoding::of`]).
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default, schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum ConstrainedDecoding {
+    /// A grammar only when the request asks for one.
+    #[default]
+    Requested,
+    /// A grammar on every turn.
+    Always,
+}
+
+impl ConstrainedDecoding {
+    /// The worker label that carries the policy when it is not on the spec.
+    pub const LABEL: &'static str = "constrained_decoding";
+    /// The label's value for [`Self::Requested`].
+    pub const REQUESTED: &'static str = "requested";
+    /// The label's value for [`Self::Always`].
+    pub const ALWAYS: &'static str = "always";
+
+    /// The policy a label value names, or why it names none.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim() {
+            Self::REQUESTED => Ok(Self::Requested),
+            Self::ALWAYS => Ok(Self::Always),
+            other => Err(format!(
+                "constrained_decoding must be '{}' or '{}', not '{other}'",
+                Self::REQUESTED,
+                Self::ALWAYS
+            )),
+        }
+    }
+
+    /// The policy a worker's `constrained_decoding` label names; anything
+    /// else, the label's absence included, is [`Self::Requested`].
+    pub fn from_label(value: Option<&str>) -> Self {
+        value
+            .and_then(|value| Self::parse(value).ok())
+            .unwrap_or_default()
+    }
+
+    /// The label value for the policy.
+    pub fn as_label(self) -> &'static str {
+        match self {
+            Self::Requested => Self::REQUESTED,
+            Self::Always => Self::ALWAYS,
+        }
+    }
+
+    /// A worker's policy: the spec's when set, else its label's.
+    pub fn of(spec: &WorkerSpec) -> Self {
+        spec.constrained_decoding
+            .unwrap_or_else(|| Self::from_label(spec.labels.get(Self::LABEL).map(String::as_str)))
+    }
+}
+
 // ── Core identity ────────────────────────────────────────────────────
 
 /// Core worker identity and configuration.
@@ -677,15 +740,32 @@ pub struct WorkerSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kv_role: Option<String>,
 
-    /// KV transfer engine id (vLLM `kv_transfer_config.engine_id`; Mooncake PD).
+    /// KV transfer engine id (the engine's `kv_transfer_config.engine_id`; Mooncake PD).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kv_engine_id: Option<String>,
 
     /// KV cache block size (tokens per block) for event-driven routing.
     /// When set, overrides the router-level default for this worker's model.
-    /// Typically matches the backend engine's page size (e.g. 16 for SGLang).
+    /// Typically matches the backend engine's page size (e.g. 16 for one of the engines).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kv_block_size: Option<usize>,
+    /// Explicit PD pairing protocol. A prefill and a decode with this set
+    /// pair only when the values are equal, and nothing derived about their
+    /// transport, engine version or KV layout is compared. The same value
+    /// can arrive as a `pairing_protocol` worker label, or from the engine
+    /// itself: the gRPC servicers report their `SMG_PAIRING_PROTOCOL`
+    /// environment in server info, so a deployment can inject it into the
+    /// engine container. Absent everywhere: the router derives the pairing
+    /// descriptor from the worker's discovered labels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pairing_protocol: Option<String>,
+    /// When the gateway hands this worker's engine a grammar: `always` for a
+    /// model read through one on every turn, `requested` (the default) for a
+    /// grammar only when the request asks. The same value can arrive as a
+    /// `constrained_decoding` worker label or from the engine's servicer in
+    /// server info; this field wins ([`ConstrainedDecoding::of`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub constrained_decoding: Option<ConstrainedDecoding>,
 
     /// Per-worker health check overrides (partial — only `Some` fields override router defaults).
     #[serde(default, skip_serializing_if = "HealthCheckUpdate::is_empty")]
@@ -758,6 +838,8 @@ impl WorkerSpec {
             kv_role: None,
             kv_engine_id: None,
             kv_block_size: None,
+            pairing_protocol: None,
+            constrained_decoding: None,
             health: HealthCheckUpdate::default(),
             http_pool: HttpPoolConfig::default(),
             resilience: ResilienceUpdate::default(),
@@ -830,6 +912,62 @@ impl std::str::FromStr for TransportMode {
     }
 }
 
+/// Where media is fetched and preprocessed for one engine's gRPC workers.
+///
+/// - `Auto`: forward media references when every worker serving the model
+///   advertises worker-side processing; otherwise preprocess on the router.
+/// - `Router`: always preprocess on the router (kill switch).
+/// - `Worker`: forward references; a request carrying per-item hints is
+///   preprocessed on the router, which applies them; fail when no capable
+///   worker exists.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum MmProcessingMode {
+    #[default]
+    Auto,
+    Router,
+    Worker,
+}
+
+impl MmProcessingMode {
+    /// Parse from a case-insensitive string (`auto` | `router` | `worker`).
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "router" => Some(Self::Router),
+            "worker" => Some(Self::Worker),
+            _ => None,
+        }
+    }
+
+    /// Canonical lowercase name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Router => "router",
+            Self::Worker => "worker",
+        }
+    }
+}
+
+impl std::fmt::Display for MmProcessingMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for MmProcessingMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse(s).ok_or_else(|| {
+            format!("invalid multimodal processing mode '{s}'; expected auto|router|worker")
+        })
+    }
+}
+
 // ── API types ───────────────────────────────────────────────────────
 
 /// Worker information for API responses.
@@ -866,6 +1004,27 @@ pub struct WorkerInfo {
     #[serde(default)]
     pub http2: bool,
 
+    /// The effective PD pairing key of a prefill or decode worker: the
+    /// explicit `pairing_protocol`, else the descriptor derived from the
+    /// engine's labels (`runtime/transport/layout`; the engine version is
+    /// left out because it only counts under strict mode). Prefill and
+    /// decode workers pair only within one key. Absent on regular workers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pd_pairing: Option<String>,
+
+    /// Why the gateway's liveness tracker currently keeps the worker out of
+    /// routing (`unreachable` or `wedged`) while its health status stands;
+    /// absent when it is routable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stalled: Option<String>,
+
+    /// The worker's last polled engine load, as published by the load
+    /// monitor. `None` when load monitoring has produced nothing for this
+    /// worker yet. Unrelated to `load` above, which counts in-flight
+    /// requests the router has sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_load: Option<WorkerLoadResponse>,
+
     /// Job status for async operations (if available).
     pub job_status: Option<JobStatus>,
 }
@@ -881,6 +1040,9 @@ impl WorkerInfo {
             status: Some(WorkerStatus::Pending),
             load: 0,
             http2: false,
+            pd_pairing: None,
+            stalled: None,
+            engine_load: None,
             job_status,
         }
     }
@@ -1019,7 +1181,9 @@ impl HealthCheckUpdate {
 /// Per-worker HTTP connection configuration.
 /// All fields optional — `None` means "use router/global default".
 #[serde_with::skip_serializing_none]
-#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema,
+)]
 pub struct HttpPoolConfig {
     /// Max idle connections per host (default: 500).
     pub pool_max_idle_per_host: Option<usize>,
@@ -1251,22 +1415,20 @@ pub struct StopProfileRequest {
     pub url: Option<String>,
 }
 
-/// Result from getting worker loads
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct WorkerLoadsResult {
-    pub loads: Vec<WorkerLoadInfo>,
-    pub total_workers: usize,
-    pub successful: usize,
-    pub failed: usize,
-}
-
 /// Per-DP-rank load snapshot from a backend.
 ///
-/// Contains core metrics from the sglang `/v1/loads` endpoint or `GetLoads` gRPC RPC.
+/// Contains core metrics from the engine's `/v1/loads` endpoint or the `GetLoads` gRPC RPC.
 /// Each snapshot represents one data-parallel rank's scheduler state.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct SchedulerLoadSnapshot {
+    /// URL of the worker this rank belongs to. Set by a gateway serving a
+    /// fleet-wide `/loads`; engines reporting their own load leave it unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker: Option<String>,
+    /// `regular`, `prefill`, `decode`, or `encode`. Set alongside `worker`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_type: Option<String>,
     pub dp_rank: i32,
     pub num_running_reqs: i32,
     pub num_waiting_reqs: i32,
@@ -1278,6 +1440,10 @@ pub struct SchedulerLoadSnapshot {
     pub max_total_num_tokens: i32,
     /// Token usage ratio (0.0–1.0).
     pub token_usage: f64,
+    /// Non-evictable KV occupancy, excluding retained, reclaimable prefix cache.
+    /// Older backends omit this; pressure then uses their legacy token usage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_token_usage: Option<f64>,
     pub gen_throughput: f64,
     pub cache_hit_rate: f64,
     pub utilization: f64,
@@ -1288,7 +1454,7 @@ pub struct SchedulerLoadSnapshot {
     pub queues: Option<EngineQueueMetricsSnapshot>,
     /// PD disaggregation signals, populated only when the backend reports a
     /// `disagg` section. `None` for HTTP or older engines. Canonical schema
-    /// other engines map into; SGLang derives the queue depths from its
+    /// other engines map into; one engine derives the queue depths from its
     /// per-stage DisaggregationMetrics counters.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kv_transfer_latency_ms: Option<f64>,
@@ -1303,7 +1469,7 @@ pub struct SchedulerLoadSnapshot {
     pub disagg_mode: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct EngineMemoryMetricsSnapshot {
     pub weight_gb: f64,
@@ -1312,7 +1478,7 @@ pub struct EngineMemoryMetricsSnapshot {
     pub token_capacity: i32,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct EngineQueueMetricsSnapshot {
     pub waiting: i32,
@@ -1321,7 +1487,7 @@ pub struct EngineQueueMetricsSnapshot {
     pub retracted: i32,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct EngineAggregateMetricsSnapshot {
     pub total_running_reqs: i32,
@@ -1332,8 +1498,41 @@ pub struct EngineAggregateMetricsSnapshot {
     pub avg_utilization: f64,
 }
 
+impl EngineAggregateMetricsSnapshot {
+    /// Roll per-rank snapshots up into one summary. Counts sum, ratios
+    /// average, rounded the way the engine servicers round so a gateway
+    /// aggregate and an engine aggregate read the same.
+    ///
+    /// Returns `None` for an empty slice: no ranks reported means no load
+    /// data, which must not read as an idle fleet.
+    pub fn from_ranks(loads: &[SchedulerLoadSnapshot]) -> Option<Self> {
+        if loads.is_empty() {
+            return None;
+        }
+        let n = loads.len() as f64;
+        let sum_i32 = |f: fn(&SchedulerLoadSnapshot) -> i32| {
+            loads.iter().map(f).fold(0i32, i32::saturating_add)
+        };
+        let avg = |f: fn(&SchedulerLoadSnapshot) -> f64, decimals: i32| {
+            let scale = 10f64.powi(decimals);
+            (loads.iter().map(f).sum::<f64>() / n * scale).round() / scale
+        };
+
+        let total_running_reqs = sum_i32(|l| l.num_running_reqs);
+        let total_waiting_reqs = sum_i32(|l| l.num_waiting_reqs);
+        Some(Self {
+            total_running_reqs,
+            total_waiting_reqs,
+            total_reqs: total_running_reqs.saturating_add(total_waiting_reqs),
+            avg_token_usage: avg(|l| l.token_usage, 4),
+            avg_throughput: avg(|l| l.gen_throughput, 2),
+            avg_utilization: avg(|l| l.utilization, 4),
+        })
+    }
+}
+
 /// Full load response for a single worker across all DP ranks.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct WorkerLoadResponse {
     pub timestamp: String,
@@ -1342,6 +1541,14 @@ pub struct WorkerLoadResponse {
     pub loads: Vec<SchedulerLoadSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aggregate: Option<EngineAggregateMetricsSnapshot>,
+    /// When the engine's state behind this report was sampled, on the
+    /// gateway's clock: the poll's receipt, or a pushed record's receipt
+    /// less its age and the one-way latency. A policy that books in-flight
+    /// work locally releases only what it dispatched before this instant.
+    /// Not serialized: it is meaningful only in the process that set it.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub sampled_at: Option<std::time::Instant>,
 }
 
 impl WorkerLoadResponse {
@@ -1351,6 +1558,18 @@ impl WorkerLoadResponse {
             return 0.0;
         }
         self.loads.iter().map(|l| l.token_usage).sum::<f64>() / self.loads.len() as f64
+    }
+
+    /// Average non-evictable KV pressure, with the legacy fallback per rank.
+    pub fn effective_kv_pressure(&self) -> f64 {
+        if self.loads.is_empty() {
+            return 0.0;
+        }
+        self.loads
+            .iter()
+            .map(|load| load.active_token_usage.unwrap_or(load.token_usage))
+            .sum::<f64>()
+            / self.loads.len() as f64
     }
 
     /// Total used tokens summed across all DP ranks.
@@ -1365,9 +1584,10 @@ impl WorkerLoadResponse {
     /// A running engine always reports its KV token capacity, so a positive
     /// `max_total_num_tokens` on any rank marks the absolute-token fields
     /// (`num_used_tokens`, `dp_rank_loads`, `total_used_tokens`) as
-    /// meaningful. Callers that need absolute tokens — the `/get_loads`
-    /// scalar and the DP-rank load cache — should gate on this so a
-    /// ratio-only snapshot is not read as "0 tokens used".
+    /// meaningful. Callers that need absolute tokens — the DP-rank load
+    /// cache — should gate on this so a ratio-only snapshot is not read as
+    /// "0 tokens used", and on [`Self::ranks_are_dp_ranks`] so a fleet
+    /// rollup is not read as one engine's ranks.
     pub fn has_absolute_token_data(&self) -> bool {
         self.loads.iter().any(|l| l.max_total_num_tokens > 0)
     }
@@ -1380,6 +1600,11 @@ impl WorkerLoadResponse {
             .sum()
     }
 
+    /// Total running requests summed across all DP ranks.
+    pub fn total_running_reqs(&self) -> i64 {
+        self.loads.iter().map(|l| l.num_running_reqs as i64).sum()
+    }
+
     /// Total waiting (queued) requests summed across all DP ranks.
     pub fn total_waiting_reqs(&self) -> i64 {
         self.loads.iter().map(|l| l.num_waiting_reqs as i64).sum()
@@ -1390,6 +1615,17 @@ impl WorkerLoadResponse {
         self.loads.iter().map(|l| l.gen_throughput).sum()
     }
 
+    /// Whether these ranks are one engine's DP ranks rather than a
+    /// gateway's fleet rollup, where every entry names its own `worker`.
+    ///
+    /// `dp_rank` is only unique within an engine, so a rollup repeats
+    /// `dp_rank: 0` once per non-DP worker. Callers that key by rank — the
+    /// DP-rank load cache — must gate on this, or one worker's entry
+    /// overwrites another's.
+    pub fn ranks_are_dp_ranks(&self) -> bool {
+        self.loads.iter().all(|l| l.worker.is_none())
+    }
+
     pub fn dp_rank_loads(&self) -> HashMap<isize, isize> {
         let mut map = HashMap::new();
         for snapshot in &self.loads {
@@ -1397,17 +1633,6 @@ impl WorkerLoadResponse {
         }
         map
     }
-}
-
-/// Individual worker load information
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct WorkerLoadInfo {
-    pub worker: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub worker_type: Option<String>,
-    pub load: isize,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub details: Option<WorkerLoadResponse>,
 }
 
 #[cfg(feature = "axum")]
@@ -1475,24 +1700,6 @@ impl IntoResponse for ProfileResult {
         }
 
         (status, Json(body)).into_response()
-    }
-}
-
-#[cfg(feature = "axum")]
-impl IntoResponse for WorkerLoadsResult {
-    fn into_response(self) -> Response {
-        let loads: Vec<Value> = self
-            .loads
-            .iter()
-            .map(|info| {
-                let mut entry = json!({"worker": &info.worker, "load": info.load});
-                if let Some(ref details) = info.details {
-                    entry["details"] = json!(details);
-                }
-                entry
-            })
-            .collect();
-        Json(json!({"workers": loads})).into_response()
     }
 }
 
@@ -1716,5 +1923,148 @@ mod overload_update_tests {
             token_usage: Some(1.0),
         };
         assert!(!update.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod aggregate_rollup_tests {
+    use super::{EngineAggregateMetricsSnapshot, SchedulerLoadSnapshot};
+
+    fn rank(
+        num_running_reqs: i32,
+        num_waiting_reqs: i32,
+        token_usage: f64,
+        gen_throughput: f64,
+        utilization: f64,
+    ) -> SchedulerLoadSnapshot {
+        SchedulerLoadSnapshot {
+            num_running_reqs,
+            num_waiting_reqs,
+            token_usage,
+            gen_throughput,
+            utilization,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn no_ranks_is_none_not_idle() {
+        assert!(EngineAggregateMetricsSnapshot::from_ranks(&[]).is_none());
+    }
+
+    #[test]
+    fn counts_sum_and_ratios_average() {
+        let aggregate = EngineAggregateMetricsSnapshot::from_ranks(&[
+            rank(4, 1, 0.2, 100.0, 0.3),
+            rank(6, 3, 0.6, 200.0, 0.7),
+        ])
+        .expect("aggregate");
+
+        assert_eq!(aggregate.total_running_reqs, 10);
+        assert_eq!(aggregate.total_waiting_reqs, 4);
+        assert_eq!(aggregate.total_reqs, 14);
+        assert_eq!(aggregate.avg_token_usage, 0.4);
+        assert_eq!(aggregate.avg_throughput, 150.0);
+        assert_eq!(aggregate.avg_utilization, 0.5);
+    }
+
+    #[test]
+    fn averages_round_the_way_the_engines_round() {
+        // 1/3 at 4 decimals for ratios, 2 for throughput.
+        let aggregate = EngineAggregateMetricsSnapshot::from_ranks(&[
+            rank(0, 0, 1.0, 1.0, 1.0),
+            rank(0, 0, 0.0, 0.0, 0.0),
+            rank(0, 0, 0.0, 0.0, 0.0),
+        ])
+        .expect("aggregate");
+
+        assert_eq!(aggregate.avg_token_usage, 0.3333);
+        assert_eq!(aggregate.avg_throughput, 0.33);
+        assert_eq!(aggregate.avg_utilization, 0.3333);
+    }
+
+    #[test]
+    fn counts_saturate_instead_of_overflowing() {
+        let aggregate = EngineAggregateMetricsSnapshot::from_ranks(&[
+            rank(i32::MAX, i32::MAX, 0.0, 0.0, 0.0),
+            rank(1, 1, 0.0, 0.0, 0.0),
+        ])
+        .expect("aggregate");
+
+        assert_eq!(aggregate.total_running_reqs, i32::MAX);
+        assert_eq!(aggregate.total_reqs, i32::MAX);
+    }
+}
+
+#[cfg(test)]
+mod constrained_decoding_tests {
+    use super::*;
+
+    /// A label names one of the two policies or nothing; the spec's typed
+    /// value wins over the label; absent everywhere, a worker is `requested`.
+    #[test]
+    fn constrained_decoding_resolves_spec_then_label() {
+        assert_eq!(
+            ConstrainedDecoding::parse("always"),
+            Ok(ConstrainedDecoding::Always)
+        );
+        assert_eq!(
+            ConstrainedDecoding::parse(" requested "),
+            Ok(ConstrainedDecoding::Requested)
+        );
+        assert!(ConstrainedDecoding::parse("sometimes")
+            .unwrap_err()
+            .contains("'requested' or 'always'"));
+        assert_eq!(
+            ConstrainedDecoding::from_label(None),
+            ConstrainedDecoding::Requested
+        );
+        assert_eq!(
+            ConstrainedDecoding::from_label(Some("always")),
+            ConstrainedDecoding::Always
+        );
+        assert_eq!(
+            ConstrainedDecoding::from_label(Some("sometimes")),
+            ConstrainedDecoding::Requested
+        );
+        assert_eq!(ConstrainedDecoding::Always.as_label(), "always");
+
+        let mut spec = WorkerSpec::new("http://w:8000");
+        assert_eq!(
+            ConstrainedDecoding::of(&spec),
+            ConstrainedDecoding::Requested
+        );
+        spec.labels
+            .insert(ConstrainedDecoding::LABEL.to_string(), "always".to_string());
+        assert_eq!(ConstrainedDecoding::of(&spec), ConstrainedDecoding::Always);
+        spec.constrained_decoding = Some(ConstrainedDecoding::Requested);
+        assert_eq!(
+            ConstrainedDecoding::of(&spec),
+            ConstrainedDecoding::Requested
+        );
+    }
+
+    /// The spec field round-trips through JSON in the label's spelling and is
+    /// left out when unset.
+    #[test]
+    fn constrained_decoding_serializes_as_its_label_value() {
+        let mut spec = WorkerSpec::new("http://w:8000");
+        assert!(!serde_json::to_string(&spec)
+            .unwrap()
+            .contains("constrained_decoding"));
+        spec.constrained_decoding = Some(ConstrainedDecoding::Always);
+        let json = serde_json::to_value(&spec).unwrap();
+        assert_eq!(json["constrained_decoding"], "always");
+        let parsed: WorkerSpec =
+            serde_json::from_str(r#"{"url":"http://w:8000","constrained_decoding":"requested"}"#)
+                .unwrap();
+        assert_eq!(
+            parsed.constrained_decoding,
+            Some(ConstrainedDecoding::Requested)
+        );
+        assert!(serde_json::from_str::<WorkerSpec>(
+            r#"{"url":"http://w:8000","constrained_decoding":"sometimes"}"#
+        )
+        .is_err());
     }
 }

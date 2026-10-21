@@ -5,23 +5,29 @@ use serde_json::{Map, Value};
 use validator::Validate;
 
 use super::{
-    common::{default_true, deserialize_null_as_false, is_false, GenerationRequest, InputIds},
+    common::{
+        default_true, deserialize_null_as_false, is_false, CachePartition, GenerationRequest,
+        InputIds,
+    },
     sampling_params::SamplingParams,
 };
 use crate::validated::Normalizable;
 
 // ============================================================================
-// SGLang Generate API (native format)
+// The native Generate API (one engine's own format)
 // ============================================================================
 
 #[derive(Clone, Debug, Serialize, Deserialize, Validate, schemars::JsonSchema)]
 #[validate(schema(function = "validate_generate_request"))]
 pub struct GenerateRequest {
-    /// Text input - SGLang native format
+    /// Text input - the native format
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
 
-    #[serde(default = "super::common::default_unknown_model")]
+    #[serde(
+        default = "super::common::default_unknown_model",
+        skip_serializing_if = "super::common::is_unknown_model"
+    )]
     pub model: String,
 
     /// Input IDs for tokenized input
@@ -55,7 +61,7 @@ pub struct GenerateRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audio_data: Option<Value>,
 
-    /// Sampling parameters (sglang style)
+    /// Sampling parameters (the native API's style)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sampling_params: Option<SamplingParams>,
 
@@ -108,7 +114,7 @@ pub struct GenerateRequest {
     pub lora_id: Option<String>,
 
     /// Custom logit processor for advanced sampling control. Must be a serialized instance
-    /// of `CustomLogitProcessor` in python/sglang/srt/sampling/custom_logit_processor.py
+    /// of the engine's `CustomLogitProcessor` (srt/sampling/custom_logit_processor.py).
     /// Use the processor's `to_str()` method to generate the serialized string.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub custom_logit_processor: Option<String>,
@@ -202,6 +208,17 @@ fn validate_generate_request(req: &GenerateRequest) -> Result<(), validator::Val
     Ok(())
 }
 
+impl GenerateRequest {
+    /// The choices the request asks for: the sampling `n`, one when absent or zero.
+    pub fn choices(&self) -> u32 {
+        self.sampling_params
+            .as_ref()
+            .and_then(|params| params.n)
+            .filter(|&n| n > 0)
+            .unwrap_or(1)
+    }
+}
+
 impl GenerationRequest for GenerateRequest {
     fn rid(&self) -> Option<&str> {
         self.rid.as_deref()
@@ -209,6 +226,17 @@ impl GenerationRequest for GenerateRequest {
 
     fn is_stream(&self) -> bool {
         self.stream
+    }
+
+    fn cache_partition(&self) -> CachePartition<'_> {
+        CachePartition {
+            // Another engine's `cache_salt` is a passthrough extension on this
+            // protocol; `extra_key` is the native API's typed classification key.
+            cache_salt: self.other.get("cache_salt").and_then(Value::as_str),
+            extra_key: self.extra_key.as_deref(),
+            // Either name identifies the adapter the engine namespaces by.
+            lora_path: self.lora_path.as_deref().or(self.lora_id.as_deref()),
+        }
     }
 
     fn get_model(&self) -> Option<&str> {
@@ -257,10 +285,10 @@ impl GenerationRequest for GenerateRequest {
 }
 
 // ============================================================================
-// SGLang Generate Response Types
+// Native Generate Response Types
 // ============================================================================
 
-/// SGLang generate response (single completion or array for n>1)
+/// Native generate response (single completion or array for n>1)
 ///
 /// Format for n=1:
 /// ```json
@@ -400,5 +428,58 @@ mod tests {
 
         let r = req();
         assert_eq!(r.routing_tokens(), None);
+    }
+
+    #[test]
+    fn absent_model_reads_as_the_wildcard_and_is_not_serialized_back() {
+        let request: GenerateRequest =
+            serde_json::from_value(serde_json::json!({ "text": "hi" })).unwrap();
+        assert_eq!(request.model, crate::UNKNOWN_MODEL_ID);
+        let v = serde_json::to_value(&request).unwrap();
+        assert!(
+            v.get("model").is_none(),
+            "wildcard placeholder serialized: {v}"
+        );
+
+        let explicit: GenerateRequest =
+            serde_json::from_value(serde_json::json!({ "text": "hi", "model": "m" })).unwrap();
+        let v = serde_json::to_value(&explicit).unwrap();
+        assert_eq!(v["model"], "m");
+    }
+
+    #[test]
+    fn cache_partition_uses_the_typed_extra_key_and_falls_back_to_lora_id() {
+        let request: GenerateRequest = serde_json::from_value(serde_json::json!({
+            "text": "hi",
+            "extra_key": "k",
+            "lora_id": "adapter-id",
+            "cache_salt": "tenant-a"
+        }))
+        .unwrap();
+        let partition = request.cache_partition();
+        assert_eq!(partition.cache_salt, Some("tenant-a"));
+        assert_eq!(partition.extra_key, Some("k"));
+        assert_eq!(partition.lora_path, Some("adapter-id"));
+
+        let typed_path: GenerateRequest = serde_json::from_value(serde_json::json!({
+            "text": "hi",
+            "lora_path": "adapter-path",
+            "lora_id": "adapter-id"
+        }))
+        .unwrap();
+        assert_eq!(typed_path.cache_partition().lora_path, Some("adapter-path"));
+        assert!(typed_path.cache_partition().cache_salt.is_none());
+    }
+
+    /// The sampling `n` is the number of choices; absent and zero both mean one.
+    #[test]
+    fn a_generate_request_asks_for_at_least_one_choice() {
+        assert_eq!(req().choices(), 1);
+        let with_n = |n: u32| -> GenerateRequest {
+            serde_json::from_value(serde_json::json!({"model": "m", "sampling_params": {"n": n}}))
+                .expect("a generate request")
+        };
+        assert_eq!(with_n(0).choices(), 1);
+        assert_eq!(with_n(4).choices(), 4);
     }
 }

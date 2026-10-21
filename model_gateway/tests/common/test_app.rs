@@ -10,7 +10,7 @@ use smg::{
     middleware::{AuthConfig, TokenBucket},
     policies::PolicyRegistry,
     routers::RouterTrait,
-    server::{build_app, AppState},
+    server::{build_app, build_apps, AppState, GatewayApps},
     worker::{
         BasicWorkerBuilder, ModelCard, RuntimeType, Worker, WorkerMonitor, WorkerRegistry,
         WorkerType,
@@ -104,7 +104,7 @@ pub fn create_test_app(
         probe_state: start_probe_state(&app_context),
         context: app_context,
         admission_queue: None,
-        router_manager: None,
+        gateway: None,
         mesh_handler: None,
         mesh_adapters: None,
     });
@@ -163,13 +163,41 @@ pub fn create_test_app_with_context(
     router: Arc<dyn RouterTrait>,
     app_context: Arc<AppContext>,
 ) -> Router {
+    create_test_app_with_context_and_auth(router, app_context, None)
+}
+
+/// Exercise the production route wrapper with initialized control-plane auth.
+pub fn create_test_app_with_context_and_auth(
+    router: Arc<dyn RouterTrait>,
+    app_context: Arc<AppContext>,
+    control_plane_auth: Option<smg_auth::ControlPlaneAuthState>,
+) -> Router {
+    build_test_apps(router, app_context, control_plane_auth, false).data
+}
+
+/// The production routers with an existing AppContext: the data listener's
+/// and, with `admin_listener`, the admin listener's.
+pub fn create_test_apps_with_context(
+    router: Arc<dyn RouterTrait>,
+    app_context: Arc<AppContext>,
+    admin_listener: bool,
+) -> GatewayApps {
+    build_test_apps(router, app_context, None, admin_listener)
+}
+
+fn build_test_apps(
+    router: Arc<dyn RouterTrait>,
+    app_context: Arc<AppContext>,
+    control_plane_auth: Option<smg_auth::ControlPlaneAuthState>,
+    admin_listener: bool,
+) -> GatewayApps {
     // Create AppState with the test router and context
     let app_state = Arc::new(AppState {
         router,
         probe_state: start_probe_state(&app_context),
         context: app_context.clone(),
         admission_queue: None,
-        router_manager: None,
+        gateway: None,
         mesh_handler: None,
         mesh_adapters: None,
     });
@@ -198,14 +226,15 @@ pub fn create_test_app_with_context(
         clippy::expect_used,
         reason = "test helper assumes router config is already validated"
     )]
-    build_app(
+    build_apps(
         app_state,
         serving_auth_config,
         admin_auth_config,
-        None, // No control plane auth for tests
+        control_plane_auth,
         router_config.max_payload_size,
         request_id_headers,
         router_config.cors_allowed_origins.clone(),
+        admin_listener,
     )
     .expect("valid tenant resolution config")
 }
@@ -218,7 +247,12 @@ pub fn create_test_app_with_context(
 )]
 pub async fn create_test_app_context() -> Arc<AppContext> {
     let router_config = RouterConfig::default();
-    let client = Client::new();
+    // A test's upstreams are its own loopback servers; the environment's
+    // proxy would otherwise sit in the path of every request.
+    let client = smg::clients::http_client_builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     // Initialize empty OnceLocks
     let worker_job_queue = Arc::new(OnceLock::new());

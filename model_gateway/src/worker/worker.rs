@@ -1,16 +1,19 @@
 use std::{
     any::Any,
+    collections::HashMap,
     fmt,
+    pin::Pin,
     sync::{
-        atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering},
+        atomic::{AtomicBool, Ordering},
         Arc, OnceLock,
     },
+    task::{Context, Poll},
     time::Duration,
 };
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use async_trait::async_trait;
-use axum::body::Body;
+use futures_util::Stream;
 // Re-export protocol types as the canonical types for the gateway
 pub use openai_protocol::worker::{ConnectionMode, ProfileOptions, RuntimeType, WorkerType};
 use openai_protocol::{
@@ -20,21 +23,23 @@ use openai_protocol::{
 };
 use smg_grpc_client::common_proto;
 use tokio::{
-    sync::{mpsc, OnceCell},
+    sync::{mpsc, Notify, OnceCell},
     task::AbortHandle,
     time,
 };
 
+pub(crate) use super::runtime::COLD_PREFILL_TOKENS_PER_SEC;
 use super::{
-    event::WorkerConnected, overload::OverloadThresholds, CircuitBreaker, ResolvedResilience,
-    WorkerError, WorkerResult, UNKNOWN_MODEL_ID,
+    event::WorkerConnected, overload::OverloadThresholds, pd_pairing::PdPairing, CircuitBreaker,
+    ResolvedResilience, WorkerError, WorkerResult, UNKNOWN_MODEL_ID,
+};
+pub use super::{
+    load::{WorkerLoadGuard, WorkerRoutingKeyLoad},
+    runtime::{RoutingState, StallReason, WorkerRuntime},
 };
 use crate::{
     observability::metrics::{metrics_labels, Metrics},
-    routers::{
-        common::header_utils::extract_routing_key,
-        grpc::{backend_client::BackendClient, client::GrpcClient, zmq_client},
-    },
+    routers::grpc::{backend_client::BackendClient, client::GrpcClient, zmq_client},
 };
 
 /// A worker's HTTP client handle, materialized on first use.
@@ -85,7 +90,8 @@ impl LazyHttpClient {
     }
 
     fn init(&self) -> &Arc<reqwest::Client> {
-        self.cell.get_or_init(|| Arc::new(reqwest::Client::new()))
+        self.cell
+            .get_or_init(|| Arc::new(crate::clients::http_client()))
     }
 }
 
@@ -108,6 +114,8 @@ async fn connect_zmq_backend(
     runtime: RuntimeType,
     handshake_override: Option<String>,
     engine_count: usize,
+    startup: Duration,
+    request_timeout: Option<Duration>,
 ) -> WorkerResult<Arc<BackendClient>> {
     zmq_client::connect_for_worker(
         &base_url,
@@ -115,6 +123,8 @@ async fn connect_zmq_backend(
         runtime,
         handshake_override.as_deref(),
         engine_count,
+        startup,
+        request_timeout,
     )
     .await
     .map(|client| Arc::new(BackendClient::Zmq(client)))
@@ -132,6 +142,12 @@ pub const MOONCAKE_CONNECTOR: &str = "MooncakeConnector";
 
 /// vLLM NIXL KV connector name
 pub const NIXL_CONNECTOR: &str = "NixlConnector";
+
+/// vLLM MoRI-IO KV connector name
+pub const MORIIO_CONNECTOR: &str = "MoRIIOConnector";
+
+/// Worker label naming a MoRI-IO engine's transfer mode, `read` or `write`.
+pub const MORIIO_MODE_LABEL: &str = "moriio_mode";
 
 /// POST an admin endpoint on an HTTP worker and map the outcome to a
 /// [`WorkerResult`].
@@ -180,8 +196,8 @@ fn require_backend_client(
 
 /// EngineCore exposes no admin RPCs over ZMQ, so these ops can never succeed for
 /// a ZMQ worker. Reject them up front rather than dispatching to client
-/// acquisition, which would otherwise drive the (up to 10-minute) lazy handshake
-/// only to return `unimplemented`.
+/// acquisition, which would otherwise drive the lazy handshake (as long as a
+/// model load) only to return `unimplemented`.
 fn zmq_admin_unsupported(url: &str, operation: &str) -> WorkerError {
     WorkerError::OperationFailed {
         url: url.to_string(),
@@ -216,80 +232,44 @@ fn admin_grpc_result(
     }
 }
 
-pub struct WorkerRoutingKeyLoad {
-    url: String,
-    active_routing_keys: dashmap::DashMap<String, usize>,
+/// Context window advertised for `model_id` in `models`: the matching card's
+/// (aliases included), else the primary card's. Borrows only, so it is safe on
+/// the per-request path.
+fn context_length_from(models: &WorkerModels, model_id: &str) -> Option<u32> {
+    models
+        .find(model_id)
+        .or_else(|| models.primary())
+        .and_then(|card| card.context_length)
 }
 
-impl WorkerRoutingKeyLoad {
-    pub fn new(url: impl Into<String>) -> Self {
-        Self {
-            url: url.into(),
-            active_routing_keys: dashmap::DashMap::new(),
-        }
-    }
+/// The labels that name a worker's running window, in the order the reader
+/// (`Worker::max_running_requests`) prefers them.
+pub(crate) const WINDOW_LABELS: [&str; 2] = ["max_num_seqs", "max_running_requests"];
 
-    pub fn value(&self) -> usize {
-        self.active_routing_keys.len()
-    }
-
-    /// In-flight requests for one routing key.
-    pub fn key_inflight(&self, routing_key: &str) -> usize {
-        self.active_routing_keys
-            .get(routing_key)
-            .map_or(0, |count| *count)
-    }
-
-    pub fn increment(&self, routing_key: &str) {
-        *self
-            .active_routing_keys
-            .entry(routing_key.to_string())
-            .or_insert(0) += 1;
-        self.update_metrics();
-    }
-
-    pub fn decrement(&self, routing_key: &str) {
-        use dashmap::mapref::entry::Entry;
-
-        match self.active_routing_keys.entry(routing_key.to_string()) {
-            Entry::Occupied(mut entry) => {
-                let counter = entry.get_mut();
-                if *counter > 0 {
-                    *counter -= 1;
-                    if *counter == 0 {
-                        entry.remove();
-                    }
-                } else {
-                    tracing::warn!(
-                        worker_url = %self.url,
-                        routing_key = %routing_key,
-                        "Attempted to decrement routing key counter that is already at 0"
-                    );
-                }
-            }
-            Entry::Vacant(_) => {
-                tracing::warn!(
-                    worker_url = %self.url,
-                    routing_key = %routing_key,
-                    "Attempted to decrement non-existent routing key"
-                );
+/// A worker's labels after a merge: `current` (the discovered labels at
+/// registration, the worker's own on a label update) with `by_hand` (the
+/// spec's own labels, the request's) on top. A window the operator set by
+/// hand is the worker's only window: a window under the other name is
+/// dropped, since the reader prefers `max_num_seqs` to `max_running_requests`
+/// and would otherwise take the engine's figure over the operator's, on
+/// every worker, expanded per rank or not. Registration, the admin label
+/// update and its early cap check all merge through here.
+pub(crate) fn merge_labels(
+    current: &HashMap<String, String>,
+    by_hand: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut labels = current.clone();
+    if WINDOW_LABELS.iter().any(|key| by_hand.contains_key(*key)) {
+        for key in WINDOW_LABELS {
+            if !by_hand.contains_key(key) {
+                labels.remove(key);
             }
         }
-        self.update_metrics();
     }
-
-    fn update_metrics(&self) {
-        Metrics::set_worker_routing_keys_active(&self.url, self.value());
+    for (key, value) in by_hand {
+        labels.insert(key.clone(), value.clone());
     }
-}
-
-impl fmt::Debug for WorkerRoutingKeyLoad {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("WorkerRoutingKeyLoad")
-            .field("url", &self.url)
-            .field("active_routing_keys", &self.value())
-            .finish()
-    }
+    labels
 }
 
 /// Core worker abstraction that represents a backend service
@@ -319,6 +299,12 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// can be discarded without mutating the newly installed worker object.
     fn revision(&self) -> u64 {
         0
+    }
+
+    /// Epochs reported during metadata discovery, invalidated after a health
+    /// failure. These are observations, not proof against an undetected restart.
+    fn cache_trace_epochs(&self) -> Vec<String> {
+        Vec::new()
     }
 
     /// Set the worker's lifecycle status.
@@ -377,8 +363,87 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// Increment the load counter
     fn increment_load(&self);
 
+    /// Increment the load counter only when the resulting value does not exceed `max`.
+    ///
+    /// Implementations backed by an atomic counter should override this method
+    /// with a compare-and-update operation. This fallback preserves the limit
+    /// for existing external implementations, but can reject usable capacity
+    /// during concurrent attempts.
+    fn try_increment_load(&self, max: usize) -> bool {
+        self.increment_load();
+        if self.load() <= max {
+            true
+        } else {
+            self.decrement_load();
+            false
+        }
+    }
+
     /// Decrement the load counter
     fn decrement_load(&self);
+
+    /// The request-completion observer installed on this worker, if any
+    /// (see [`RequestCompletionSink`]).
+    fn completion_sink(&self) -> Option<Arc<dyn RequestCompletionSink>> {
+        None
+    }
+
+    /// Install (or clear) the request-completion observer.
+    fn set_completion_sink(&self, _sink: Option<Arc<dyn RequestCompletionSink>>) {}
+
+    /// Claim `count` PD bootstrap rooms while the worker's claimed total
+    /// stays within `window`; a refusal claims nothing.
+    ///
+    /// The PD admission gate reserves through this rather than comparing
+    /// [`Worker::load`] to the window: a read-then-send lets two dispatches
+    /// both take the last free slot, which is exactly the over-window burst
+    /// the gate exists to prevent.
+    ///
+    /// The defaults admit unconditionally and track nothing. They exist for
+    /// implementations that carry no shared runtime (the language bindings,
+    /// test doubles): the gate only reaches a worker that reports a running
+    /// window, and any implementation that does report one must override
+    /// these three with a real claim, or the window is not enforced (and
+    /// the three queue methods after them with a real order, or the wait
+    /// is not first come, first served).
+    fn try_admit_pd(&self, _count: usize, _window: usize) -> bool {
+        true
+    }
+
+    /// Release `count` rooms claimed by [`Worker::try_admit_pd`].
+    fn release_pd(&self, _count: usize) {}
+
+    /// Rooms currently claimed on this worker.
+    fn pd_admitted(&self) -> usize {
+        0
+    }
+
+    /// Take a place at the back of this worker's admission queue for a
+    /// dispatch that needs `rooms`. The gate lets it claim only while no older
+    /// place needs as few rooms ([`Worker::pd_may_claim`]), which is what
+    /// hands a freed room to the request that has waited longest for one;
+    /// the place is given back through [`Worker::pd_dequeue`] however the
+    /// wait ends.
+    fn pd_enqueue(&self, _rooms: usize) -> u64 {
+        0
+    }
+
+    /// Whether `place` may claim: no older place still waiting needs as few
+    /// rooms as it does, or fewer. The default never queues, so it always may.
+    fn pd_may_claim(&self, _place: u64) -> bool {
+        true
+    }
+
+    /// Give `place` back, whether its dispatch claimed, was shed, or stopped
+    /// waiting early; the places behind it move up.
+    fn pd_dequeue(&self, _place: u64) {}
+
+    /// The notifier of `place`, fired when it is worth trying again: rooms
+    /// were released, or a place ahead of it left. `None` (the default, or a
+    /// place already given back) leaves the gate to its retry interval.
+    fn pd_wake(&self, _place: u64) -> Option<Arc<Notify>> {
+        None
+    }
 
     /// Get the current routing-key load cardinality.
     fn routing_key_load(&self) -> usize;
@@ -401,23 +466,43 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// Get worker-specific metadata
     fn metadata(&self) -> &WorkerMetadata;
 
+    /// The PD pairing descriptor placement compares across a prefill and a
+    /// decode.
+    fn pd_pairing(&self) -> &PdPairing {
+        &self.metadata().pd_pairing
+    }
+
     /// Worker-reported in-flight capacity, if available.
     ///
-    /// Reads the `max_running_requests` label populated by the metadata
-    /// discovery pipeline (Step 4 of the worker lifecycle). Returns
-    /// `None` when the worker hasn't reported a value or reports zero
-    /// (zero is meaningless for capacity accounting).
+    /// Reads the running-window label populated by the metadata discovery
+    /// pipeline (Step 4 of the worker lifecycle). Returns `None` when the
+    /// worker hasn't reported a value or reports zero (zero is meaningless
+    /// for capacity accounting).
+    ///
+    /// Engines spell the same window two ways — TokenSpeed and vLLM
+    /// advertise `max_num_seqs`, SGLang advertises `max_running_requests` —
+    /// and both are the count of requests the scheduler will run at once, so
+    /// both are read here rather than leaving TokenSpeed workers looking like
+    /// non-reporters. `max_num_seqs` wins when a worker reports both: it is
+    /// the authoritative name for the engines that use it, and it is the
+    /// order `smg_grpc_servicer.tokenspeed.loads::running_window` reports in,
+    /// so the label and the `GetLoads` report cannot disagree.
     ///
     /// `WorkerCapacity` uses this to derive total fleet capacity when
     /// every worker reports; falls back to a configured per-worker
-    /// estimate otherwise.
+    /// estimate otherwise. The PD admission gate uses it as the decode
+    /// side's admission bound.
     fn max_running_requests(&self) -> Option<u16> {
-        self.metadata()
-            .spec
-            .labels
-            .get("max_running_requests")
-            .and_then(|s| s.parse::<u16>().ok())
+        let labels = &self.metadata().spec.labels;
+        WINDOW_LABELS
+            .iter()
+            .find_map(|key| labels.get(*key))
+            .and_then(|s| s.parse::<u64>().ok())
             .filter(|n| *n > 0)
+            // A figure wider than the count (an explicit flag above 65535 on
+            // a large engine) saturates: a window that wide is the widest the
+            // gate and the capacity sum can use, not no window at all.
+            .map(|n| u16::try_from(n).unwrap_or(u16::MAX))
     }
 
     /// Whether this worker can serve the Realtime API (WS/WebRTC/REST
@@ -444,14 +529,17 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// Check if the worker is available (healthy + circuit closed/half-open +
     /// not vetoed by the absolute overload guard).
     fn is_available(&self) -> bool {
-        self.is_healthy() && self.circuit_breaker_can_execute() && !self.is_overloaded()
+        self.is_healthy()
+            && self.circuit_breaker_can_execute()
+            && !self.is_overloaded()
+            && self.stall_reason().is_none()
     }
 
     /// [`Self::is_healthy`] fused with the overload veto. For the hash policies,
     /// which route on health alone and never consult the circuit breaker;
     /// `BasicWorker` overrides it to read both under a single runtime guard.
     fn is_healthy_and_eligible(&self) -> bool {
-        self.is_healthy() && !self.is_overloaded()
+        self.is_healthy() && !self.is_overloaded() && self.stall_reason().is_none()
     }
 
     /// Whether the absolute overload guard currently vetoes this worker.
@@ -464,10 +552,239 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
 
     /// Set the overload veto, returning `true` when the flag actually changed.
     ///
-    /// Route writes through [`WorkerRegistry::set_worker_overloaded`] instead of
+    /// Route writes through [`WorkerRegistry::set_worker_overloaded`](crate::worker::WorkerRegistry::set_worker_overloaded) instead of
     /// calling this directly: the per-model counters and the
     /// `smg_workers_overloaded` gauge move only on transitions.
     fn set_overloaded(&self, _overloaded: bool) -> bool {
+        false
+    }
+
+    /// Why the liveness tracker vetoes this worker, if it does.
+    fn stall_reason(&self) -> Option<StallReason> {
+        None
+    }
+
+    /// Set or clear the liveness veto, returning `true` when it changed.
+    /// Route writes through [`super::liveness`], which logs and counts the
+    /// transition.
+    fn set_stall(&self, _reason: Option<StallReason>) -> bool {
+        false
+    }
+
+    /// Record a successful interaction with the worker (a poll answered, a
+    /// probe passed, an event batch, a response).
+    fn note_contact(&self) {}
+
+    /// Record a token or a completion from the worker.
+    fn note_token_progress(&self) {}
+
+    /// Record a transport failure (a poll, probe or stream that failed on the
+    /// connection); cleared by the next contact.
+    fn note_transport_failure(&self) {}
+
+    /// Whether a transport failure happened since the last contact.
+    fn transport_failure_pending(&self) -> bool {
+        false
+    }
+
+    /// Time since the last successful contact.
+    fn contact_age(&self) -> Duration {
+        Duration::ZERO
+    }
+
+    /// Time since the last token or completion.
+    fn token_progress_age(&self) -> Duration {
+        Duration::ZERO
+    }
+
+    /// Record a load record pushed on the worker's own KV-event stream: from
+    /// here on the worker is expected to be heard from at the stream's
+    /// cadence (see [`super::liveness`]).
+    fn note_load_record(&self) {}
+
+    /// Whether the worker's stream has ever pushed a load record.
+    fn pushes_load_records(&self) -> bool {
+        false
+    }
+
+    /// Record whether the worker's latest load record reports its engine
+    /// silent on its in-flight requests for the wedge bound (see
+    /// [`super::liveness`]).
+    fn note_engine_stall(&self, _stalled: bool) {}
+
+    /// Whether the latest load record reported the engine stalled.
+    fn engine_stalled(&self) -> bool {
+        false
+    }
+
+    /// The prefill rate observed on this worker, tokens per second; zero
+    /// until a window of first tokens has been seen.
+    fn prefill_rate_tps(&self) -> u64 {
+        0
+    }
+    /// Record the start of a request whose responses the gateway sees one by
+    /// one (a streaming generation to this worker over gRPC): the pile the
+    /// wedged rule counts, and the start of its clock when a run begins.
+    /// Requests without that signal (HTTP, a PD side, a non-streaming
+    /// generation) never form a pile.
+    fn note_tracked_started(&self) {}
+    /// Record the end of a tracked request.
+    fn note_tracked_ended(&self) {}
+    /// Requests in flight whose responses the gateway sees one by one.
+    fn tracked_load(&self) -> usize {
+        0
+    }
+    /// Record the first token or completion of a stream from this worker:
+    /// from here until its end the stream is one the worker is producing for.
+    fn note_output_started(&self) {}
+    /// Record the end of a stream that had produced output.
+    fn note_output_ended(&self) {}
+    /// How long the worker has produced nothing while it still holds streams
+    /// it had been producing for: `Some(age)` when at least one stream past
+    /// its first token or completion is open and the last token or
+    /// completion from the worker was `age` ago; `None` when no such stream
+    /// is open (an idle worker, one whose streams all ended, one whose
+    /// in-flight work has shown nothing yet: nothing to judge it by), or for
+    /// a worker that does not track it. The signal a disaggregated request
+    /// reads on its decode partner when its prefill side's silence bound
+    /// passes on the parallel dispatch shape, where the prefill's first
+    /// response waits for the decode side. The age is that of the last
+    /// response the gateway read, not of the engine's last production: a
+    /// stream whose reader stops polling (a client that stays connected and
+    /// stops reading its bounded channel) keeps its open count and ages, so
+    /// a decode whose only open producing streams belong to such readers
+    /// can read as silent while a frozen prefill is the cause; the two
+    /// conditions together are the limit of this signal.
+    fn output_silence(&self) -> Option<Duration> {
+        None
+    }
+
+    /// Store the engine's reported waiting-queue depth, returning the previous
+    /// value.
+    fn swap_waiting_reqs(&self, _waiting: i64) -> i64 {
+        0
+    }
+
+    /// Store the in-flight count seen by the liveness sweep, returning the
+    /// previous sample.
+    fn swap_load_sample(&self, _load: usize) -> usize {
+        0
+    }
+
+    /// A notifier fired on every contact with the worker, for loops that back
+    /// off from it and should retry as soon as it is heard from again.
+    fn contact_wake(&self) -> Option<Arc<Notify>> {
+        None
+    }
+
+    /// Ask the health manager to promote the worker now, on the strength of a
+    /// successful contact, instead of at its next scheduled probe.
+    fn signal_connected(&self) {}
+
+    /// Close the circuit breaker: a liveness veto was cleared by a contact,
+    /// so the failures that opened it belong to the outage. It reopens on
+    /// fresh failures like any closed breaker. A health promotion goes
+    /// through [`Self::readmit_circuit_breaker`] instead: an open breaker is
+    /// put on trial, not closed.
+    fn reset_circuit_breaker(&self) {}
+
+    /// The worker's health returned: put its open circuit breaker on trial
+    /// (half-open) now, as its timeout would, or forget the failure streak a
+    /// still-closed breaker banked during the outage. Returns whether an
+    /// open breaker went on trial; a worker without a breaker never does.
+    fn readmit_circuit_breaker(&self) -> bool {
+        false
+    }
+
+    /// Record that the worker just became routable (promotion to Ready, or a
+    /// liveness veto cleared); the warm-up slice counts from here.
+    fn note_admitted(&self) {}
+
+    /// Time since the worker last became routable; `Duration::MAX` for a
+    /// worker that does not track it (never warming).
+    fn admitted_age(&self) -> Duration {
+        Duration::MAX
+    }
+
+    /// Blocks the worker's index has gained since its current admission, for
+    /// the warm-up slice; `indexed` is what the index holds for it now. A
+    /// worker that does not track admissions reports the count itself.
+    fn warmup_growth(&self, indexed: usize) -> usize {
+        indexed
+    }
+
+    /// Gateway clock (`liveness::now_ms`) before which a thin worker with
+    /// requests in flight takes no further diverted hit (see
+    /// `CacheAwarePolicy::warmup_divert`); zero for a worker that does not
+    /// track it.
+    fn divert_until_ms(&self) -> u64 {
+        0
+    }
+
+    /// A hit was diverted to this thin worker; the next one waits until
+    /// `until_ms` while it has anything in flight.
+    fn note_diverted(&self, _until_ms: u64) {}
+
+    /// A request of `tokens` prompt tokens was dispatched: work the engine
+    /// still has to prefill before its first token (see
+    /// [`Self::prefill_backlog`]). `timed` says the gateway will see that
+    /// first token on its own (a streaming generation), so the prompt's
+    /// prefill can be timed for the worker's rate; a non-streaming
+    /// generation answers once, at its end, and its prompt counts in the
+    /// backlog only.
+    fn note_prefill_started(&self, _tokens: u64, _timed: bool) {}
+
+    /// The request's first token came back, with `cached` of its prompt
+    /// tokens reported served from the engine's prefix cache (`Some`; zero
+    /// when the engine reports no count), or its stream ended or was dropped
+    /// before one (`None`): its prompt is no longer pending prefill. `timed`
+    /// as at its start.
+    fn note_prefill_ended(&self, _tokens: u64, _timed: bool, _cached: Option<u64>) {}
+
+    /// How long the engine may still need before the first token of its
+    /// in-flight work is due: the prompt tokens dispatched and not yet
+    /// answered, over the prefill rate observed on this worker (a cold prior
+    /// until one is). Zero for a worker that does not track it.
+    fn prefill_backlog(&self) -> Duration {
+        Duration::ZERO
+    }
+
+    /// [`Self::prefill_backlog`] with `tokens` more prompt tokens about to
+    /// be dispatched: how long the engine may need before the first token of
+    /// a prompt of that length is due, behind what is already pending. Zero
+    /// for a worker that does not track it.
+    fn prefill_eta(&self, _tokens: u64) -> Duration {
+        Duration::ZERO
+    }
+
+    /// How long ago a prompt dispatched to the worker was last answered with
+    /// its first token (or, for a non-streaming generation, its one answer):
+    /// the worker's latest first response, the evidence that it answers at
+    /// all. `None` for a worker that has answered none since the gateway
+    /// started, or does not track it.
+    fn prefill_answered_ago(&self) -> Option<Duration> {
+        None
+    }
+
+    /// How long the worker's current run of pending prompts (since its
+    /// pending backlog last left zero) has waited for its first answer,
+    /// plus the time earlier runs since its latest first response held
+    /// prompts and ended unanswered (given up on, or dropped): its silence,
+    /// the spells it held nothing left out. `None` while nothing is pending,
+    /// once the run has had an answer, or for a worker that does not track
+    /// its runs.
+    fn prefill_unanswered_run(&self) -> Option<Duration> {
+        None
+    }
+
+    /// Whether the engine behind the worker is on a prompt shape it has not
+    /// shown it runs: a prompt pending on the worker, or one of `tokens`
+    /// about to be dispatched, longer than any the worker has answered since
+    /// the gateway started, on a worker that has answered at least one. A
+    /// worker that has answered nothing has shown no shape to go by, and is
+    /// judged like any other; so is a worker that does not track it
+    /// (`false`).
+    fn prefill_cold_shape(&self, _tokens: u64) -> bool {
         false
     }
 
@@ -483,6 +800,7 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
             load: self.load(),
             processed: self.processed_requests(),
             overloaded: self.is_overloaded(),
+            stalled: self.stall_reason().is_some(),
         }
     }
 
@@ -499,18 +817,31 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// pass the status code returned to the client (e.g., 502 for a send
     /// error, 504 for a timeout).
     fn record_outcome(&self, status_code: u16) {
-        let resilience = self.resilience();
         // Capacity pushback (429 by default) is a routing signal, not a
         // worker fault: the request is retried elsewhere, but no
         // circuit-breaker sample is recorded in either direction — opening
         // the breaker on backpressure would amplify a load spike into
         // unavailability, and crediting a success would close a half-open
         // breaker on a request the worker refused.
-        if resilience.capacity_status_codes.contains(&status_code) {
+        if self
+            .resilience()
+            .capacity_status_codes
+            .contains(&status_code)
+        {
             return;
         }
-        let is_failure = resilience.retryable_status_codes.contains(&status_code);
-        self.record_circuit_breaker_outcome(!is_failure);
+        self.record_circuit_breaker_outcome(!self.is_breaker_failure(status_code));
+    }
+
+    /// Whether `status_code` counts as a circuit-breaker failure for this
+    /// worker: a status in its `retryable_status_codes` that is not capacity
+    /// pushback. The per-request accounting in
+    /// `routers::common::attempt_ledger` asks this before charging, so a
+    /// request's retries charge a worker once.
+    fn is_breaker_failure(&self, status_code: u16) -> bool {
+        let resilience = self.resilience();
+        !resilience.capacity_status_codes.contains(&status_code)
+            && resilience.retryable_status_codes.contains(&status_code)
     }
 
     /// Get the resolved resilience config for this worker.
@@ -575,6 +906,31 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
         self.metadata().dp_size()
     }
 
+    /// The KV transfer engine id the worker's engine currently reports: the
+    /// spec's, unless a recovery re-read it (see
+    /// [`Self::refresh_kv_engine_id`]). A PD handoff must be minted for the
+    /// engine process that is there now, not the one discovered at
+    /// registration (#2491).
+    fn kv_engine_id(&self) -> Option<String> {
+        self.metadata().spec.kv_engine_id.clone()
+    }
+
+    /// Replace the engine id after a re-read. Returns `true` when it changed.
+    fn refresh_kv_engine_id(&self, _kv_engine_id: Option<String>) -> bool {
+        false
+    }
+
+    /// Whether the engine id in force has been confirmed by the engine since
+    /// the worker last recovered. `false` after a re-read that failed,
+    /// expired or returned no id, so the next probe tries again instead of
+    /// the worker serving with a possibly stale id until its next outage.
+    fn kv_engine_id_confirmed(&self) -> bool {
+        true
+    }
+
+    /// Record the outcome of a re-read (see [`Self::kv_engine_id_confirmed`]).
+    fn set_kv_engine_id_confirmed(&self, _confirmed: bool) {}
+
     /// Transform a request for DP-aware routing.
     ///
     /// When the worker has a `dp_rank`, injects `data_parallel_rank`
@@ -590,6 +946,16 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// path skips the `serde_json::Value` round-trip when this is `false`.
     fn mutates_request(&self) -> bool {
         self.metadata().mutates_request()
+    }
+
+    /// Whether [`Worker::prepare_request`] is the built-in edit, the
+    /// `data_parallel_rank` insert for a DP-aware worker, and nothing else.
+    /// The HTTP proxy path then applies that edit on raw JSON slices instead
+    /// of round-tripping the body through `serde_json::Value`. An
+    /// implementation with its own `prepare_request` keeps the default,
+    /// `false`, so its edits and errors still run.
+    fn uses_builtin_prepare_request(&self) -> bool {
+        false
     }
 
     /// Get the model ID this worker serves.
@@ -637,6 +1003,25 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// Get all models this worker can serve.
     fn models(&self) -> Vec<ModelCard> {
         self.metadata().spec.models.all().to_vec()
+    }
+
+    /// Whether any model card of this worker satisfies `pred`: the same
+    /// cards [`Self::models`] returns, read in place. For a check on the
+    /// request path, which [`Self::models`] would answer by cloning every
+    /// card.
+    fn any_model(&self, pred: &mut dyn FnMut(&ModelCard) -> bool) -> bool {
+        self.metadata().spec.models.all().iter().any(pred)
+    }
+
+    /// Context window (in tokens) this worker advertises for `model_id`, from
+    /// the matching model card (falling back to the primary card). `None`
+    /// when the worker never advertised one; callers then leave the length
+    /// check to the engine.
+    ///
+    /// `BasicWorker` overrides this to consult its lazy-discovered
+    /// `models_override`, as `supports_model` does.
+    fn context_length(&self, model_id: &str) -> Option<u32> {
+        context_length_from(&self.metadata().spec.models, model_id)
     }
 
     /// Set models for this worker (for lazy discovery).
@@ -844,6 +1229,17 @@ pub struct WorkerMetadata {
     pub health_config: HealthCheckConfig,
     /// Health check endpoint path (internal-only, from router config).
     pub health_endpoint: String,
+    /// The longest any one stage of a ZMQ engine's startup handshake may stay
+    /// silent (from router config); it alone covers the engine's init between
+    /// its HELLO and its READY, which the gateway sees nothing of otherwise.
+    pub zmq_startup_timeout: Duration,
+    /// The bound on a request over the worker's ZMQ link, from its dispatch
+    /// to its last message (resolved at registration as the HTTP worker
+    /// client's per-request timeout is: the worker's own
+    /// `http_pool.timeout_secs`, else the router's `request_timeout_secs`);
+    /// `None` leaves the link's streams open for as long as the client reads
+    /// them.
+    pub zmq_request_timeout: Option<Duration>,
     /// Effective absolute overload thresholds (per signal: `spec.overload`
     /// override, else gateway default). Resolved once at registration; the
     /// load monitor's ingestion predicate scores every report against these,
@@ -853,6 +1249,17 @@ pub struct WorkerMetadata {
     /// `spec.http_pool.http2` when declared, else negotiated at registration
     /// under `upstream_http2`.
     pub http2: bool,
+    /// What this worker offers a PD rendezvous partner, derived once from
+    /// the spec and its discovered labels (#2483).
+    pub pd_pairing: PdPairing,
+    /// The labels discovery read from the engine when the worker was
+    /// registered or last refreshed, before the operator's own labels were
+    /// merged over them. A refresh on the engine's next transition into
+    /// service replaces exactly these (see the update step's
+    /// `refreshed_labels`), so a label the operator set or overrode keeps its
+    /// value. Empty for a worker that was not discovered (a mesh import, a
+    /// test fixture).
+    pub discovered_labels: Arc<HashMap<String, String>>,
 }
 
 impl WorkerMetadata {
@@ -1014,167 +1421,14 @@ impl WorkerMetadata {
     }
 }
 
-/// One-shot routing snapshot — see [`Worker::routing_state`].
-#[derive(Clone, Copy, Debug)]
-pub struct RoutingState {
-    /// `status == Ready`.
-    pub healthy: bool,
-    /// Circuit breaker permits execution (closed or half-open).
-    pub can_execute: bool,
-    /// Active in-flight request count.
-    pub load: usize,
-    /// Lifetime processed-request count (min-load tie-break).
-    pub processed: usize,
-    /// Absolute overload veto, set by the load monitor at ingestion time.
-    pub overloaded: bool,
-}
-
-impl RoutingState {
-    /// The full routing eligibility test. Costs nothing beyond the reads the
-    /// gather pass already performed: every field rides the one guard
-    /// [`Worker::routing_state`] took.
-    pub const fn eligible(self) -> bool {
-        self.healthy && self.can_execute && !self.overloaded
-    }
-}
-
-/// Shared mutable worker state preserved across same-URL replacements.
-#[derive(Debug)]
-pub struct WorkerRuntime {
-    status: AtomicU8,
-    consecutive_failures: AtomicUsize,
-    consecutive_successes: AtomicUsize,
-    total_pending_probes: AtomicUsize,
-    load_counter: AtomicUsize,
-    processed_counter: AtomicUsize,
-    worker_routing_key_load: WorkerRoutingKeyLoad,
-    revision: AtomicU64,
-    /// Absolute overload veto. Lives here rather than in the load-snapshot map
-    /// so selection reads it under the guard it already holds, and so a
-    /// same-URL replacement inherits it with the rest of the shared runtime.
-    overloaded: AtomicBool,
-}
-
-impl WorkerRuntime {
-    pub fn new(url: &str, initial_status: WorkerStatus) -> Self {
-        Self {
-            status: AtomicU8::new(initial_status as u8),
-            consecutive_failures: AtomicUsize::new(0),
-            consecutive_successes: AtomicUsize::new(0),
-            total_pending_probes: AtomicUsize::new(0),
-            load_counter: AtomicUsize::new(0),
-            processed_counter: AtomicUsize::new(0),
-            worker_routing_key_load: WorkerRoutingKeyLoad::new(url),
-            revision: AtomicU64::new(0),
-            overloaded: AtomicBool::new(false),
-        }
-    }
-
-    // ── Lifecycle status ────────────────────────────────────────────
-
-    pub fn status(&self) -> WorkerStatus {
-        WorkerStatus::from_u8(self.status.load(Ordering::Acquire))
-    }
-
-    pub fn set_status(&self, status: WorkerStatus) {
-        self.status.store(status as u8, Ordering::Release);
-    }
-
-    pub fn revision(&self) -> u64 {
-        self.revision.load(Ordering::Acquire)
-    }
-
-    pub fn bump_revision(&self) -> u64 {
-        self.revision.fetch_add(1, Ordering::AcqRel) + 1
-    }
-
-    // ── Health-check counters ───────────────────────────────────────
-
-    pub fn consecutive_failures_increment(&self) -> usize {
-        self.consecutive_failures.fetch_add(1, Ordering::AcqRel) + 1
-    }
-
-    pub fn consecutive_failures_reset(&self) {
-        self.consecutive_failures.store(0, Ordering::Release);
-    }
-
-    pub fn consecutive_successes_increment(&self) -> usize {
-        self.consecutive_successes.fetch_add(1, Ordering::AcqRel) + 1
-    }
-
-    pub fn consecutive_successes_reset(&self) {
-        self.consecutive_successes.store(0, Ordering::Release);
-    }
-
-    pub fn total_pending_probes(&self) -> usize {
-        self.total_pending_probes.load(Ordering::Relaxed)
-    }
-
-    pub fn total_pending_probes_increment(&self) -> usize {
-        self.total_pending_probes.fetch_add(1, Ordering::Relaxed) + 1
-    }
-
-    pub fn total_pending_probes_reset(&self) {
-        self.total_pending_probes.store(0, Ordering::Relaxed);
-    }
-
-    // ── Load counter ────────────────────────────────────────────────
-
-    pub fn load(&self) -> usize {
-        self.load_counter.load(Ordering::Relaxed)
-    }
-
-    pub fn increment_load(&self) {
-        self.load_counter.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Saturating decrement. Returns `true` if the counter was decremented,
-    /// `false` if it was already zero — callers can log when that happens.
-    pub fn try_decrement_load(&self) -> bool {
-        self.load_counter
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                current.checked_sub(1)
-            })
-            .is_ok()
-    }
-
-    // ── Routing-key load ────────────────────────────────────────────
-
-    pub fn routing_key_load(&self) -> usize {
-        self.worker_routing_key_load.value()
-    }
-
-    pub fn routing_key_inflight(&self, routing_key: &str) -> usize {
-        self.worker_routing_key_load.key_inflight(routing_key)
-    }
-
-    pub fn increment_routing_key_load(&self, routing_key: &str) {
-        self.worker_routing_key_load.increment(routing_key);
-    }
-
-    pub fn decrement_routing_key_load(&self, routing_key: &str) {
-        self.worker_routing_key_load.decrement(routing_key);
-    }
-
-    // ── Processed-request counter ───────────────────────────────────
-
-    pub fn processed_requests(&self) -> usize {
-        self.processed_counter.load(Ordering::Relaxed)
-    }
-
-    pub fn increment_processed(&self) {
-        self.processed_counter.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn is_overloaded(&self) -> bool {
-        self.overloaded.load(Ordering::Relaxed)
-    }
-
-    /// Returns `true` when the flag transitioned, so the caller can move the
-    /// per-model counters and gauge exactly once per edge.
-    pub fn set_overloaded(&self, overloaded: bool) -> bool {
-        self.overloaded.swap(overloaded, Ordering::Relaxed) != overloaded
-    }
+/// Observer of request completions on a worker. The request's load guard
+/// notifies it when it drops, which is the one point every path that holds
+/// worker load (HTTP, gRPC, both PD sides, admitted prefill) passes through on
+/// success, error and client disconnect alike. The policy registry installs
+/// one on each worker it learns about, so policies that book state at
+/// dispatch (reservations, bookings) see the request end.
+pub trait RequestCompletionSink: Send + Sync + fmt::Debug {
+    fn request_completed(&self, worker: &dyn Worker);
 }
 
 /// Basic worker implementation
@@ -1205,17 +1459,29 @@ pub struct BasicWorker {
     /// When not `Wildcard`, overrides metadata.models for routing decisions.
     /// Uses `ArcSwap` for lock-free reads on the hot path (`supports_model`).
     pub models_override: Arc<ArcSwap<WorkerModels>>,
+    /// The KV transfer engine id in force, seeded from the spec and replaced
+    /// when a recovered engine reports a new one (see
+    /// [`Worker::refresh_kv_engine_id`]). A metadata update shares this state
+    /// with the old worker. A fresh discovery starts from its own spec.
+    pub kv_engine_id: Arc<ArcSwapOption<String>>,
+    /// Set while a recovery re-read of the engine id has not succeeded yet
+    /// (see [`Worker::kv_engine_id_confirmed`]).
+    pub kv_engine_id_unconfirmed: Arc<AtomicBool>,
     /// Worker-directed HTTP client, shared across same-config workers, built
     /// on first use (see [`LazyHttpClient`]).
     pub http_client: Arc<LazyHttpClient>,
     /// Resolved resilience config (retry + circuit breaker settings).
     pub resilience: ResolvedResilience,
+    /// Request-completion observer, installed by the policy registry; shared
+    /// by clones so a DP-rank view reports to the same sink.
+    pub completion_sink: Arc<std::sync::RwLock<Option<Arc<dyn RequestCompletionSink>>>>,
 }
 
 impl Clone for BasicWorker {
     fn clone(&self) -> Self {
         Self {
             metadata: self.metadata.clone(),
+            completion_sink: Arc::clone(&self.completion_sink),
             runtime: ArcSwap::from(self.runtime.load_full()),
             circuit_breaker: ArcSwap::from(self.circuit_breaker.load_full()),
             backend_client: Arc::clone(&self.backend_client),
@@ -1223,6 +1489,10 @@ impl Clone for BasicWorker {
             zmq_connect_abort: Arc::clone(&self.zmq_connect_abort),
             connect_signal_tx: self.connect_signal_tx.clone(),
             models_override: Arc::clone(&self.models_override),
+            kv_engine_id: Arc::new(ArcSwapOption::new(self.kv_engine_id.load_full())),
+            kv_engine_id_unconfirmed: Arc::new(AtomicBool::new(
+                self.kv_engine_id_unconfirmed.load(Ordering::Relaxed),
+            )),
             http_client: Arc::clone(&self.http_client),
             resilience: self.resilience.clone(),
         }
@@ -1243,6 +1513,18 @@ impl fmt::Debug for BasicWorker {
 }
 
 impl BasicWorker {
+    /// Keep the live KV state across a metadata update.
+    pub(crate) fn share_kv_engine_state(&mut self, previous: &BasicWorker) {
+        self.kv_engine_id = Arc::clone(&previous.kv_engine_id);
+        self.kv_engine_id_unconfirmed = Arc::clone(&previous.kv_engine_id_unconfirmed);
+    }
+
+    /// The circuit breaker configuration this worker runs with: the gateway
+    /// defaults plus its own overrides, as resolved at registration.
+    pub(crate) fn circuit_breaker_config(&self) -> super::circuit_breaker::CircuitBreakerConfig {
+        self.circuit_breaker.load().config().clone()
+    }
+
     fn update_running_requests_metrics(&self) {
         let load = self.load();
         Metrics::set_worker_requests_active(self.url(), load);
@@ -1271,6 +1553,8 @@ impl BasicWorker {
         let runtime = self.metadata.spec.runtime_type;
         let handshake_override = self.metadata.spec.zmq_handshake_address.clone();
         let engine_count = self.metadata.zmq_engine_count();
+        let startup = self.metadata.zmq_startup_timeout;
+        let request_timeout = self.metadata.zmq_request_timeout;
         // Capture the readiness signal and the revision at hand-off. The
         // manager only promotes if this revision still matches, so a
         // same-URL replacement racing the handshake is discarded.
@@ -1291,6 +1575,8 @@ impl BasicWorker {
                         runtime,
                         handshake_override,
                         engine_count,
+                        startup,
+                        request_timeout,
                     )
                 })
                 .await
@@ -1326,6 +1612,9 @@ impl BasicWorker {
         let existing_cb = self.circuit_breaker.load();
         let other_cb = other.circuit_breaker.load_full();
         if other_cb.config() == existing_cb.config() {
+            // Building this worker reset the URL's breaker state gauge to
+            // closed; the adopted breaker is what monitoring must show.
+            other_cb.publish_metrics();
             self.circuit_breaker.store(other_cb);
         }
 
@@ -1356,8 +1645,51 @@ impl BasicWorker {
     }
 }
 
+impl BasicWorker {
+    /// The model cards this worker answers for, read in place: the lazily
+    /// discovered list when one was set, the metadata's cards otherwise. The
+    /// one place that chooses, so `models` and `any_model` cannot drift
+    /// apart.
+    fn with_model_cards<R>(&self, read: impl FnOnce(&[ModelCard]) -> R) -> R {
+        let overridden = self.models_override.load();
+        if overridden.is_wildcard() {
+            read(self.metadata.spec.models.all())
+        } else {
+            read(overridden.all())
+        }
+    }
+}
+
 #[async_trait]
 impl Worker for BasicWorker {
+    /// [`BasicWorker`] keeps the trait's default `prepare_request`, so the
+    /// HTTP proxy path may apply the DP-rank edit on raw slices.
+    fn uses_builtin_prepare_request(&self) -> bool {
+        true
+    }
+
+    fn kv_engine_id(&self) -> Option<String> {
+        self.kv_engine_id.load_full().map(|id| (*id).clone())
+    }
+
+    fn refresh_kv_engine_id(&self, kv_engine_id: Option<String>) -> bool {
+        let previous = self.kv_engine_id.load_full();
+        if previous.as_deref() == kv_engine_id.as_ref() {
+            return false;
+        }
+        self.kv_engine_id.store(kv_engine_id.map(Arc::new));
+        true
+    }
+
+    fn kv_engine_id_confirmed(&self) -> bool {
+        !self.kv_engine_id_unconfirmed.load(Ordering::Relaxed)
+    }
+
+    fn set_kv_engine_id_confirmed(&self, confirmed: bool) {
+        self.kv_engine_id_unconfirmed
+            .store(!confirmed, Ordering::Relaxed);
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -1384,6 +1716,18 @@ impl Worker for BasicWorker {
 
     fn revision(&self) -> u64 {
         self.runtime.load().revision()
+    }
+
+    fn cache_trace_epochs(&self) -> Vec<String> {
+        if !self.runtime.load().cache_trace_epochs_valid() {
+            return Vec::new();
+        }
+        self.metadata
+            .spec
+            .labels
+            .get("cache_trace_epochs")
+            .and_then(|epochs| serde_json::from_str(epochs).ok())
+            .unwrap_or_default()
     }
 
     fn set_status(&self, status: WorkerStatus) {
@@ -1457,6 +1801,14 @@ impl Worker for BasicWorker {
         self.update_running_requests_metrics();
     }
 
+    fn try_increment_load(&self, max: usize) -> bool {
+        let incremented = self.runtime.load().try_increment_load(max);
+        if incremented {
+            self.update_running_requests_metrics();
+        }
+        incremented
+    }
+
     fn decrement_load(&self) {
         if !self.runtime.load().try_decrement_load() {
             tracing::warn!(
@@ -1465,6 +1817,34 @@ impl Worker for BasicWorker {
             );
         }
         self.update_running_requests_metrics();
+    }
+
+    fn try_admit_pd(&self, count: usize, window: usize) -> bool {
+        self.runtime.load().try_admit_pd(count, window)
+    }
+
+    fn release_pd(&self, count: usize) {
+        self.runtime.load().release_pd(count);
+    }
+
+    fn pd_admitted(&self) -> usize {
+        self.runtime.load().pd_admitted()
+    }
+
+    fn pd_enqueue(&self, rooms: usize) -> u64 {
+        self.runtime.load().pd_enqueue(rooms)
+    }
+
+    fn pd_may_claim(&self, place: u64) -> bool {
+        self.runtime.load().pd_may_claim(place)
+    }
+
+    fn pd_dequeue(&self, place: u64) {
+        self.runtime.load().pd_dequeue(place);
+    }
+
+    fn pd_wake(&self, place: u64) -> Option<Arc<Notify>> {
+        self.runtime.load().pd_wake(place)
     }
 
     fn routing_key_load(&self) -> usize {
@@ -1511,18 +1891,193 @@ impl Worker for BasicWorker {
         self.runtime.load().set_overloaded(overloaded)
     }
 
+    fn stall_reason(&self) -> Option<StallReason> {
+        self.runtime.load().stall_reason()
+    }
+
+    fn set_stall(&self, reason: Option<StallReason>) -> bool {
+        self.runtime.load().set_stall(reason)
+    }
+
+    fn note_contact(&self) {
+        self.runtime.load().note_contact();
+    }
+
+    fn note_token_progress(&self) {
+        self.runtime.load().note_token_progress();
+    }
+
+    fn note_transport_failure(&self) {
+        self.runtime.load().note_transport_failure();
+    }
+
+    fn transport_failure_pending(&self) -> bool {
+        self.runtime.load().transport_failure_pending()
+    }
+
+    fn contact_age(&self) -> Duration {
+        self.runtime.load().contact_age()
+    }
+
+    fn token_progress_age(&self) -> Duration {
+        self.runtime.load().token_progress_age()
+    }
+
+    fn note_load_record(&self) {
+        self.runtime.load().note_load_record();
+    }
+
+    fn pushes_load_records(&self) -> bool {
+        self.runtime.load().pushes_load_records()
+    }
+
+    fn note_engine_stall(&self, stalled: bool) {
+        self.runtime.load().note_engine_stall(stalled);
+    }
+
+    fn engine_stalled(&self) -> bool {
+        self.runtime.load().engine_stalled()
+    }
+
+    fn prefill_rate_tps(&self) -> u64 {
+        self.runtime.load().prefill_rate_tps()
+    }
+
+    fn swap_waiting_reqs(&self, waiting: i64) -> i64 {
+        self.runtime.load().swap_waiting_reqs(waiting)
+    }
+
+    fn swap_load_sample(&self, load: usize) -> usize {
+        self.runtime.load().swap_load_sample(load)
+    }
+
+    fn contact_wake(&self) -> Option<Arc<Notify>> {
+        Some(self.runtime.load().contact_wake())
+    }
+
+    fn signal_connected(&self) {
+        if let Some(tx) = &self.connect_signal_tx {
+            let _ = tx.send(WorkerConnected {
+                url: self.url().to_string(),
+                revision: self.revision(),
+            });
+        }
+    }
+
+    fn reset_circuit_breaker(&self) {
+        self.circuit_breaker.load().reset();
+    }
+
+    fn readmit_circuit_breaker(&self) -> bool {
+        let breaker = self.circuit_breaker.load();
+        if breaker.try_half_open() {
+            return true;
+        }
+        breaker.clear_failure_streak();
+        false
+    }
+
+    fn note_admitted(&self) {
+        self.runtime.load().note_admitted();
+    }
+
+    fn admitted_age(&self) -> Duration {
+        self.runtime.load().admitted_age()
+    }
+
+    fn warmup_growth(&self, indexed: usize) -> usize {
+        self.runtime.load().warmup_growth(indexed)
+    }
+
+    fn divert_until_ms(&self) -> u64 {
+        self.runtime.load().divert_until_ms()
+    }
+
+    fn note_diverted(&self, until_ms: u64) {
+        self.runtime.load().note_diverted(until_ms);
+    }
+
+    fn note_prefill_started(&self, tokens: u64, timed: bool) {
+        self.runtime.load().note_prefill_started(tokens, timed);
+    }
+
+    fn note_prefill_ended(&self, tokens: u64, timed: bool, cached: Option<u64>) {
+        self.runtime
+            .load()
+            .note_prefill_ended(tokens, timed, cached);
+    }
+
+    fn prefill_backlog(&self) -> Duration {
+        self.runtime.load().prefill_backlog()
+    }
+
+    fn prefill_eta(&self, tokens: u64) -> Duration {
+        self.runtime.load().prefill_eta(tokens)
+    }
+
+    fn prefill_answered_ago(&self) -> Option<Duration> {
+        self.runtime.load().prefill_answered_ago()
+    }
+
+    fn prefill_unanswered_run(&self) -> Option<Duration> {
+        self.runtime.load().prefill_unanswered_run()
+    }
+
+    fn prefill_cold_shape(&self, tokens: u64) -> bool {
+        self.runtime.load().prefill_cold_shape(tokens)
+    }
+
+    fn note_tracked_started(&self) {
+        self.runtime.load().note_tracked_started();
+    }
+
+    fn note_tracked_ended(&self) {
+        self.runtime.load().note_tracked_ended();
+    }
+
+    fn tracked_load(&self) -> usize {
+        self.runtime.load().tracked_load()
+    }
+
+    fn note_output_started(&self) {
+        self.runtime.load().note_output_started();
+    }
+
+    fn note_output_ended(&self) {
+        self.runtime.load().note_output_ended();
+    }
+
+    fn output_silence(&self) -> Option<Duration> {
+        self.runtime.load().output_silence()
+    }
+
     fn is_available(&self) -> bool {
         // Same two guards the pre-veto version took (`is_healthy` +
-        // `circuit_breaker_can_execute`): the veto rides the runtime guard.
+        // `circuit_breaker_can_execute`): the vetoes ride the runtime guard.
         let rt = self.runtime.load();
         rt.status() == WorkerStatus::Ready
             && !rt.is_overloaded()
+            && rt.stall_reason().is_none()
             && self.circuit_breaker.load().can_execute()
     }
 
     fn is_healthy_and_eligible(&self) -> bool {
         let rt = self.runtime.load();
-        rt.status() == WorkerStatus::Ready && !rt.is_overloaded()
+        rt.status() == WorkerStatus::Ready && !rt.is_overloaded() && rt.stall_reason().is_none()
+    }
+
+    fn completion_sink(&self) -> Option<Arc<dyn RequestCompletionSink>> {
+        self.completion_sink
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn set_completion_sink(&self, sink: Option<Arc<dyn RequestCompletionSink>>) {
+        *self
+            .completion_sink
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = sink;
     }
 
     fn routing_state(&self) -> RoutingState {
@@ -1536,6 +2091,7 @@ impl Worker for BasicWorker {
             load: rt.load(),
             processed: rt.processed_requests(),
             overloaded: rt.is_overloaded(),
+            stalled: rt.stall_reason().is_some(),
         }
     }
 
@@ -1564,13 +2120,20 @@ impl Worker for BasicWorker {
     }
 
     fn models(&self) -> Vec<ModelCard> {
+        self.with_model_cards(<[ModelCard]>::to_vec)
+    }
+
+    fn any_model(&self, pred: &mut dyn FnMut(&ModelCard) -> bool) -> bool {
+        self.with_model_cards(|cards| cards.iter().any(pred))
+    }
+
+    fn context_length(&self, model_id: &str) -> Option<u32> {
         let overridden = self.models_override.load();
-        let source = if overridden.is_wildcard() {
-            self.metadata.spec.models.all()
+        if overridden.is_wildcard() {
+            context_length_from(&self.metadata.spec.models, model_id)
         } else {
-            overridden.all()
-        };
-        source.to_vec()
+            context_length_from(&overridden, model_id)
+        }
     }
 
     fn set_models(&self, models: Vec<ModelCard>) {
@@ -1770,95 +2333,38 @@ impl Worker for BasicWorker {
     }
 }
 
-/// RAII guard for worker load management
+/// A response body's stream that owns an RAII guard.
 ///
-/// Automatically decrements worker load when dropped. Can be attached to
-/// an axum Response to tie the guard's lifetime to the response body,
-/// which is essential for streaming responses where the function returns
-/// immediately but the stream continues in the background.
-pub struct WorkerLoadGuard {
-    worker: Arc<dyn Worker>,
-    routing_key: Option<String>,
+/// A streaming handler returns at once and keeps producing from a task, so
+/// what it holds for the request (the worker's load guard, a rate-limit
+/// reservation's safety net) must live as long as the response body does,
+/// however the body ends: read to its end, dropped when the client leaves,
+/// or consumed by another handler in-process. The guard rides in the body's
+/// own stream and is dropped with it, after the stream. No wrapper goes
+/// over the body for it: a body wrapper is a boxed `poll_frame` more on
+/// every frame out.
+pub struct GuardedStream<S, G> {
+    inner: S,
+    _guard: G,
 }
 
-impl WorkerLoadGuard {
-    pub fn new(worker: Arc<dyn Worker>, headers: Option<&http::HeaderMap>) -> Self {
-        let key = extract_routing_key(headers).map(String::from);
-        Self::with_key(worker, key.as_deref())
-    }
-
-    /// Guard keyed by the caller-resolved effective sticky key (rid-derived
-    /// wins over the header), so keyed-load accounting matches selection.
-    pub fn with_key(worker: Arc<dyn Worker>, routing_key: Option<&str>) -> Self {
-        worker.increment_load();
-
-        let routing_key = routing_key.map(String::from);
-        if let Some(ref key) = routing_key {
-            worker.increment_routing_key_load(key);
-        }
-
-        Self {
-            worker,
-            routing_key,
-        }
-    }
-}
-
-impl Drop for WorkerLoadGuard {
-    fn drop(&mut self) {
-        self.worker.decrement_load();
-        if let Some(ref key) = self.routing_key {
-            self.worker.decrement_routing_key_load(key);
-        }
-    }
-}
-
-/// Body wrapper that holds an attached value.
-///
-/// When this body is dropped (stream ends or client disconnects),
-/// the attached value is dropped automatically. This is useful for RAII guards
-/// like WorkerLoadGuard that need to be tied to a response body's lifetime.
-pub struct AttachedBody<T> {
-    inner: Body,
-    _attached: T,
-}
-
-impl<T> AttachedBody<T> {
-    pub fn new(inner: Body, attached: T) -> Self {
+impl<S, G> GuardedStream<S, G> {
+    pub fn new(inner: S, guard: G) -> Self {
         Self {
             inner,
-            _attached: attached,
+            _guard: guard,
         }
     }
 }
 
-impl<T: Send + Unpin + 'static> AttachedBody<T> {
-    pub fn wrap_response(
-        response: axum::response::Response,
-        attached: T,
-    ) -> axum::response::Response {
-        let (parts, body) = response.into_parts();
-        axum::response::Response::from_parts(parts, Body::new(Self::new(body, attached)))
-    }
-}
+impl<S: Stream + Unpin, G: Unpin> Stream for GuardedStream<S, G> {
+    type Item = S::Item;
 
-impl<T: Send + Unpin + 'static> http_body::Body for AttachedBody<T> {
-    type Data = bytes::Bytes;
-    type Error = axum::Error;
-
-    fn poll_frame(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
-        let this = self.get_mut();
-        std::pin::Pin::new(&mut this.inner).poll_frame(cx)
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.get_mut().inner).poll_next(cx)
     }
 
-    fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
-    }
-
-    fn size_hint(&self) -> http_body::SizeHint {
+    fn size_hint(&self) -> (usize, Option<usize>) {
         self.inner.size_hint()
     }
 }
@@ -1874,6 +2380,9 @@ pub fn worker_to_info(worker: &Arc<dyn Worker>) -> WorkerInfo {
     let metadata = worker.metadata();
     let spec = metadata.spec.clone();
     let status = worker.status();
+    // Only PD workers pair; a regular worker's descriptor would be noise.
+    let pd_pairing = matches!(spec.worker_type, WorkerType::Prefill | WorkerType::Decode)
+        .then(|| metadata.pd_pairing.key());
 
     WorkerInfo {
         id: worker.url().to_string(),
@@ -1883,6 +2392,11 @@ pub fn worker_to_info(worker: &Arc<dyn Worker>) -> WorkerInfo {
         status: Some(status),
         load: worker.load(),
         http2: metadata.http2,
+        pd_pairing,
+        stalled: worker
+            .stall_reason()
+            .map(|reason| reason.as_str().to_string()),
+        engine_load: None,
         job_status: None,
     }
 }
@@ -1891,6 +2405,7 @@ pub fn worker_to_info(worker: &Arc<dyn Worker>) -> WorkerInfo {
 mod tests {
     use std::{thread, time::Duration};
 
+    use metrics_exporter_prometheus::PrometheusBuilder;
     use openai_protocol::worker::HealthCheckConfig;
 
     use super::*;
@@ -1899,6 +2414,48 @@ mod tests {
         BasicWorkerBuilder,
     };
 
+    /// The `smg_worker_cb_state` sample for the test worker's URL in a
+    /// rendered scrape.
+    fn cb_state_gauge(rendered: &str) -> Option<f64> {
+        rendered
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("smg_worker_cb_state{worker=\"http://worker:8000\"} ")
+            })
+            .map(|value| value.parse().unwrap())
+    }
+
+    /// A same-URL replacement is built on a fresh breaker, which sets the
+    /// URL's state gauge to closed before the registry adopts the live
+    /// breaker. Adoption must publish the adopted state again, or an open
+    /// breaker reads as closed until its next transition.
+    #[test]
+    fn adopting_a_live_breaker_republishes_its_state_gauge() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let config = CircuitBreakerConfig {
+                failure_threshold: 1,
+                ..CircuitBreakerConfig::default()
+            };
+            let old = BasicWorkerBuilder::new("http://worker:8000")
+                .circuit_breaker_config(config.clone())
+                .build();
+            old.record_circuit_breaker_outcome(false);
+            assert_eq!(old.circuit_breaker_state(), CircuitState::Open);
+            assert_eq!(cb_state_gauge(&handle.render()), Some(1.0));
+
+            let new = BasicWorkerBuilder::new("http://worker:8000")
+                .circuit_breaker_config(config)
+                .build();
+            assert_eq!(cb_state_gauge(&handle.render()), Some(0.0));
+
+            assert!(new.inherit_shared_state_from(&old));
+            assert_eq!(new.circuit_breaker_state(), CircuitState::Open);
+            assert_eq!(cb_state_gauge(&handle.render()), Some(1.0));
+        });
+    }
+
     /// Health config that skips health checks — workers start Ready immediately.
     /// Use in tests that don't test the health check lifecycle.
     fn no_health_check() -> HealthCheckConfig {
@@ -1906,6 +2463,27 @@ mod tests {
             disable_health_check: true,
             ..HealthCheckConfig::default()
         }
+    }
+
+    #[test]
+    fn rediscovered_worker_keeps_its_own_kv_engine_state() {
+        let old = BasicWorkerBuilder::new("grpc://worker:8080")
+            .kv_engine_id("old-engine")
+            .build();
+        old.set_kv_engine_id_confirmed(false);
+        let new = BasicWorkerBuilder::new("grpc://worker:8080")
+            .kv_engine_id("new-engine")
+            .build();
+
+        assert!(new.inherit_shared_state_from(&old));
+        assert_eq!(new.kv_engine_id().as_deref(), Some("new-engine"));
+        assert!(new.kv_engine_id_confirmed());
+
+        // A late probe for the old worker must not alter the new discovery.
+        old.refresh_kv_engine_id(Some("late-engine".to_string()));
+        old.set_kv_engine_id_confirmed(false);
+        assert_eq!(new.kv_engine_id().as_deref(), Some("new-engine"));
+        assert!(new.kv_engine_id_confirmed());
     }
 
     #[test]
@@ -1973,7 +2551,7 @@ mod tests {
 
     #[test]
     fn test_worker_with_labels() {
-        let mut labels = std::collections::HashMap::new();
+        let mut labels = HashMap::new();
         labels.insert("env".to_string(), "prod".to_string());
         labels.insert("zone".to_string(), "us-west".to_string());
 
@@ -1989,7 +2567,7 @@ mod tests {
     #[test]
     fn test_max_running_requests_parses_from_label() {
         use crate::worker::BasicWorkerBuilder;
-        let mut labels = std::collections::HashMap::new();
+        let mut labels = HashMap::new();
         labels.insert("max_running_requests".to_string(), "256".to_string());
         let worker = BasicWorkerBuilder::new("http://w:9000")
             .labels(labels)
@@ -2007,7 +2585,7 @@ mod tests {
     #[test]
     fn test_max_running_requests_returns_none_on_bad_value() {
         use crate::worker::BasicWorkerBuilder;
-        let mut labels = std::collections::HashMap::new();
+        let mut labels = HashMap::new();
         labels.insert(
             "max_running_requests".to_string(),
             "not-a-number".to_string(),
@@ -2021,7 +2599,7 @@ mod tests {
     #[test]
     fn test_max_running_requests_zero_treated_as_none() {
         use crate::worker::BasicWorkerBuilder;
-        let mut labels = std::collections::HashMap::new();
+        let mut labels = HashMap::new();
         labels.insert("max_running_requests".to_string(), "0".to_string());
         let worker = BasicWorkerBuilder::new("http://w:9000")
             .labels(labels)
@@ -2031,9 +2609,173 @@ mod tests {
     }
 
     #[test]
+    fn test_max_running_requests_reads_the_tokenspeed_spelling() {
+        use crate::worker::BasicWorkerBuilder;
+        // TokenSpeed advertises the same scheduler window as `max_num_seqs`;
+        // without this a TokenSpeed worker looks like a non-reporter to both
+        // fleet capacity and PD admission.
+        let mut labels = HashMap::new();
+        labels.insert("max_num_seqs".to_string(), "16".to_string());
+        let worker = BasicWorkerBuilder::new("grpc://w:30000")
+            .labels(labels)
+            .build();
+        assert_eq!(worker.max_running_requests(), Some(16));
+    }
+
+    #[test]
+    fn test_max_running_requests_prefers_max_num_seqs_when_both_are_reported() {
+        use crate::worker::BasicWorkerBuilder;
+        // The servicer's `running_window` resolves in the same order, so a
+        // worker reporting both spellings cannot have its discovery label
+        // disagree with its GetLoads report.
+        let mut labels = HashMap::new();
+        labels.insert("max_running_requests".to_string(), "256".to_string());
+        labels.insert("max_num_seqs".to_string(), "16".to_string());
+        let worker = BasicWorkerBuilder::new("grpc://w:30000")
+            .labels(labels)
+            .build();
+        assert_eq!(worker.max_running_requests(), Some(16));
+    }
+
+    #[test]
+    fn test_pd_admission_claims_are_atomic_and_bounded_by_the_window() {
+        use crate::worker::BasicWorkerBuilder;
+        let worker = BasicWorkerBuilder::new("grpc://w:30000").build();
+
+        assert!(worker.try_admit_pd(2, 3));
+        assert_eq!(worker.pd_admitted(), 2);
+        // All-or-nothing: a refusal must leave the claim untouched.
+        assert!(!worker.try_admit_pd(2, 3));
+        assert_eq!(worker.pd_admitted(), 2);
+        assert!(worker.try_admit_pd(1, 3));
+        assert_eq!(worker.pd_admitted(), 3);
+
+        worker.release_pd(3);
+        assert_eq!(worker.pd_admitted(), 0);
+        // Releases saturate rather than wrapping to usize::MAX.
+        worker.release_pd(1);
+        assert_eq!(worker.pd_admitted(), 0);
+    }
+
+    #[test]
+    fn test_pd_admission_never_overshoots_the_window_under_real_parallelism() {
+        use std::{sync::Arc, thread};
+
+        use crate::worker::BasicWorkerBuilder;
+        // The whole point of claiming rather than reading: threads racing for
+        // the last rooms must not all win.
+        let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("grpc://w:30000").build());
+        let window = 8;
+        let threads: Vec<_> = (0..32)
+            .map(|_| {
+                let worker = Arc::clone(&worker);
+                thread::spawn(move || worker.try_admit_pd(1, window))
+            })
+            .collect();
+
+        let admitted = threads
+            .into_iter()
+            .map(|handle| handle.join().expect("claim thread"))
+            .filter(|claimed| *claimed)
+            .count();
+
+        assert_eq!(admitted, window, "exactly the window's worth may claim");
+        assert_eq!(worker.pd_admitted(), window);
+    }
+
+    #[test]
+    fn test_pd_admission_queue_is_arrival_ordered_and_closes_over_departures() {
+        use crate::worker::BasicWorkerBuilder;
+        let worker = BasicWorkerBuilder::new("grpc://w:30000").build();
+
+        let (first, second, third) = (
+            worker.pd_enqueue(1),
+            worker.pd_enqueue(1),
+            worker.pd_enqueue(1),
+        );
+        assert!(worker.pd_may_claim(first), "the oldest place is next");
+        assert!(!worker.pd_may_claim(second));
+        assert!(!worker.pd_may_claim(third));
+        assert!(
+            worker.pd_wake(second).is_some(),
+            "a queued place has its notifier"
+        );
+
+        // A dispatch that stops waiting from the middle leaves no hole.
+        worker.pd_dequeue(second);
+        assert!(worker.pd_may_claim(first));
+        assert!(
+            worker.pd_wake(second).is_none(),
+            "a place given back has none"
+        );
+        worker.pd_dequeue(first);
+        assert!(worker.pd_may_claim(third), "the places behind move up");
+        assert!(
+            !worker.pd_may_claim(second),
+            "a place given back never comes back"
+        );
+
+        // Leaving twice, or with a place never handed out, changes nothing.
+        worker.pd_dequeue(second);
+        worker.pd_dequeue(u64::MAX);
+        assert!(worker.pd_may_claim(third));
+
+        worker.pd_dequeue(third);
+        assert!(
+            worker.pd_may_claim(worker.pd_enqueue(1)),
+            "with nobody waiting a newcomer is next at once"
+        );
+    }
+
+    #[test]
+    fn test_pd_admission_queue_lets_a_narrower_place_pass_a_wider_older_one() {
+        use crate::worker::BasicWorkerBuilder;
+        let worker = BasicWorkerBuilder::new("grpc://w:30000").build();
+
+        // Arrival order, with the rooms each needs: 4, 1, 2, 1, 3.
+        let wide = worker.pd_enqueue(4);
+        let narrow = worker.pd_enqueue(1);
+        let middle = worker.pd_enqueue(2);
+        let narrow_too = worker.pd_enqueue(1);
+        let wider = worker.pd_enqueue(3);
+        assert!(worker.pd_may_claim(wide), "the front always may");
+        assert!(
+            worker.pd_may_claim(narrow),
+            "it needs fewer rooms than everyone ahead of it"
+        );
+        assert!(
+            !worker.pd_may_claim(middle),
+            "the 1-room place ahead goes first"
+        );
+        assert!(
+            !worker.pd_may_claim(narrow_too),
+            "its equal ahead goes first"
+        );
+        assert!(!worker.pd_may_claim(wider));
+
+        // The narrow one is served: the 2-room place now needs fewer than the
+        // front, and the other 1-room place fewer than both ahead of it.
+        worker.pd_dequeue(narrow);
+        assert!(worker.pd_may_claim(wide));
+        assert!(worker.pd_may_claim(middle));
+        assert!(worker.pd_may_claim(narrow_too));
+        assert!(!worker.pd_may_claim(wider), "a 1-room place is still ahead");
+
+        // The wide front leaves (shed, or its rooms freed together).
+        worker.pd_dequeue(wide);
+        assert!(worker.pd_may_claim(middle));
+        assert!(worker.pd_may_claim(narrow_too));
+        assert!(!worker.pd_may_claim(wider));
+
+        worker.pd_dequeue(middle);
+        worker.pd_dequeue(narrow_too);
+        assert!(worker.pd_may_claim(wider), "last in line, and alone");
+    }
+
+    #[test]
     fn test_is_realtime_capable_true_from_label() {
         use crate::worker::BasicWorkerBuilder;
-        let mut labels = std::collections::HashMap::new();
+        let mut labels = HashMap::new();
         labels.insert("realtime".to_string(), "true".to_string());
         let worker = BasicWorkerBuilder::new("http://w:9000")
             .labels(labels)
@@ -2051,7 +2793,7 @@ mod tests {
     #[test]
     fn test_is_realtime_capable_false_on_non_true_value() {
         use crate::worker::BasicWorkerBuilder;
-        let mut labels = std::collections::HashMap::new();
+        let mut labels = HashMap::new();
         labels.insert("realtime".to_string(), "1".to_string());
         let worker = BasicWorkerBuilder::new("http://w:9000")
             .labels(labels)
@@ -2344,6 +3086,11 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// The load counter's increment, a million times: the count is exact,
+    /// and the rate is printed. The rate is machine-bound (a loaded or slow
+    /// machine reaches a fraction of a quiet one's), so the unit suite
+    /// asserts no absolute floor; `SMG_TEST_LOAD_COUNTER_FLOOR=<ops/s>` turns
+    /// the printed measurement into an assertion for a run on a known machine.
     #[test]
     #[expect(clippy::print_stderr)]
     fn test_load_counter_performance() {
@@ -2361,16 +3108,28 @@ mod tests {
             worker.increment_load();
         }
         let duration = start.elapsed();
+        assert_eq!(worker.load(), iterations);
 
         let ops_per_sec = iterations as f64 / duration.as_secs_f64();
         eprintln!("Load counter operations per second: {ops_per_sec:.0}");
 
-        // Lower bound is intentionally generous so this microbench does
-        // not flake on CI runners under contention. A relaxed Acquire/
-        // Release atomic increment should comfortably exceed this on any
-        // reasonable hardware — observed CI floor is around 1M ops/sec,
-        // so 500k gives a 2x safety margin.
-        assert!(ops_per_sec > 500_000.0);
+        // An asked-for floor is an assertion; an unreadable or malformed one
+        // is an error, not a silently skipped check: only an absent variable
+        // means no floor was asked for.
+        match std::env::var("SMG_TEST_LOAD_COUNTER_FLOOR") {
+            Err(std::env::VarError::NotPresent) => {}
+            Err(error) => panic!("SMG_TEST_LOAD_COUNTER_FLOOR is unreadable: {error}"),
+            Ok(floor) => {
+                let floor: f64 = match floor.parse::<f64>() {
+                    Ok(floor) if floor.is_finite() => floor,
+                    _ => panic!("SMG_TEST_LOAD_COUNTER_FLOOR {floor:?} is not a finite number"),
+                };
+                assert!(
+                    ops_per_sec > floor,
+                    "load counter: {ops_per_sec:.0} ops/s, under the asked-for floor of {floor:.0}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -2566,6 +3325,33 @@ mod tests {
     }
 
     #[test]
+    fn engine_rejections_do_not_open_the_circuit_breaker() {
+        let config = CircuitBreakerConfig {
+            failure_threshold: 2,
+            success_threshold: 1,
+            timeout_duration: Duration::from_millis(50),
+            window_duration: Duration::from_secs(60),
+        };
+        let worker = BasicWorkerBuilder::new("http://test:8080")
+            .worker_type(WorkerType::Regular)
+            .circuit_breaker_config(config)
+            .health_config(no_health_check())
+            .build();
+
+        // A 400 is the client's fault: any number of them leaves the breaker closed.
+        for _ in 0..10 {
+            worker.record_outcome(400);
+        }
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::Closed);
+        assert!(worker.is_available());
+
+        worker.record_outcome(500);
+        worker.record_outcome(500);
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::Open);
+        assert!(!worker.is_available());
+    }
+
+    #[test]
     fn test_worker_with_circuit_breaker_config() {
         let config = CircuitBreakerConfig {
             failure_threshold: 2,
@@ -2694,11 +3480,15 @@ mod tests {
     #[test]
     fn test_worker_metadata_empty_models_accepts_all() {
         let metadata = WorkerMetadata {
+            pd_pairing: PdPairing::derive(&WorkerSpec::new("http://test:8080")),
             spec: Arc::new(WorkerSpec::new("http://test:8080")),
             health_config: HealthCheckConfig::default(),
             health_endpoint: "/health".to_string(),
+            zmq_startup_timeout: Duration::from_secs(600),
+            zmq_request_timeout: None,
             overload: OverloadThresholds::default(),
             http2: false,
+            discovered_labels: Arc::default(),
         };
 
         // Empty models list should accept any model
@@ -2719,11 +3509,15 @@ mod tests {
         let mut spec = WorkerSpec::new("http://test:8080");
         spec.models = WorkerModels::from(vec![model1, model2]);
         let metadata = WorkerMetadata {
+            pd_pairing: PdPairing::derive(&spec),
             spec: Arc::new(spec),
             health_config: HealthCheckConfig::default(),
             health_endpoint: "/health".to_string(),
+            zmq_startup_timeout: Duration::from_secs(600),
+            zmq_request_timeout: None,
             overload: OverloadThresholds::default(),
             http2: false,
+            discovered_labels: Arc::default(),
         };
 
         // Find by primary ID
@@ -2736,155 +3530,6 @@ mod tests {
 
         // Not found
         assert!(metadata.find_model("unknown-model").is_none());
-    }
-
-    #[test]
-    fn test_worker_routing_key_load_increment_decrement() {
-        let load = WorkerRoutingKeyLoad::new("http://test:8000");
-        assert_eq!(load.value(), 0);
-
-        load.increment("key1");
-        assert_eq!(load.value(), 1);
-
-        load.increment("key2");
-        assert_eq!(load.value(), 2);
-
-        load.increment("key1");
-        assert_eq!(load.value(), 2);
-
-        load.decrement("key1");
-        assert_eq!(load.value(), 2);
-
-        load.decrement("key1");
-        assert_eq!(load.value(), 1);
-
-        load.decrement("key2");
-        assert_eq!(load.value(), 0);
-    }
-
-    #[test]
-    fn test_worker_routing_key_load_cleanup_on_zero() {
-        let load = WorkerRoutingKeyLoad::new("http://test:8000");
-
-        load.increment("key1");
-        load.increment("key2");
-        load.increment("key3");
-        assert_eq!(load.active_routing_keys.len(), 3);
-
-        load.decrement("key1");
-        assert_eq!(load.active_routing_keys.len(), 2);
-
-        load.decrement("key2");
-        assert_eq!(load.active_routing_keys.len(), 1);
-
-        load.decrement("key3");
-        assert_eq!(load.active_routing_keys.len(), 0);
-    }
-
-    #[test]
-    fn test_worker_routing_key_load_multiple_requests_same_key() {
-        let load = WorkerRoutingKeyLoad::new("http://test:8000");
-
-        load.increment("key-1");
-        load.increment("key-1");
-        load.increment("key-1");
-        assert_eq!(load.value(), 1);
-
-        load.decrement("key-1");
-        assert_eq!(load.value(), 1);
-
-        load.decrement("key-1");
-        assert_eq!(load.value(), 1);
-
-        load.decrement("key-1");
-        assert_eq!(load.value(), 0);
-        assert_eq!(load.active_routing_keys.len(), 0);
-    }
-
-    #[test]
-    fn test_worker_routing_key_load_decrement_nonexistent() {
-        let load = WorkerRoutingKeyLoad::new("http://test:8000");
-        load.decrement("nonexistent");
-        assert_eq!(load.value(), 0);
-    }
-
-    #[test]
-    fn test_worker_load_guard_with_routing_key() {
-        use crate::worker::BasicWorkerBuilder;
-
-        let worker: Arc<dyn Worker> = Arc::new(
-            BasicWorkerBuilder::new("http://test:8000")
-                .worker_type(WorkerType::Regular)
-                .build(),
-        );
-
-        assert_eq!(worker.load(), 0);
-        assert_eq!(worker.routing_key_load(), 0);
-
-        let mut headers = http::HeaderMap::new();
-        headers.insert("x-smg-routing-key", "key-123".parse().unwrap());
-
-        {
-            let _guard = WorkerLoadGuard::new(worker.clone(), Some(&headers));
-            assert_eq!(worker.load(), 1);
-            assert_eq!(worker.routing_key_load(), 1);
-        }
-
-        assert_eq!(worker.load(), 0);
-        assert_eq!(worker.routing_key_load(), 0);
-    }
-
-    #[test]
-    fn test_worker_load_guard_without_routing_key() {
-        use crate::worker::BasicWorkerBuilder;
-
-        let worker: Arc<dyn Worker> = Arc::new(
-            BasicWorkerBuilder::new("http://test:8000")
-                .worker_type(WorkerType::Regular)
-                .build(),
-        );
-
-        assert_eq!(worker.load(), 0);
-        assert_eq!(worker.routing_key_load(), 0);
-
-        {
-            let _guard = WorkerLoadGuard::new(worker.clone(), None);
-            assert_eq!(worker.load(), 1);
-            assert_eq!(worker.routing_key_load(), 0);
-        }
-
-        assert_eq!(worker.load(), 0);
-        assert_eq!(worker.routing_key_load(), 0);
-    }
-
-    #[test]
-    fn test_worker_load_guard_multiple_same_routing_key() {
-        use crate::worker::BasicWorkerBuilder;
-
-        let worker: Arc<dyn Worker> = Arc::new(
-            BasicWorkerBuilder::new("http://test:8000")
-                .worker_type(WorkerType::Regular)
-                .build(),
-        );
-
-        let mut headers = http::HeaderMap::new();
-        headers.insert("x-smg-routing-key", "key-123".parse().unwrap());
-
-        let guard1 = WorkerLoadGuard::new(worker.clone(), Some(&headers));
-        assert_eq!(worker.load(), 1);
-        assert_eq!(worker.routing_key_load(), 1);
-
-        let guard2 = WorkerLoadGuard::new(worker.clone(), Some(&headers));
-        assert_eq!(worker.load(), 2);
-        assert_eq!(worker.routing_key_load(), 1);
-
-        drop(guard1);
-        assert_eq!(worker.load(), 1);
-        assert_eq!(worker.routing_key_load(), 1);
-
-        drop(guard2);
-        assert_eq!(worker.load(), 0);
-        assert_eq!(worker.routing_key_load(), 0);
     }
 
     #[test]
@@ -3031,10 +3676,14 @@ mod tests {
     }
 
     /// Build a ZMQ worker whose sockets no engine will ever dial, plus the
-    /// data-plane socket path its handshake driver binds.
+    /// data-plane socket path its handshake driver binds. The handshake takes
+    /// an OS-assigned loopback port: the port derived from a temporary ipc
+    /// path is a hash into a band other listeners on the host may hold, and a
+    /// collision there fails the bind these tests wait for.
     fn unattended_zmq_worker(dir: &std::path::Path) -> (BasicWorker, std::path::PathBuf) {
         let worker = BasicWorkerBuilder::new(format!("ipc://{}", dir.join("ts0.ipc").display()))
             .connection_mode(ConnectionMode::Zmq)
+            .zmq_handshake_address("tcp://127.0.0.1:0")
             .health_config(no_health_check())
             .build();
         (worker, dir.join("ts0.ipc-in.sock"))
@@ -3134,5 +3783,65 @@ mod tests {
             !worker.zmq_connect_started.load(Ordering::SeqCst),
             "handshake guard must reset so a later probe can retry"
         );
+    }
+
+    #[test]
+    fn output_silence_is_read_only_while_a_stream_that_produced_output_is_open() {
+        let worker: Arc<dyn Worker> =
+            Arc::new(BasicWorkerBuilder::new("grpc://decode:30000").build());
+        // Nothing in flight it has shown output on: nothing to judge.
+        assert!(worker.output_silence().is_none());
+        worker.note_output_started();
+        worker.note_token_progress();
+        thread::sleep(Duration::from_millis(20));
+        let silence = worker.output_silence().expect("a producing stream is open");
+        assert!(silence >= Duration::from_millis(20), "{silence:?}");
+        // A token: the silence restarts.
+        worker.note_token_progress();
+        assert!(worker.output_silence().expect("still open") < silence);
+        // The stream ended: nothing to judge again, however quiet the worker.
+        worker.note_output_ended();
+        assert!(worker.output_silence().is_none());
+        // The count never goes negative.
+        worker.note_output_ended();
+        assert!(worker.output_silence().is_none());
+    }
+}
+
+#[cfg(test)]
+mod running_window_label_tests {
+    use std::collections::HashMap;
+
+    use crate::worker::{BasicWorkerBuilder, Worker};
+
+    fn with_labels(pairs: &[(&str, &str)]) -> impl Worker {
+        BasicWorkerBuilder::new("http://w:1")
+            .labels(
+                pairs
+                    .iter()
+                    .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                    .collect::<HashMap<_, _>>(),
+            )
+            .build()
+    }
+
+    /// A window label wider than the count's type (an explicit flag above
+    /// 65535 on a large engine) saturates, as the widest window the gate and
+    /// the capacity sum can use, instead of reading as no window at all; a
+    /// zero or a word still reads as none, and `max_num_seqs` still wins.
+    #[test]
+    fn a_window_label_wider_than_the_count_saturates_instead_of_reading_as_none() {
+        for (value, expected) in [
+            ("8", Some(8)),
+            ("65535", Some(65535)),
+            ("70000", Some(65535)),
+            ("0", None),
+            ("none", None),
+        ] {
+            let worker = with_labels(&[("max_running_requests", value)]);
+            assert_eq!(worker.max_running_requests(), expected, "{value}");
+        }
+        let both = with_labels(&[("max_num_seqs", "16"), ("max_running_requests", "70000")]);
+        assert_eq!(both.max_running_requests(), Some(16));
     }
 }

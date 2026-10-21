@@ -1,7 +1,7 @@
 //! gRPC router implementations
 
 use axum::response::Response;
-use openai_protocol::{chat::ChatCompletionRequest, common::StringOrArray};
+use openai_protocol::chat::ChatCompletionRequest;
 
 use crate::routers::error;
 
@@ -17,11 +17,13 @@ pub(crate) mod proto_wrapper;
 pub(crate) mod regular;
 pub(crate) mod router; // Used by routers/factory
 pub(crate) mod spec;
+#[cfg(test)]
+pub(crate) mod test_engine;
 pub mod utils; // Used by routers/http and bindings/golang
 pub mod zmq_client; // ZMQ backend adapter behind the vLLM client surface
-pub(crate) mod zmq_multimodal; // Proto mm inputs → EngineCore mm_features
 
 // Re-export for convenience
+pub use multimodal::worker as worker_media;
 pub use proto_wrapper::{MultimodalData, TensorBytes};
 
 fn validate_text_only_output(request: &ChatCompletionRequest) -> Result<(), Box<Response>> {
@@ -54,7 +56,14 @@ fn validate_text_only_output(request: &ChatCompletionRequest) -> Result<(), Box<
 #[derive(Debug)]
 pub struct ProcessedMessages {
     pub text: String,
-    pub stop_sequences: Option<StringOrArray>,
+    /// Rendered prompt tokens the provider does not bill.
+    pub unbilled_prompt_tokens: u32,
+    /// The prompt continues the trailing assistant message instead of
+    /// following a generation prompt (see
+    /// `ChatTemplateOutput::continued_final_message`): what the reasoning
+    /// decisions follow, since a template that cannot continue the message
+    /// appends its text after the generation prompt.
+    pub continued_final_message: bool,
 }
 
 #[cfg(test)]

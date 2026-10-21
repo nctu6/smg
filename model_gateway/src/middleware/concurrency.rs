@@ -3,16 +3,11 @@
 //!
 //! `AdmissionQueue` caps concurrent waiters at `queue_size`; a request
 //! that finds every slot taken sheds immediately. Waiters park directly
-//! on the token bucket, which serves them in FIFO order. `TokenGuardBody`
-//! wraps the response body so the token is only released after the entire
-//! stream has been delivered.
+//! on the token bucket, which serves them in FIFO order. The token rides on
+//! the response body (the edge's one body wrapper, see `edge_body`), so it
+//! is only released after the entire stream has been delivered.
 
-use std::{
-    pin::Pin,
-    sync::Arc,
-    task::{Context, Poll},
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 
 use axum::{
     body::Body,
@@ -21,12 +16,15 @@ use axum::{
     middleware::Next,
     response::Response,
 };
-use bytes::Bytes;
-use http_body::Frame;
 use tokio::{sync::Semaphore, time::error::Elapsed};
 use tracing::{debug, warn};
 
-use super::{token_bucket::TokenBucket, SHED_RETRY_AFTER_SECS};
+use super::{
+    edge_body::{BodyDuties, Permit},
+    tenant_resolution::restamp_accepted_at,
+    token_bucket::TokenBucket,
+    SHED_RETRY_AFTER_SECS,
+};
 use crate::{
     observability::metrics::{metrics_labels, Metrics},
     routers::error::create_error,
@@ -85,6 +83,9 @@ impl Drop for TokenPermit {
     }
 }
 
+/// On the response body: every frame passes; the drop returns the token.
+impl Permit for TokenPermit {}
+
 /// Holds one slot of the queue-depth gauge; drop covers admit, reject, and
 /// request cancellation.
 struct QueueDepthGuard;
@@ -102,48 +103,17 @@ impl Drop for QueueDepthGuard {
     }
 }
 
-/// A body wrapper that holds a token until the body is fully consumed or dropped.
-pub struct TokenGuardBody {
-    inner: Body,
-    _permit: TokenPermit,
-}
-
-impl TokenGuardBody {
-    fn with_permit(inner: Body, permit: TokenPermit) -> Self {
-        Self {
-            inner,
-            _permit: permit,
-        }
-    }
-}
-
-impl http_body::Body for TokenGuardBody {
-    type Data = Bytes;
-    type Error = axum::Error;
-
-    fn poll_frame(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        // SAFETY: We never move the inner body, and Body is Unpin
-        // (it's a type alias for UnsyncBoxBody which is Unpin)
-        let this = self.get_mut();
-        Pin::new(&mut this.inner).poll_frame(cx)
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
-    }
-
-    fn size_hint(&self) -> http_body::SizeHint {
-        self.inner.size_hint()
-    }
-}
-
-async fn run_with_permit(next: Next, request: Request<Body>, permit: TokenPermit) -> Response {
-    let (parts, body) = next.run(request).await.into_parts();
-    let body = TokenGuardBody::with_permit(body, permit);
-    Response::from_parts(parts, Body::new(body))
+async fn run_with_permit(next: Next, mut request: Request<Body>, permit: TokenPermit) -> Response {
+    // The wait for the permit was the admission queue's, bounded by its own
+    // timeout; the bound ahead of worker selection counts from here.
+    restamp_accepted_at(request.extensions_mut());
+    let mut response = next.run(request).await;
+    // Held until the response body is fully consumed or dropped, by the
+    // edge's one body wrapper.
+    BodyDuties::hand(&mut response, |duties| {
+        duties.permit = Some(Box::new(permit));
+    });
+    response
 }
 
 /// Bounded admission queue: at most `queue_size` requests wait for a token;
@@ -240,12 +210,18 @@ pub async fn concurrency_limit_middleware(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        atomic::{AtomicBool, Ordering},
-        OnceLock,
+    use std::{
+        pin::Pin,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            OnceLock,
+        },
+        task::{Context, Poll},
     };
 
     use axum::{routing::post, Router};
+    use bytes::Bytes;
+    use http_body::Frame;
     use http_body_util::BodyExt;
     use llm_tokenizer::registry::TokenizerRegistry;
     use metrics_exporter_prometheus::PrometheusBuilder;
@@ -258,8 +234,14 @@ mod tests {
 
     use super::*;
     use crate::{
-        app_context::AppContext, config::RouterConfig, health::ProbeState,
-        policies::PolicyRegistry, routers::router_manager::RouterManager, worker::WorkerRegistry,
+        app_context::AppContext,
+        config::RouterConfig,
+        health::ProbeState,
+        middleware::{edge_body::at_the_edge, HttpMetricsLayer},
+        observability::inflight_tracker::InFlightRequestTracker,
+        policies::PolicyRegistry,
+        routers::gateway::Gateway,
+        worker::WorkerRegistry,
     };
 
     fn test_app_state(
@@ -269,7 +251,7 @@ mod tests {
         let router_config = RouterConfig::default();
         let context = Arc::new(
             AppContext::builder()
-                .client(reqwest::Client::new())
+                .client(crate::clients::http_client())
                 .rate_limiter(Some(bucket))
                 .tokenizer_registry(Arc::new(TokenizerRegistry::new()))
                 .reasoning_parser_factory(None)
@@ -288,19 +270,18 @@ mod tests {
                 .unwrap(),
         );
         Arc::new(AppState {
-            router: Arc::new(RouterManager::new(
-                context.worker_registry.clone(),
-                context.client.clone(),
-            )),
+            router: Arc::new(Gateway::new(context.worker_registry.clone())),
             probe_state: ProbeState::new(context.inflight_tracker.clone()),
             context,
             admission_queue,
-            router_manager: None,
+            gateway: None,
             mesh_handler: None,
             mesh_adapters: None,
         })
     }
 
+    /// The admission layer under the server's edge (the metrics layer, which
+    /// builds the one body wrapper that holds the token).
     fn echo_app(app_state: Arc<AppState>) -> Router {
         Router::new()
             .route("/echo", post(|body: Bytes| async move { body }))
@@ -308,6 +289,7 @@ mod tests {
                 app_state,
                 concurrency_limit_middleware,
             ))
+            .layer(HttpMetricsLayer::new(InFlightRequestTracker::new()))
     }
 
     fn echo_request(body: Body) -> Request<Body> {
@@ -342,7 +324,8 @@ mod tests {
             .layer(axum::middleware::from_fn_with_state(
                 test_app_state(bucket, None),
                 concurrency_limit_middleware,
-            ));
+            ))
+            .layer(HttpMetricsLayer::new(InFlightRequestTracker::new()));
         (app, frame_tx)
     }
 
@@ -399,11 +382,30 @@ mod tests {
     fn response_body_holds_token_until_dropped() {
         let bucket = Arc::new(TokenBucket::new(1, 0));
         let permit = TokenPermit::try_acquire(bucket.clone(), 1.0).unwrap();
-        let body = TokenGuardBody::with_permit(Body::empty(), permit);
+        let mut response = Response::new(Body::from("payload"));
+        BodyDuties::hand(&mut response, |duties| {
+            duties.permit = Some(Box::new(permit));
+        });
+        let body = at_the_edge(response).into_body();
 
         assert_eq!(bucket.available_tokens(), 0.0);
         drop(body);
         assert_eq!(bucket.available_tokens(), 1.0);
+    }
+
+    /// A body complete when it reaches the edge (an empty answer) returns its
+    /// token there: nothing is left to deliver.
+    #[test]
+    fn an_already_complete_body_returns_the_token_at_the_edge() {
+        let bucket = Arc::new(TokenBucket::new(1, 0));
+        let permit = TokenPermit::try_acquire(bucket.clone(), 1.0).unwrap();
+        let mut response = Response::new(Body::empty());
+        BodyDuties::hand(&mut response, |duties| {
+            duties.permit = Some(Box::new(permit));
+        });
+        let response = at_the_edge(response);
+        assert_eq!(bucket.available_tokens(), 1.0);
+        drop(response);
     }
 
     /// A streaming response keeps its token after the handler returns: a
@@ -647,7 +649,8 @@ mod tests {
             .layer(axum::middleware::from_fn_with_state(
                 test_app_state(bucket, Some(queue)),
                 concurrency_limit_middleware,
-            ));
+            ))
+            .layer(HttpMetricsLayer::new(InFlightRequestTracker::new()));
 
         let first = tokio::spawn(
             app.clone().oneshot(

@@ -64,7 +64,6 @@ async fn spawn_capture_worker() -> (String, Captured) {
 
 fn least_load_policy() -> PolicyConfig {
     PolicyConfig::LeastLoad {
-        load_check_interval_secs: 10,
         kv_pressure_weight: 0.15,
         mean_prefill_tokens: 1024,
         default_throughput: 2000.0,
@@ -87,6 +86,10 @@ fn cache_aware_policy() -> PolicyConfig {
         cache_index: Default::default(),
         cache_ttl_secs: 180,
         cache_boundaries: Vec::new(),
+        selection_policy: None,
+        selection_accounting_ttl_ms: 0,
+        balance_prefix_margin_tokens: 0,
+        balance_uncached_credit: false,
     }
 }
 
@@ -274,7 +277,7 @@ async fn retries_disabled_streams_a_small_body() {
 }
 
 #[tokio::test]
-async fn routing_key_override_buffers_and_prefers_body_rid() {
+async fn routing_key_override_buffers_and_prefers_header_over_fresh_rids() {
     let (url_a, captured_a) = spawn_capture_worker().await;
     let (url_b, captured_b) = spawn_capture_worker().await;
 
@@ -299,7 +302,11 @@ async fn routing_key_override_buffers_and_prefers_body_rid() {
     }
     let app = ctx.create_app();
 
-    for (rid, header_key) in [("conv_t1", "request-1"), ("conv_t2", "request-2")] {
+    let rids = [
+        "request:group:59bc514bcf6d43a7b523563a1e9769a0",
+        "request:group:9045ab50ac21477aa6b4f6bd29c475b0",
+    ];
+    for rid in rids {
         let payload = serde_json::to_vec(&json!({
             "input_ids": [1, 2, 3],
             "stream": false,
@@ -309,7 +316,7 @@ async fn routing_key_override_buffers_and_prefers_body_rid() {
         let mut req =
             chunked_json_request("/generate", payload.clone(), Some(payload.len() as u64));
         req.headers_mut()
-            .insert("x-smg-routing-key", header_key.parse().unwrap());
+            .insert("x-smg-routing-key", "conversation-42".parse().unwrap());
         req.headers_mut()
             .insert("x-smg-routing-tokens", "1,2,3".parse().unwrap());
         let resp = app.clone().oneshot(req).await.unwrap();
@@ -320,13 +327,9 @@ async fn routing_key_override_buffers_and_prefers_body_rid() {
     let captured_b = captured_b.lock().await;
     assert!(
         matches!((captured_a.len(), captured_b.len()), (2, 0) | (0, 2)),
-        "body rid must override distinct per-request header keys"
+        "the conversation header must override fresh per-request IDs"
     );
-    for ((headers, body), rid) in captured_a
-        .iter()
-        .chain(captured_b.iter())
-        .zip(["conv_t1", "conv_t2"])
-    {
+    for ((headers, body), rid) in captured_a.iter().chain(captured_b.iter()).zip(rids) {
         assert!(
             headers.get(CONTENT_LENGTH).is_some(),
             "routing-key override must use the buffered typed path"

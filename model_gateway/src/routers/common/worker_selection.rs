@@ -4,12 +4,10 @@
 
 use std::{sync::Arc, time::Duration};
 
-use axum::{
-    http::{HeaderMap, HeaderValue},
-    response::Response,
-};
+use axum::{http::HeaderValue, response::Response};
 use futures_util::future::join_all;
 use openai_protocol::models::ListModelsResponse;
+use smg_external_router::ExternalRouterSpec;
 
 use crate::{
     routers::{
@@ -19,7 +17,7 @@ use crate::{
         },
         error,
     },
-    worker::{ConnectionMode, ProviderType, RuntimeType, Worker, WorkerRegistry, WorkerType},
+    worker::{overload::STAGE_SELECTION, ProviderType, RuntimeType, Worker, WorkerRegistry},
 };
 
 /// Holds references to shared infrastructure needed for worker selection.
@@ -30,39 +28,7 @@ pub struct WorkerSelector<'a> {
     registry: &'a WorkerRegistry,
 }
 
-/// Input for [`WorkerSelector::select_worker`].
-///
-/// Combines the model to resolve with optional registry filters and
-/// the caller's HTTP headers (used for auth passthrough during
-/// upstream model refresh).
-#[derive(Debug, Default)]
-pub struct SelectWorkerRequest<'a> {
-    /// Model ID to select a worker for (required).
-    pub model_id: &'a str,
-
-    /// Caller's HTTP headers — used to extract the auth token for
-    /// upstream `/v1/models` refresh on cache miss.
-    pub headers: Option<&'a HeaderMap>,
-
-    /// Provider-based security filtering for multi-provider setups.
-    /// When set, prevents credentials from leaking to workers of a
-    /// different provider (e.g. Anthropic key to OpenAI worker).
-    pub provider: Option<ProviderType>,
-
-    /// Filter by worker type (Regular, Prefill, Decode). `None` = any.
-    pub worker_type: Option<WorkerType>,
-
-    /// Filter by connection mode (Http, Grpc). `None` = any.
-    pub connection_mode: Option<ConnectionMode>,
-
-    /// Filter by runtime type (External, Sglang, Vllm, Trtllm). `None` = any.
-    pub runtime_type: Option<RuntimeType>,
-
-    /// When `true`, restrict candidates to workers advertising realtime
-    /// capability (the `realtime` label). Used by the realtime routes so
-    /// they never proxy to a worker that can't serve realtime.
-    pub require_realtime_capable: bool,
-}
+pub use smg_external_router::worker::SelectWorkerRequest;
 
 impl<'a> WorkerSelector<'a> {
     pub fn new(registry: &'a WorkerRegistry) -> Self {
@@ -103,8 +69,8 @@ impl<'a> WorkerSelector<'a> {
         // each of these requests into three registry walks and up to 5 s of
         // network wait to reach a 503 that carries neither the shed error code
         // nor the shed counter.
-        if let Some(shed) = self.shed_if_all_overloaded(req) {
-            return Err(shed);
+        if let Some(verdict) = self.all_overloaded_verdict(req) {
+            return verdict;
         }
 
         tracing::debug!(
@@ -113,7 +79,7 @@ impl<'a> WorkerSelector<'a> {
         );
 
         let auth = extract_auth_header(req.headers, None);
-        self.refresh_external_models(auth.as_ref(), req.provider.as_ref())
+        self.refresh_external_models(auth.as_ref(), req.router.as_ref())
             .await;
 
         self.find_best_worker(req).ok_or_else(|| {
@@ -147,8 +113,8 @@ impl<'a> WorkerSelector<'a> {
             .filter(|worker| !require_available || worker.is_available())
             .cloned()
             .collect();
-        let candidates = match &req.provider {
-            Some(provider) => filter_by_provider(workers, provider),
+        let candidates = match &req.router {
+            Some(router) => filter_by_router(workers, router),
             None => workers,
         };
         candidates
@@ -164,11 +130,23 @@ impl<'a> WorkerSelector<'a> {
             .min_by_key(|w| w.load())
     }
 
-    /// Shed when every worker this request could have selected is vetoed.
-    /// Runs only on the miss path.
-    fn shed_if_all_overloaded(&self, req: &SelectWorkerRequest<'_>) -> Option<Response> {
+    /// The verdict on a pool whose every worker is vetoed, judged on the miss
+    /// path only: a shed when the pool is all-overloaded under
+    /// `--worker-overload-shed`, else the least-loaded routable worker (an
+    /// overloaded one never under shedding; a liveness veto steers either
+    /// way). `None` when the pool is not all-vetoed (or nothing in it is
+    /// routable), so the usual miss handling continues.
+    fn all_overloaded_verdict(
+        &self,
+        req: &SelectWorkerRequest<'_>,
+    ) -> Option<Result<Arc<dyn Worker>, Response>> {
         let candidates = self.candidate_pool(req, false);
-        overload::shed_if_all_overloaded(&candidates, req.model_id)
+        let shedding = self.registry.overload_shed_enabled();
+        if let Some(shed) = overload::shed_if_all_overloaded(&candidates, req.model_id, shedding) {
+            return Some(Err(shed));
+        }
+        overload::fallback_if_all_vetoed(&candidates, req.model_id, STAGE_SELECTION, shedding)
+            .map(Ok)
     }
 
     /// Check if any healthy worker supports the model (regardless of circuit breaker).
@@ -182,8 +160,8 @@ impl<'a> WorkerSelector<'a> {
             .filter(|worker| worker.is_healthy())
             .cloned()
             .collect();
-        let candidates = match &req.provider {
-            Some(p) => filter_by_provider(workers, p),
+        let candidates = match &req.router {
+            Some(router) => filter_by_router(workers, router),
             None => workers,
         };
         candidates.iter().any(|w| {
@@ -194,13 +172,13 @@ impl<'a> WorkerSelector<'a> {
 
     /// Refresh model lists for healthy external workers in parallel.
     ///
-    /// When `provider` is set, only workers matching that provider are refreshed
-    /// to prevent credential leakage across providers. Each worker falls back to
+    /// When `router` is set, only workers it takes are refreshed, so a caller's
+    /// key never reaches another provider's workers. Each worker falls back to
     /// its own configured API key when the caller provides no auth.
     async fn refresh_external_models(
         &self,
         auth_header: Option<&HeaderValue>,
-        provider: Option<&ProviderType>,
+        router: Option<&ExternalRouterSpec>,
     ) {
         let mut external_workers: Vec<_> = self
             .registry
@@ -214,8 +192,8 @@ impl<'a> WorkerSelector<'a> {
 
         // Only refresh workers matching the request's provider to avoid sending
         // e.g. an OpenAI key to Anthropic workers during model discovery.
-        if let Some(p) = provider {
-            external_workers.retain(|w| matches!(w.default_provider(), Some(wp) if wp == p));
+        if let Some(router) = router {
+            external_workers.retain(|w| router.takes(w.default_provider()));
         }
 
         if external_workers.is_empty() {
@@ -239,11 +217,11 @@ impl<'a> WorkerSelector<'a> {
     }
 }
 
-/// In multi-provider setups, filter to only workers matching the target provider.
-/// In single-provider (or no-provider) setups, returns all workers unchanged.
-fn filter_by_provider(
+/// In multi-provider setups, keep only the workers `router` takes. In
+/// single-provider (or no-provider) setups, return all workers unchanged.
+fn filter_by_router(
     workers: Vec<Arc<dyn Worker>>,
-    target: &ProviderType,
+    router: &ExternalRouterSpec,
 ) -> Vec<Arc<dyn Worker>> {
     let mut first_provider: Option<Option<ProviderType>> = None;
     let has_multiple_providers = workers.iter().any(|w| {
@@ -260,7 +238,7 @@ fn filter_by_provider(
     if has_multiple_providers {
         workers
             .into_iter()
-            .filter(|w| matches!(w.default_provider(), Some(p) if p == target))
+            .filter(|w| router.takes(w.default_provider()))
             .collect()
     } else {
         workers
@@ -331,10 +309,11 @@ async fn refresh_worker_models(
 
 #[cfg(test)]
 mod tests {
-    use openai_protocol::worker::HealthCheckConfig;
+    use openai_protocol::worker::{HealthCheckConfig, WorkerSpec};
+    use smg_external_router::known;
 
     use super::*;
-    use crate::worker::BasicWorkerBuilder;
+    use crate::worker::{BasicWorkerBuilder, WorkerType};
 
     fn no_health_check() -> HealthCheckConfig {
         HealthCheckConfig {
@@ -353,6 +332,58 @@ mod tests {
             b = b.label("realtime", "true");
         }
         Arc::new(b.build())
+    }
+
+    /// A worker of `provider` serving exactly `model`, as a spec would declare it.
+    fn provider_worker(url: &str, provider: &str, model: &str) -> Arc<dyn Worker> {
+        let spec: WorkerSpec = serde_json::from_value(serde_json::json!({
+            "url": url,
+            "runtime_type": "external",
+            "provider": provider,
+            "models": [{"id": model}],
+        }))
+        .expect("worker spec");
+        Arc::new(
+            BasicWorkerBuilder::from_spec(spec)
+                .health_config(no_health_check())
+                .build(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_router_takes_every_provider_it_serves() {
+        // Mixed providers, so the selector filters by router: the
+        // OpenAI-compatible router must still reach the xAI worker it is
+        // dispatched for, and the Anthropic router must not.
+        let registry = WorkerRegistry::new();
+        registry.register_or_replace(provider_worker(
+            "http://127.0.0.1:18090",
+            "openai",
+            "gpt-4o",
+        ));
+        registry.register_or_replace(provider_worker("http://127.0.0.1:18091", "xai", "grok-3"));
+
+        let picked = WorkerSelector::new(&registry)
+            .select_worker(&SelectWorkerRequest {
+                model_id: "grok-3",
+                router: Some(known::OPENAI),
+                ..Default::default()
+            })
+            .await
+            .expect("the OpenAI-compatible router serves xAI workers");
+        assert_eq!(picked.url(), "http://127.0.0.1:18091");
+
+        let refused = WorkerSelector::new(&registry)
+            .select_worker(&SelectWorkerRequest {
+                model_id: "gpt-4o",
+                router: Some(known::ANTHROPIC),
+                ..Default::default()
+            })
+            .await;
+        assert!(
+            refused.is_err(),
+            "an OpenAI worker is not an Anthropic candidate"
+        );
     }
 
     #[tokio::test]
@@ -407,5 +438,44 @@ mod tests {
     #[test]
     fn default_request_does_not_require_realtime() {
         assert!(!SelectWorkerRequest::default().require_realtime_capable);
+    }
+
+    /// Every candidate over the thresholds: by default the least-loaded one
+    /// serves; under `--worker-overload-shed` the request is refused.
+    #[tokio::test]
+    async fn all_overloaded_steers_to_the_least_loaded_unless_shedding() {
+        let registry = WorkerRegistry::new();
+        let busy = worker("http://127.0.0.1:18180", false);
+        let quiet = worker("http://127.0.0.1:18181", false);
+        for _ in 0..4 {
+            busy.increment_load();
+        }
+        quiet.increment_load();
+        registry.register_or_replace(Arc::clone(&busy));
+        registry.register_or_replace(Arc::clone(&quiet));
+        registry.set_worker_overloaded(&busy, true);
+        registry.set_worker_overloaded(&quiet, true);
+
+        let picked = WorkerSelector::new(&registry)
+            .select_worker(&SelectWorkerRequest {
+                model_id: "m",
+                ..Default::default()
+            })
+            .await
+            .expect("steered to the least-loaded worker");
+        assert_eq!(picked.url(), "http://127.0.0.1:18181");
+
+        registry.set_overload_shed(true);
+        let refused = WorkerSelector::new(&registry)
+            .select_worker(&SelectWorkerRequest {
+                model_id: "m",
+                ..Default::default()
+            })
+            .await
+            .expect_err("shedding refuses the all-overloaded pool");
+        assert_eq!(
+            error::extract_error_code_from_response(&refused),
+            "worker_overload_protection_shed"
+        );
     }
 }

@@ -33,8 +33,10 @@ use rustls::crypto::ring;
 use smg::{
     app_context::AppContext,
     config::RouterConfig,
+    mesh_discovery::{start_mesh_discovery_with_client, MeshDiscoveryConfig},
     service_discovery::{
-        start_service_discovery_with_client, ServiceDiscoveryConfig, POD_UID_LABEL,
+        start_service_discovery_with_client, ServiceDiscoveryConfig, DISCOVERY_ID_LABEL,
+        DISCOVERY_PROVIDER_LABEL, POD_UID_LABEL,
     },
     worker::BasicWorkerBuilder,
 };
@@ -234,7 +236,6 @@ fn worker_pod(name: &str, uid: &str, ports: &str, ready: bool) -> Pod {
 
 fn discovery_config() -> ServiceDiscoveryConfig {
     ServiceDiscoveryConfig {
-        enabled: true,
         selector: [("app".to_string(), "smg-it".to_string())].into(),
         check_interval: Duration::from_millis(300),
         ..Default::default()
@@ -312,8 +313,6 @@ async fn multi_port_pod_registers_and_removes_all_workers() {
         fake.client(),
         discovery_config(),
         Arc::clone(&app_context),
-        None,
-        None,
     );
 
     wait_for(
@@ -357,8 +356,6 @@ async fn terminating_pod_drains_before_final_deletion() {
         fake.client(),
         discovery_config(),
         Arc::clone(&app_context),
-        None,
-        None,
     );
     wait_for(
         &app_context,
@@ -395,10 +392,13 @@ async fn zombie_worker_removed_and_manual_worker_kept() {
     let app_context = test_context().await;
 
     // A worker registered for a pod that no longer exists (e.g. by a
-    // registration workflow that outlived its pod) — carries the pod-uid
-    // label, so the reconciler owns it.
+    // registration workflow that outlived its pod). It carries the Kubernetes
+    // provider label, which is what makes it the reconciler's to remove; the
+    // Pod UID label is only the compatibility label it also wrote.
     let zombie = Arc::new(
         BasicWorkerBuilder::new("http://127.0.0.1:19")
+            .label(DISCOVERY_PROVIDER_LABEL, "kubernetes")
+            .label(DISCOVERY_ID_LABEL, "uid-ghost:19")
             .label(POD_UID_LABEL, "uid-ghost")
             .build(),
     );
@@ -411,8 +411,6 @@ async fn zombie_worker_removed_and_manual_worker_kept() {
         fake.client(),
         discovery_config(),
         Arc::clone(&app_context),
-        None,
-        None,
     );
 
     wait_for(
@@ -444,8 +442,6 @@ async fn watch_interruption_relists_and_converges() {
         fake.client(),
         discovery_config(),
         Arc::clone(&app_context),
-        None,
-        None,
     );
     wait_for(
         &app_context,
@@ -489,8 +485,6 @@ async fn drain_window_is_honored_despite_reconcile_passes() {
         fake.client(),
         discovery_config(),
         Arc::clone(&app_context),
-        None,
-        None,
     );
     wait_for(
         &app_context,
@@ -633,8 +627,6 @@ async fn failed_registration_retries_until_engine_appears() {
         fake.client(),
         discovery_config(),
         Arc::clone(&app_context),
-        None,
-        None,
     );
 
     // Many reconcile passes with the engine down: registration keeps failing
@@ -677,8 +669,6 @@ async fn pod_added_after_start_registers_only_once_ready() {
         fake.client(),
         discovery_config(),
         Arc::clone(&app_context),
-        None,
-        None,
     );
 
     fake.apply_pod(worker_pod("flip-0", "uid-flip-0", &port.to_string(), false));
@@ -713,8 +703,6 @@ async fn ready_pod_becoming_unready_removes_all_workers_and_recovers() {
         fake.client(),
         discovery_config(),
         Arc::clone(&app_context),
-        None,
-        None,
     );
     wait_for_ready_pod_uid(
         &app_context,
@@ -794,8 +782,6 @@ async fn same_url_pod_replacement_reregisters_with_new_uid() {
         fake.client(),
         discovery_config(),
         Arc::clone(&app_context),
-        None,
-        None,
     );
     wait_for_pod_uid(
         &app_context,
@@ -840,6 +826,90 @@ async fn same_url_pod_replacement_reregisters_with_new_uid() {
     handle.abort();
 }
 
+fn with_annotation(mut pod: Pod, key: &str, value: &str) -> Pod {
+    pod.metadata
+        .annotations
+        .get_or_insert_with(BTreeMap::new)
+        .insert(key.to_string(), value.to_string());
+    pod
+}
+
+/// The KV connector of every registered worker at `port`.
+fn kv_connectors_at(app_context: &AppContext, port: u16) -> Vec<Option<String>> {
+    app_context
+        .worker_registry
+        .get_all()
+        .into_iter()
+        .filter(|worker| worker.url().ends_with(&format!(":{port}")))
+        .map(|worker| worker.metadata().spec.kv_connector.clone())
+        .collect()
+}
+
+/// Editing a live Pod's KV annotation keeps its UID, so the instance is the
+/// same, but its configuration is not: the worker is updated to the new
+/// connector instead of keeping the old one until the Pod is recreated.
+///
+/// It must stay registered throughout. The drain window is real here and the
+/// worker is Ready before the edit: a removal submitted beside the update
+/// would drain the worker, then delete whatever sits at its URL once the
+/// drain ends, which by then is the updated worker.
+#[tokio::test]
+async fn kv_annotation_edit_on_a_live_pod_updates_its_worker_in_place() {
+    const DRAIN: Duration = Duration::from_secs(2);
+    let fake = FakeK8s::start().await;
+    let app_context = test_context_with_drain(DRAIN.as_secs()).await;
+    let (_engine, port) = start_mock_engine().await;
+    let pod = |connector: &str| {
+        with_annotation(
+            worker_pod("kv-0", "uid-kv-0", &port.to_string(), true),
+            "smg.ai/kv-connector",
+            connector,
+        )
+    };
+    let mooncake = || vec![Some("MooncakeConnector".to_string())];
+    let nixl = || vec![Some("NixlConnector".to_string())];
+
+    fake.apply_pod(pod("MooncakeConnector"));
+    let handle = start_service_discovery_with_client(
+        fake.client(),
+        discovery_config(),
+        Arc::clone(&app_context),
+    );
+    wait_for_ready_pod_uid(&app_context, port, "uid-kv-0", "the Ready worker").await;
+    assert_eq!(kv_connectors_at(&app_context, port), mooncake());
+
+    fake.apply_pod(pod("NixlConnector"));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let current = kv_connectors_at(&app_context, port);
+        if current == nixl() {
+            break;
+        }
+        assert!(
+            current == mooncake(),
+            "the worker left the registry while being updated: {current:?}"
+        );
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the edited annotation never reached the worker: {current:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // Past the drain window and several passes, it is still there.
+    let settled = tokio::time::Instant::now() + DRAIN + Duration::from_secs(1);
+    while tokio::time::Instant::now() < settled {
+        assert_eq!(
+            kv_connectors_at(&app_context, port),
+            nixl(),
+            "the updated worker did not stay registered"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    wait_for_pod_uid(&app_context, port, "uid-kv-0", "the same Pod UID").await;
+
+    handle.abort();
+}
+
 #[tokio::test]
 async fn annotation_port_change_reconciles_worker_set() {
     let fake = FakeK8s::start().await;
@@ -858,8 +928,6 @@ async fn annotation_port_change_reconciles_worker_set() {
         fake.client(),
         discovery_config(),
         Arc::clone(&app_context),
-        None,
-        None,
     );
     wait_for(
         &app_context,
@@ -912,8 +980,6 @@ async fn severed_watch_reconnects_and_converges_without_relist() {
         fake.client(),
         discovery_config(),
         Arc::clone(&app_context),
-        None,
-        None,
     );
     wait_for(
         &app_context,
@@ -940,16 +1006,18 @@ async fn severed_watch_reconnects_and_converges_without_relist() {
 }
 
 #[tokio::test]
-async fn router_discovery_updates_mesh_cluster_state() {
+async fn mesh_router_discovery_runs_without_worker_discovery() {
     use smg_mesh::gossip::NodeStatus;
 
     let fake = FakeK8s::start().await;
     let app_context = test_context().await;
 
-    let mut config = discovery_config();
-    config
-        .router_selector
-        .insert("role".to_string(), "router".to_string());
+    // Mesh router discovery runs on its own lifecycle: no worker discovery
+    // is started here, and none of these router pods may become workers.
+    let config = MeshDiscoveryConfig {
+        router_selector: [("role".to_string(), "router".to_string())].into(),
+        ..Default::default()
+    };
     let cluster_state: smg_mesh::ClusterState = Arc::default();
 
     let mut router = worker_pod("r-0", "uid-r-0", "1", true);
@@ -961,13 +1029,8 @@ async fn router_discovery_updates_mesh_cluster_state() {
     );
     fake.apply_pod(router.clone());
 
-    let handle = start_service_discovery_with_client(
-        fake.client(),
-        config,
-        Arc::clone(&app_context),
-        Some(cluster_state.clone()),
-        Some(7000),
-    );
+    let handle =
+        start_mesh_discovery_with_client(fake.client(), config, cluster_state.clone(), 7000);
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     loop {
@@ -988,6 +1051,11 @@ async fn router_discovery_updates_mesh_cluster_state() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+
+    assert!(
+        app_context.worker_registry.get_all().is_empty(),
+        "mesh router discovery must not register workers"
+    );
 
     fake.delete_pod("r-0");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);

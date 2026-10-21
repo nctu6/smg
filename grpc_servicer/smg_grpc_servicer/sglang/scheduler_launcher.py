@@ -9,6 +9,7 @@ import logging
 import multiprocessing as mp
 import signal
 
+from sglang.srt.arg_groups.model_override_base import resolved_view
 from sglang.srt.managers.data_parallel_controller import (
     run_data_parallel_controller_process,
 )
@@ -17,7 +18,15 @@ from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import configure_logger, numa_utils
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
+from smg_grpc_servicer.rust_lifecycle import READY_POLL_SECS
+
 logger = logging.getLogger(__name__)
+
+
+class SchedulerStartError(RuntimeError):
+    """A scheduler process did not start: it exited, closed its pipe or
+    reported a failure before it was ready. The server answers it with a
+    named exit instead of a traceback."""
 
 
 def run_scheduler_with_signal_handling(*args, **kwargs):
@@ -36,6 +45,24 @@ def run_scheduler_with_signal_handling(*args, **kwargs):
 
     # Now run the actual scheduler process
     run_scheduler_process(*args, **kwargs)
+
+
+def terminate_scheduler_processes(scheduler_procs: list[mp.Process]) -> None:
+    """Terminate and reap scheduler processes without abandoning later ranks."""
+    for i, proc in enumerate(scheduler_procs):
+        try:
+            if proc.is_alive():
+                logger.info(f"Terminating scheduler process {i}...")
+                proc.terminate()
+            proc.join(timeout=2.0)
+            if proc.is_alive():
+                logger.warning(f"Scheduler process {i} did not terminate, killing...")
+                proc.kill()
+                proc.join(timeout=1.0)
+        except Exception:
+            logger.exception(f"Failed to terminate scheduler process {i}")
+
+    logger.info("All scheduler processes terminated")
 
 
 def launch_scheduler_process_only(
@@ -64,6 +91,9 @@ def launch_scheduler_process_only(
     Raises:
         RuntimeError: If any scheduler process fails to initialize
     """
+    # No-op after serve_grpc publishes its config; resolves for direct callers.
+    server_args.resolve_once()
+
     # Configure global environment
     configure_logger(server_args)
     server_args.check_server_args()
@@ -74,29 +104,49 @@ def launch_scheduler_process_only(
     # Allocate ports for inter-process communications
     if port_args is None:
         port_args = PortArgs.init_new(server_args)
-        logger.info(f"{server_args=}")
+    logger.info(f"{server_args=}")
 
     scheduler_procs = []
-
-    if server_args.dp_size == 1:
-        # Single data parallel group - launch TP/PP schedulers
-        memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=server_args.enable_memory_saver
+    try:
+        scheduler_info = _start_scheduler_processes(
+            server_args,
+            port_args,
+            scheduler_procs,
         )
+    except BaseException:
+        terminate_scheduler_processes(scheduler_procs)
+        raise
+
+    return scheduler_info, port_args, scheduler_procs
+
+
+def _start_scheduler_processes(
+    server_args: ServerArgs,
+    port_args: PortArgs,
+    scheduler_procs: list[mp.Process],
+) -> dict:
+    """Start scheduler processes and wait for every ready handshake."""
+
+    # Resolution preserves raw inputs; use the topology the engine will run.
+    cfg = resolved_view(server_args)
+
+    if cfg.dp_size == 1 and cfg.ep_join_mode != "scale":
+        # Single data parallel group - launch TP/PP schedulers
+        memory_saver_adapter = TorchMemorySaverAdapter.create(enable=cfg.enable_memory_saver)
         scheduler_pipe_readers = []
 
         # Calculate TP/PP distribution across nodes
-        nnodes_per_tp_group = max(server_args.nnodes // server_args.pp_size, 1)
-        tp_size_per_node = server_args.tp_size // nnodes_per_tp_group
+        nnodes_per_tp_group = max(cfg.nnodes // cfg.pp_size, 1)
+        tp_size_per_node = cfg.tp_size // nnodes_per_tp_group
         tp_rank_range = range(
-            tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group),
-            tp_size_per_node * (server_args.node_rank % nnodes_per_tp_group + 1),
+            tp_size_per_node * (cfg.node_rank % nnodes_per_tp_group),
+            tp_size_per_node * (cfg.node_rank % nnodes_per_tp_group + 1),
         )
 
-        pp_size_per_node = max(server_args.pp_size // server_args.nnodes, 1)
+        pp_size_per_node = max(cfg.pp_size // cfg.nnodes, 1)
         pp_rank_range = range(
-            pp_size_per_node * (server_args.node_rank // nnodes_per_tp_group),
-            pp_size_per_node * (server_args.node_rank // nnodes_per_tp_group + 1),
+            pp_size_per_node * (cfg.node_rank // nnodes_per_tp_group),
+            pp_size_per_node * (cfg.node_rank // nnodes_per_tp_group + 1),
         )
 
         # Launch scheduler for each TP/PP rank combination
@@ -104,25 +154,15 @@ def launch_scheduler_process_only(
             for tp_rank in tp_rank_range:
                 reader, writer = mp.Pipe(duplex=False)
 
-                # Calculate GPU ID for this rank
+                # SGLang leaves the PP offset unstepped, which can collide with TP ranks.
                 gpu_id = (
-                    server_args.base_gpu_id
-                    + ((pp_rank % pp_size_per_node) * tp_size_per_node)
-                    + (tp_rank % tp_size_per_node) * server_args.gpu_id_step
+                    cfg.base_gpu_id
+                    + ((pp_rank % pp_size_per_node) * tp_size_per_node * cfg.gpu_id_step)
+                    + (tp_rank % tp_size_per_node) * cfg.gpu_id_step
                 )
 
-                # Calculate parallelism ranks (matching engine.py logic)
-                attn_dp_size = server_args.dp_size if server_args.enable_dp_attention else 1
-                attn_tp_size = server_args.tp_size // attn_dp_size // server_args.attn_cp_size
-                attn_cp_rank = (tp_rank // attn_tp_size) % server_args.attn_cp_size
-                moe_dp_rank = tp_rank // (server_args.tp_size // server_args.moe_dp_size)
-                moe_ep_rank = (
-                    tp_rank
-                    % (server_args.tp_size // server_args.moe_dp_size)
-                    // (server_args.tp_size // server_args.moe_dp_size // server_args.ep_size)
-                )
-
-                # Create scheduler process
+                # Create scheduler process. The scheduler derives the attention and MoE
+                # ranks itself from tp_rank and pp_rank.
                 proc = mp.Process(
                     target=run_scheduler_with_signal_handling,
                     args=(
@@ -130,9 +170,6 @@ def launch_scheduler_process_only(
                         port_args,
                         gpu_id,
                         tp_rank,
-                        attn_cp_rank,
-                        moe_dp_rank,
-                        moe_ep_rank,
                         pp_rank,
                         None,  # dp_rank
                         writer,
@@ -144,8 +181,12 @@ def launch_scheduler_process_only(
                     numa_utils.configure_subprocess(server_args, gpu_id),
                 ):
                     proc.start()
+                    scheduler_procs.append(proc)
+                # The rank holds its end of the pipe; this one closes, so a rank
+                # that dies before reporting shows as EOF on the reader instead
+                # of a wait that never ends.
+                writer.close()
 
-                scheduler_procs.append(proc)
                 scheduler_pipe_readers.append(reader)
     else:
         # Data parallelism - launch data parallel controller
@@ -158,22 +199,33 @@ def launch_scheduler_process_only(
         )
         proc.start()
         scheduler_procs.append(proc)
+        writer.close()
 
     # TODO(CatherineSue): handle cases for multi-node
 
-    # Wait for all scheduler processes to be ready
+    # Wait for all scheduler processes to be ready: polling, so a process that
+    # dies during its start (a weight load that fails, a crash) is noticed and
+    # the launch fails, instead of a wait on a report that never comes.
     scheduler_infos = []
     for i, reader in enumerate(scheduler_pipe_readers):
+        while not reader.poll(READY_POLL_SECS):
+            dead = next((proc for proc in scheduler_procs if not proc.is_alive()), None)
+            if dead is not None:
+                dead.join(timeout=1.0)
+                raise SchedulerStartError(
+                    f"Scheduler process {dead.pid} exited with code {dead.exitcode} "
+                    "before it was ready"
+                )
         try:
             data = reader.recv()
         except EOFError:
             logger.error(f"Rank {i} scheduler is dead. Please check if there are relevant logs.")
             scheduler_procs[i].join()
             logger.error(f"Exit code: {scheduler_procs[i].exitcode}")
-            raise RuntimeError(f"Failed to initialize scheduler rank {i}")
+            raise SchedulerStartError(f"Failed to initialize scheduler rank {i}")
 
         if data.get("status") != "ready":
-            raise RuntimeError(
+            raise SchedulerStartError(
                 f"Scheduler rank {i} initialization failed: {data.get('error', 'Unknown error')}"
             )
         scheduler_infos.append(data)
@@ -181,4 +233,4 @@ def launch_scheduler_process_only(
     logger.info(f"All {len(scheduler_procs)} scheduler process(es) initialized successfully")
 
     # Return the first scheduler's info (they should all be the same)
-    return scheduler_infos[0], port_args, scheduler_procs
+    return scheduler_infos[0]

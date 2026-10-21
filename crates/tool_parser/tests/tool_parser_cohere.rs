@@ -203,6 +203,7 @@ async fn test_cohere_streaming_basic() {
             description: Some("Get weather".to_string()),
             parameters: json!({}),
             strict: None,
+            extra: Default::default(),
         },
     }];
 
@@ -248,6 +249,42 @@ async fn test_cohere_streaming_basic() {
     );
     assert_eq!(tool_names.len(), 1, "Should have one tool call");
     assert_eq!(tool_names[0], "get_weather");
+}
+
+#[tokio::test]
+async fn test_cohere_streaming_empty_parameters() {
+    // A streamed call without parameters ends with `{}`, as parse_complete returns.
+    let tools = common::create_test_tools();
+    for chunks in [
+        vec![
+            "<|START_ACTION|>",
+            r#"{"tool_name": "get_weather"}"#,
+            "<|END_ACTION|>",
+        ],
+        vec![
+            "<|START_ACTION|>",
+            "{",
+            "\"tool_name\"",
+            ": ",
+            "\"get_weather\"",
+            "}",
+            "<|END_ACTION|>",
+        ],
+    ] {
+        let mut parser = CohereParser::new();
+        let mut name = None;
+        let mut arguments = String::new();
+        for chunk in chunks {
+            let result = parser.parse_incremental(chunk, &tools).await.unwrap();
+            for call in result.calls {
+                assert_eq!(call.tool_index, 0);
+                name = call.name.or(name);
+                arguments.push_str(&call.parameters);
+            }
+        }
+        assert_eq!(name.as_deref(), Some("get_weather"));
+        assert_eq!(arguments, "{}");
+    }
 }
 
 #[tokio::test]

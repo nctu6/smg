@@ -1,0 +1,87 @@
+//! Transcription request building: reuse the chat backend-request build path
+//! on the request synthesized in preparation, producing a transcription spec.
+
+use async_trait::async_trait;
+use axum::response::Response;
+
+use crate::routers::{
+    error,
+    grpc::{
+        common::stages::BuildStage,
+        context::{
+            stage_output, BuildOutput, ExecutionPlanKind, PreparationOutput, RequestContext,
+        },
+        regular::stages::chat::build_chat_backed_plan,
+        spec::{ResponseSpec, TranscriptionResponseSpec},
+    },
+};
+
+/// Transcription request building stage.
+///
+/// Transcription is Regular-only (the pipeline is never built under PD/EPD),
+/// so the backend plan is always a single request with no PD metadata — this
+/// stage carries no disaggregation parameters.
+pub(crate) struct TranscriptionRequestBuildingStage;
+
+impl TranscriptionRequestBuildingStage {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[async_trait]
+impl BuildStage for TranscriptionRequestBuildingStage {
+    async fn build(&self, ctx: &mut RequestContext) -> Result<BuildOutput, Response> {
+        let prep = stage_output(
+            ctx.state.preparation.take(),
+            "TranscriptionRequestBuildingStage::build",
+        )?;
+
+        let PreparationOutput::Transcription {
+            token_ids,
+            processed_messages,
+            chat_request,
+            format,
+            family,
+        } = prep
+        else {
+            debug_assert!(false, "pipeline guarantees Transcription variant");
+            return Err(error::internal_error(
+                "wrong_preparation_type",
+                "Expected Transcription preparation output",
+            ));
+        };
+
+        // The backend request is chat-shaped: reuse the chat build path on the
+        // request synthesized in preparation. Regular-only, so a single-plan
+        // request with no PD metadata and no tool constraints.
+        let (plan, stamp, _) = build_chat_backed_plan(
+            ctx,
+            &chat_request,
+            processed_messages.text,
+            processed_messages.continued_final_message,
+            token_ids,
+            None,
+            None,
+            "transcription-",
+            /* inject_pd_metadata */ false,
+            ExecutionPlanKind::Single,
+        )
+        .await?;
+
+        Ok(BuildOutput {
+            plan,
+            spec: ResponseSpec::Transcription(TranscriptionResponseSpec { format, family }),
+            stamp,
+        })
+    }
+
+    fn name(&self) -> &'static str {
+        "TranscriptionRequestBuilding"
+    }
+
+    #[cfg(test)]
+    fn signature(&self) -> String {
+        "TranscriptionRequestBuildingStage".to_string()
+    }
+}

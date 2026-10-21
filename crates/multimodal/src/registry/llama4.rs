@@ -1,7 +1,5 @@
 use std::collections::HashMap;
 
-use serde_json::{json, Value};
-
 use crate::{
     encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs},
     registry::{ModelMetadata, ModelProcessorSpec, RegistryResult},
@@ -83,6 +81,11 @@ impl ModelProcessorSpec for Llama4Spec {
         "llama4"
     }
 
+    /// `<|image|>` is vLLM's single-token target for Llama 4.
+    fn worker_expandable(&self, modality: Modality) -> bool {
+        matches!(modality, Modality::Image)
+    }
+
     fn matches(&self, metadata: &ModelMetadata) -> bool {
         let id = metadata.model_id.to_ascii_lowercase();
         id.contains("llama-4")
@@ -108,10 +111,6 @@ impl ModelProcessorSpec for Llama4Spec {
         _metadata: &ModelMetadata,
     ) -> RegistryResult<HashMap<Modality, usize>> {
         Ok(HashMap::from([(Modality::Image, 8)]))
-    }
-
-    fn processor_kwargs(&self, _metadata: &ModelMetadata) -> RegistryResult<Value> {
-        Ok(json!({}))
     }
 
     fn prompt_replacements(

@@ -1,4 +1,4 @@
-mod gemma3;
+mod deepseek_v41;
 mod gemma4;
 mod glm53_flash;
 mod inkling;
@@ -7,15 +7,19 @@ mod kimi_k3;
 mod llama4;
 mod llava;
 mod minimax_m3;
+mod muse_spark;
+mod nemotron_omni;
 mod phi3_v;
-mod qwen3_asr;
+pub mod qwen3_asr;
 mod qwen3_omni;
 mod qwen3_vl;
 mod qwen_vl;
 mod traits;
+pub mod transcription;
 
-use gemma3::Gemma3VisionSpec;
-use gemma4::Gemma4VisionSpec;
+use deepseek_v41::DeepseekV41VisionSpec;
+pub use deepseek_v41::DEEPSEEK_V41_IMAGE_PLACEHOLDER;
+use gemma4::Gemma4Spec;
 use glm53_flash::Glm53FlashSpec;
 use inkling::InklingSpec;
 use kimi_k25::KimiK25VisionSpec;
@@ -23,6 +27,8 @@ use kimi_k3::KimiK3VisionSpec;
 use llama4::Llama4Spec;
 use llava::{LlavaNextSpec, LlavaSpec};
 use minimax_m3::MiniMaxM3VisionSpec;
+use muse_spark::MuseSparkSpec;
+use nemotron_omni::NemotronOmniSpec;
 use once_cell::sync::Lazy;
 use phi3_v::Phi3VisionSpec;
 use qwen3_asr::Qwen3AsrSpec;
@@ -31,7 +37,8 @@ use qwen3_vl::Qwen3VLVisionSpec;
 use qwen_vl::QwenVLVisionSpec;
 // Re-export public API from traits.
 pub use traits::{
-    MediaPartOrder, ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult,
+    modality_limit_override, EncoderInputFormat, MediaItemInfo, MediaPartOrder, ModalityHooks,
+    ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult, ReplacementsHook,
     Tokenizer,
 };
 
@@ -43,8 +50,10 @@ impl ModelRegistry {
     pub fn new() -> Self {
         Self {
             specs: vec![
-                LazySpec::new(|| Box::new(Gemma4VisionSpec)),
-                LazySpec::new(|| Box::new(Gemma3VisionSpec)),
+                // DeepSeek-V4.1 matches only its own model_type / id, so it can lead.
+                LazySpec::new(|| Box::new(DeepseekV41VisionSpec)),
+                // Gemma 4 matches its own model_type / id only.
+                LazySpec::new(|| Box::new(Gemma4Spec)),
                 LazySpec::new(|| Box::new(Glm53FlashSpec)),
                 LazySpec::new(|| Box::new(InklingSpec)),
                 // Kimi-K3 must be registered before Kimi-K2.5: the two families
@@ -53,6 +62,10 @@ impl ModelRegistry {
                 LazySpec::new(|| Box::new(KimiK25VisionSpec)),
                 LazySpec::new(|| Box::new(Llama4Spec)),
                 LazySpec::new(|| Box::new(MiniMaxM3VisionSpec)),
+                // Muse Spark matches its own model_type / architecture / id only.
+                LazySpec::new(|| Box::new(MuseSparkSpec)),
+                // Nemotron-H Omni matches its own model_type only.
+                LazySpec::new(|| Box::new(NemotronOmniSpec)),
                 // LlavaNext must be registered before Llava so "llava_next" model_type matches first.
                 LazySpec::new(|| Box::new(LlavaNextSpec)),
                 LazySpec::new(|| Box::new(LlavaSpec)),
@@ -74,6 +87,12 @@ impl ModelRegistry {
             }
         }
         None
+    }
+
+    /// The names of the model families this registry has a spec for, in
+    /// lookup order: what a refusal can list for the operator.
+    pub fn spec_names(&self) -> Vec<&'static str> {
+        self.specs.iter().map(|spec| spec.get().name()).collect()
     }
 }
 
@@ -164,7 +183,7 @@ pub(super) mod test_helpers {
     ) -> PreprocessedEncoderInputs {
         let sizes: Vec<(u32, u32)> = item_sizes.iter().map(|s| (s.height, s.width)).collect();
         PreprocessedEncoderInputs {
-            encoder_input: ndarray::ArrayD::zeros(vec![1, 3, 336, 336]),
+            encoder_input: ndarray::ArrayD::<f32>::zeros(vec![1, 3, 336, 336]).into(),
             feature_token_counts: feature_token_counts.to_vec(),
             item_sizes: sizes,
             model_specific: HashMap::new(),
@@ -191,10 +210,42 @@ pub(super) mod test_helpers {
             },
         );
         PreprocessedEncoderInputs {
-            encoder_input: ndarray::ArrayD::zeros(vec![1, 3, 336, 336]),
+            encoder_input: ndarray::ArrayD::<f32>::zeros(vec![1, 3, 336, 336]).into(),
             feature_token_counts: vec![0; sizes.len()],
             item_sizes: sizes,
             model_specific,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::registry::test_helpers::TestTokenizer;
+
+    /// A checkpoint of this family resolves to a spec by its `model_type`
+    /// alone (the served id is often an opaque path).
+    #[test]
+    fn the_registry_resolves_the_gemma4_family() {
+        let tokenizer = TestTokenizer::new(&[]);
+        let config = json!({
+            "model_type": "gemma4",
+            "image_token_id": 258880,
+            "boi_token_id": 255999,
+            "eoi_token_id": 258882,
+            "video_token_id": 258884
+        });
+        let metadata = ModelMetadata {
+            model_id: "/models/local-checkpoint",
+            tokenizer: &tokenizer,
+            config: &config,
+        };
+        let registry = ModelRegistry::new();
+        let spec = registry
+            .lookup(&metadata)
+            .expect("the gemma4 family has a spec");
+        assert_eq!(spec.name(), "gemma4");
     }
 }

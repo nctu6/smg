@@ -97,6 +97,9 @@ fn deep_clone_info(w: &Arc<dyn Worker>) -> WorkerInfo {
         status: Some(status),
         load: w.load(),
         http2: meta.http2,
+        pd_pairing: None,
+        stalled: None,
+        engine_load: None,
         job_status: None,
     }
 }

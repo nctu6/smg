@@ -9,9 +9,8 @@ use axum::response::Response;
 use openai_protocol::{
     common::{ToolCall, Usage},
     responses::{
-        InputTokensDetails, OutputTokensDetails, ResponseContentPart, ResponseOutputItem,
-        ResponseReasoningContent, ResponseStatus, ResponseUsage, ResponsesRequest,
-        ResponsesResponse, ResponsesUsage,
+        ResponseContentPart, ResponseOutputItem, ResponseReasoningContent, ResponseStatus,
+        ResponseUsage, ResponsesRequest, ResponsesResponse, ResponsesUsage,
     },
 };
 use serde_json::{json, to_string};
@@ -20,7 +19,7 @@ use tracing::{debug, error, warn};
 
 use super::{
     common::{
-        build_next_request_with_tools, inject_mcp_metadata, load_previous_messages,
+        build_next_request_with_tools, inject_mcp_metadata,
         strip_image_generation_from_request_tools, McpCallTracking,
     },
     execution::{convert_mcp_tools_to_response_tools, execute_mcp_tools, ToolResult},
@@ -33,7 +32,8 @@ use crate::{
         error,
         grpc::{
             common::responses::{
-                collect_user_function_names, ensure_mcp_connection, persist_response_if_needed,
+                collect_user_function_names, ensure_mcp_connection, load_history,
+                persist_response_if_needed, utils::resolve_function_identity, NotStored,
                 ResponsesContext,
             },
             harmony::processor::ResponsesIterationResult,
@@ -51,16 +51,19 @@ use crate::{
 ///    - Build next request with tool results
 ///    - Repeat from step 1 (full pipeline re-execution)
 /// 4. If no tool calls, return final response
+///
+/// `response_id` is the id a background response was answered and stored
+/// under: its terminal object is persisted under that id.
 pub(crate) async fn serve_harmony_responses(
     ctx: &ResponsesContext,
     request: ResponsesRequest,
     tenant_request_meta: TenantRequestMeta,
+    response_id: Option<String>,
 ) -> Result<ResponsesResponse, Response> {
-    // Clone request for persistence
-    let original_request = request.clone();
-
-    // Load previous conversation history if previous_response_id is set
-    let current_request = load_previous_messages(ctx, request).await?;
+    // Load the history the request continues, as the caller's tenant may see
+    // it; `request` itself stays as it came, for the persist.
+    let tenant = crate::tenant::storage_tenant(&tenant_request_meta);
+    let current_request = load_history(ctx.history_stores(), &request, tenant.as_deref()).await?;
 
     // Check MCP connection and get whether MCP tools are present
     let (has_mcp_tools, mcp_servers) = ensure_mcp_connection(
@@ -70,7 +73,7 @@ pub(crate) async fn serve_harmony_responses(
     )
     .await?;
 
-    let response = if has_mcp_tools {
+    let mut response = if has_mcp_tools {
         execute_with_mcp_loop(
             ctx,
             current_request,
@@ -82,17 +85,23 @@ pub(crate) async fn serve_harmony_responses(
         // No MCP tools - execute pipeline once (may have function tools or no tools)
         execute_without_mcp_loop(ctx, current_request, tenant_request_meta).await?
     };
+    if let Some(response_id) = response_id {
+        response.id = response_id;
+    }
 
-    // Persist response to storage if store=true
+    // Persist response to storage if store=true; a foreground response the
+    // client expects stored is answered as stored or not at all.
     persist_response_if_needed(
         ctx.conversation_storage.clone(),
         ctx.conversation_item_storage.clone(),
         ctx.response_storage.clone(),
         &response,
-        &original_request,
+        &request,
+        tenant.as_deref(),
         ctx.request_context.clone(),
     )
-    .await;
+    .await
+    .map_err(NotStored::into_response)?;
 
     Ok(response)
 }
@@ -471,10 +480,13 @@ fn build_tool_response(
         let output_str = to_string(&result.output)
             .unwrap_or_else(|e| format!("{{\"error\": \"Failed to serialize tool output: {e}\"}}"));
 
+        let (name, namespace) =
+            resolve_function_identity(responses_request.tools.as_deref(), &tool_call.function.name);
         output.push(ResponseOutputItem::FunctionToolCall {
             id: Some(tool_call.id.clone()),
             call_id: tool_call.id.clone(),
-            name: tool_call.function.name.clone(),
+            name,
+            namespace,
             arguments: tool_call.function.arguments.clone().unwrap_or_default(),
             output: Some(output_str),
             status: if result.is_error {
@@ -490,10 +502,13 @@ fn build_tool_response(
     for tool_call in function_tool_calls {
         let call_id = tool_call.id.clone();
         let arguments = tool_call.function.arguments.unwrap_or_default();
+        let (name, namespace) =
+            resolve_function_identity(responses_request.tools.as_deref(), &tool_call.function.name);
         output.push(ResponseOutputItem::FunctionToolCall {
             id: Some(tool_call.id),
             call_id,
-            name: tool_call.function.name,
+            name,
+            namespace,
             arguments,
             output: None, // No output = needs execution
             status: "completed".to_string(),
@@ -511,19 +526,35 @@ fn build_tool_response(
         .created_at(created_at)
         .status(ResponseStatus::Completed)
         .output(output)
-        .usage(ResponsesUsage::Modern(ResponseUsage {
-            input_tokens: usage.prompt_tokens,
-            output_tokens: usage.completion_tokens,
-            total_tokens: usage.total_tokens,
-            input_tokens_details: usage
-                .prompt_tokens_details
-                .as_ref()
-                .map(InputTokensDetails::from),
-            output_tokens_details: usage.completion_tokens_details.as_ref().and_then(|d| {
-                d.reasoning_tokens.map(|tokens| OutputTokensDetails {
-                    reasoning_tokens: tokens,
-                })
-            }),
-        }))
+        .usage(ResponsesUsage::Modern(ResponseUsage::from(&usage)))
         .build()
+}
+
+#[cfg(test)]
+mod namespace_tests {
+    use super::*;
+    use crate::routers::grpc::common::responses::utils::namespace_test_request;
+
+    #[test]
+    fn namespace_function_response_preserves_identity() {
+        let request = namespace_test_request();
+        let call = serde_json::from_value(json!({
+            "id": "call_test", "type": "function",
+            "function": {"name": "weather.lookup", "arguments": "{}"}
+        }))
+        .unwrap();
+        let response = build_tool_response(
+            vec![],
+            vec![],
+            vec![call],
+            None,
+            String::new(),
+            Usage::from_counts(1, 1),
+            "resp_test".into(),
+            Arc::new(request),
+        );
+        let wire = serde_json::to_value(response).unwrap();
+        assert_eq!(wire["output"][0]["name"], "lookup");
+        assert_eq!(wire["output"][0]["namespace"], "weather");
+    }
 }

@@ -11,8 +11,8 @@ use crate::routers::{
         client::GrpcClient,
         common::stages::{helpers, BuildStage},
         context::{
-            AttemptStamp, BuildOutput, ExecutionPlan, PreparationOutput, RequestContext,
-            RequestType,
+            stage_output, AttemptStamp, BuildOutput, ExecutionPlan, PreparationOutput,
+            RequestContext, RequestType,
         },
         proto_wrapper::ProtoEmbedRequest,
         spec::ResponseSpec,
@@ -83,13 +83,11 @@ fn build_one_embed(
 #[async_trait]
 impl BuildStage for EmbeddingRequestBuildingStage {
     async fn build(&self, ctx: &mut RequestContext) -> Result<BuildOutput, Response> {
-        let prep_output = ctx.state.preparation.as_ref().ok_or_else(|| {
-            error!(
-                function = "EmbeddingRequestBuildingStage::build",
-                "Preparation output missing"
-            );
-            error::internal_error("preparation_missing", "Preparation output missing")
-        })?;
+        // Preparation output should have tokenized input
+        let prep_output = stage_output(
+            ctx.state.preparation.as_ref(),
+            "EmbeddingRequestBuildingStage::build",
+        )?;
 
         let PreparationOutput::Embedding { items, .. } = prep_output else {
             error!(
@@ -154,6 +152,7 @@ impl BuildStage for EmbeddingRequestBuildingStage {
                     sampling_mask: None,
                     sampling_baseline: None,
                     inject_pd_metadata: false,
+                    tool_constraint: None,
                 },
             });
         }
@@ -187,6 +186,7 @@ impl BuildStage for EmbeddingRequestBuildingStage {
                 sampling_mask: None,
                 sampling_baseline: None,
                 inject_pd_metadata: false,
+                tool_constraint: None,
             },
         })
     }

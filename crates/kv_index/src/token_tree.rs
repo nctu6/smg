@@ -24,6 +24,7 @@ use std::{
 use dashmap::{mapref::entry::Entry, DashMap};
 use once_cell::sync::Lazy;
 use parking_lot::RwLock as ParkingLotRwLock;
+use rustc_hash::FxBuildHasher;
 use tracing::debug;
 
 use super::{
@@ -130,10 +131,16 @@ fn new_children_map() -> DashMap<TokenPageKey, NodeRef, TokenPageHasherBuilder> 
     DashMap::with_hasher_and_shard_amount(TokenPageHasherBuilder::default(), NODE_SHARD_COUNT)
 }
 
+/// Per-tenant maps keyed by interned worker ids. Tenant ids are operator
+/// controlled worker URLs, hashed on every request-path lookup, so a fast
+/// non-keyed hash is the right trade; map order was already arbitrary (the
+/// default hasher is randomly seeded per map).
+type TenantMap<V> = DashMap<TenantId, V, FxBuildHasher>;
+
 /// Create a tenant access time DashMap
 #[inline]
-fn new_tenant_map() -> DashMap<TenantId, u64> {
-    DashMap::with_shard_amount(NODE_SHARD_COUNT)
+fn new_tenant_map() -> TenantMap<u64> {
+    DashMap::with_hasher_and_shard_amount(FxBuildHasher, NODE_SHARD_COUNT)
 }
 
 /// Result of a prefix match operation with token counts.
@@ -168,7 +175,8 @@ impl MatchResult for PrefixMatchResult {
 
 /// Global tenant string intern pool to avoid repeated allocations.
 /// Uses DashMap for concurrent access with minimal contention.
-static TENANT_INTERN_POOL: Lazy<DashMap<Arc<str>, ()>> = Lazy::new(DashMap::new);
+static TENANT_INTERN_POOL: Lazy<DashMap<Arc<str>, (), FxBuildHasher>> =
+    Lazy::new(|| DashMap::with_hasher(FxBuildHasher));
 
 /// Intern tenant ID to avoid repeated allocations.
 /// Returns cached Arc<str> if tenant was seen before.
@@ -200,7 +208,7 @@ struct Node {
     /// Children nodes keyed by first PAGE_SIZE tokens (page key)
     children: DashMap<TokenPageKey, NodeRef, TokenPageHasherBuilder>,
     /// Tenants that own this node with last access timestamps
-    tenant_last_access_time: DashMap<TenantId, u64>,
+    tenant_last_access_time: TenantMap<u64>,
     /// Cached last tenant for fast access (probabilistic update)
     last_tenant: ParkingLotRwLock<Option<TenantId>>,
     /// Parent node (Weak to avoid reference cycles). None for root.
@@ -237,7 +245,10 @@ impl Node {
                 TokenPageHasherBuilder::default(),
                 ROOT_SHARD_COUNT,
             ),
-            tenant_last_access_time: DashMap::with_shard_amount(ROOT_SHARD_COUNT),
+            tenant_last_access_time: DashMap::with_hasher_and_shard_amount(
+                FxBuildHasher,
+                ROOT_SHARD_COUNT,
+            ),
             last_tenant: ParkingLotRwLock::new(None),
             parent: ParkingLotRwLock::new(Weak::new()),
             page_key: ParkingLotRwLock::new(None),
@@ -294,9 +305,7 @@ impl Node {
     /// Returns true when this call newly attached the tenant to the node —
     /// the atomic winner under concurrency, so token accounting tied to it is
     /// exact.
-    fn touch_tenant(&self, tenant: &TenantId, track_lfu: bool) -> bool {
-        let ts = next_timestamp();
-
+    fn touch_tenant(&self, tenant: &TenantId, ts: u64, track_lfu: bool) -> bool {
         // Conditionally increment hit count (only for LFU policy to reduce contention)
         if track_lfu {
             self.hit_count.fetch_add(1, Ordering::Relaxed);
@@ -324,13 +333,52 @@ impl Node {
 
         newly_attached
     }
+
+    /// `get_any_tenant` and `touch_tenant` in one map operation: stamp the
+    /// cached tenant if it still owns this node, else the first tenant in map
+    /// order. One write-locked lookup instead of a read-locked check followed
+    /// by a write-locked update. `None` when no tenant owns the node (then
+    /// nothing is stamped or counted, as before).
+    ///
+    /// A returned tenant is always one this call stamped: both branches pick
+    /// and stamp under the same shard guard, so an eviction cannot remove the
+    /// pick in between and leave the match naming a tenant that no longer
+    /// owns the node. A match never re-attaches an evicted tenant.
+    fn touch_any_tenant(&self, ts: u64, track_lfu: bool) -> Option<TenantId> {
+        let cached = self.last_tenant.read().clone();
+        let tenant = cached
+            .filter(|tenant| {
+                self.tenant_last_access_time
+                    .get_mut(tenant.as_ref())
+                    .map(|mut stamp| *stamp = ts)
+                    .is_some()
+            })
+            .or_else(|| {
+                self.tenant_last_access_time
+                    .iter_mut()
+                    .next()
+                    .map(|mut entry| {
+                        *entry.value_mut() = ts;
+                        Arc::clone(entry.key())
+                    })
+            })?;
+        if track_lfu {
+            self.hit_count.fetch_add(1, Ordering::Relaxed);
+        }
+        if ts & 0xF == 0 {
+            if let Some(mut guard) = self.last_tenant.try_write() {
+                *guard = Some(Arc::clone(&tenant));
+            }
+        }
+        Some(tenant)
+    }
 }
 
 /// Token-based radix tree for cache-aware routing.
 pub struct TokenTree {
     root: NodeRef,
     /// Track total tokens per tenant for eviction decisions
-    tenant_token_count: DashMap<TenantId, usize>,
+    tenant_token_count: TenantMap<usize>,
     /// Tree-wide token total (sum of `tenant_token_count`); the budget
     /// checked by `evict_tenant_by_size`
     total_token_count: AtomicUsize,
@@ -386,7 +434,10 @@ impl TokenTree {
         assert!(page_size >= 1, "page_size must be at least 1");
         Self {
             root: Arc::new(Node::new_root()),
-            tenant_token_count: DashMap::with_shard_amount(ROOT_SHARD_COUNT),
+            tenant_token_count: DashMap::with_hasher_and_shard_amount(
+                FxBuildHasher,
+                ROOT_SHARD_COUNT,
+            ),
             total_token_count: AtomicUsize::new(0),
             eviction_policy: policy,
             page_size,
@@ -437,6 +488,7 @@ impl TokenTree {
             Arc::clone(&self.root),
             tokens,
             Arc::clone(&tenant_id),
+            next_timestamp(),
             track_lfu,
             page_size,
         );
@@ -454,11 +506,19 @@ impl TokenTree {
     ///
     /// [`Self::match_and_insert_with`] reuses this to splice only the *unmatched
     /// suffix* at the fall-off node (after re-attaching the tenant to the matched
-    /// ancestor nodes), so the already-matched prefix is never re-walked.
+    /// ancestor nodes), so the already-matched prefix is never re-walked; except
+    /// when its replay finds an edge gone (an eviction detached a path node while
+    /// the caller chose the tenant): then it descends again from the root over the
+    /// whole aligned sequence, so that the suffix lands under live nodes. The
+    /// credit stays exact, since a node the replay already attached is a full
+    /// match here and adds nothing, though such a node is touched a second time
+    /// (under LFU its hit count rises twice for the one request), on that rare
+    /// path alone.
     fn insert_from(
         mut current: NodeRef,
         mut remaining: &[TokenId],
         tenant_id: TenantId,
+        ts: u64,
         track_lfu: bool,
         page_size: usize,
     ) -> usize {
@@ -484,7 +544,7 @@ impl TokenTree {
                     // No child with this page key - create new node
                     let new_node = Arc::new(Node::new(remaining.to_vec()));
                     new_node.set_parent(&current, page_key);
-                    new_node.touch_tenant(&tenant_id, track_lfu);
+                    new_node.touch_tenant(&tenant_id, ts, track_lfu);
                     entry.insert(new_node);
                     InsertStep::Done(remaining.len())
                 }
@@ -512,7 +572,7 @@ impl TokenTree {
                         // touch_tenant), or repeat traffic inflates
                         // `tenant_token_count`.
                         drop(child_tokens);
-                        let newly_attached = child.touch_tenant(&tenant_id, track_lfu);
+                        let newly_attached = child.touch_tenant(&tenant_id, ts, track_lfu);
                         InsertStep::Continue {
                             next: child,
                             advance: common_len,
@@ -571,7 +631,8 @@ impl TokenTree {
                         // the return is authoritative and the prefix is credited
                         // exactly once even against a concurrent same-tenant
                         // replay that raced the clone above.
-                        let newly_attached = intermediate_node.touch_tenant(&tenant_id, track_lfu);
+                        let newly_attached =
+                            intermediate_node.touch_tenant(&tenant_id, ts, track_lfu);
 
                         // Replace entry with intermediate node
                         entry.insert(intermediate_node);
@@ -625,7 +686,7 @@ impl TokenTree {
                             let new_node = Arc::new(Node::new(new_remaining.to_vec()));
                             let new_page_key = page_key_of(new_remaining, page_size);
                             new_node.set_parent(&intermediate_node, new_page_key);
-                            new_node.touch_tenant(&tenant_id, track_lfu);
+                            new_node.touch_tenant(&tenant_id, ts, track_lfu);
                             intermediate_node.children.insert(new_page_key, new_node);
                             new_remaining.len()
                         } else {
@@ -633,7 +694,8 @@ impl TokenTree {
                         };
 
                         // Attach before publication (see the prefix-split arm).
-                        let newly_attached = intermediate_node.touch_tenant(&tenant_id, track_lfu);
+                        let newly_attached =
+                            intermediate_node.touch_tenant(&tenant_id, ts, track_lfu);
 
                         // Replace entry with intermediate node
                         entry.insert(intermediate_node);
@@ -759,7 +821,7 @@ impl TokenTree {
                             // Update timestamp on match to keep LRU in sync with backend
                             // SGLang does: child.last_access_time = access_time
                             if let Some(ref t) = tenant {
-                                child.touch_tenant(t, track_lfu);
+                                child.touch_tenant(t, next_timestamp(), track_lfu);
                             }
 
                             if match_len < child_tokens.len() {
@@ -903,7 +965,7 @@ impl TokenTree {
                     // Insert: create a new leaf node holding the remainder.
                     let new_node = Arc::new(Node::new(remaining.to_vec()));
                     new_node.set_parent(&current, page_key);
-                    new_node.touch_tenant(&tenant_id, track_lfu);
+                    new_node.touch_tenant(&tenant_id, next_timestamp(), track_lfu);
                     entry.insert(new_node);
                     Step::Done(remaining.len())
                 }
@@ -944,7 +1006,7 @@ impl TokenTree {
                                 Some(t_match) => {
                                     matched_tokens += common_len;
                                     matched_tenants = child.matched_tenants();
-                                    child.touch_tenant(&t_match, track_lfu);
+                                    child.touch_tenant(&t_match, next_timestamp(), track_lfu);
                                     last_tenant = Some(t_match);
                                 }
                             }
@@ -957,7 +1019,8 @@ impl TokenTree {
                         // ALSO touched twice (match then insert), so we keep both
                         // touches to preserve LFU hit_count / timestamp behavior
                         // byte-for-byte.
-                        let newly_attached = child.touch_tenant(&tenant_id, track_lfu);
+                        let newly_attached =
+                            child.touch_tenant(&tenant_id, next_timestamp(), track_lfu);
                         Step::Continue {
                             next: child,
                             advance: common_len,
@@ -977,7 +1040,7 @@ impl TokenTree {
                                 Some(t_match) => {
                                     matched_tokens += common_len;
                                     matched_tenants = child.matched_tenants();
-                                    child.touch_tenant(&t_match, track_lfu);
+                                    child.touch_tenant(&t_match, next_timestamp(), track_lfu);
                                     last_tenant = Some(t_match);
                                 }
                             }
@@ -1017,7 +1080,8 @@ impl TokenTree {
                             .insert(suffix_page_key, Arc::clone(&child));
 
                         // Attach before publication (see `insert_from`).
-                        let newly_attached = intermediate_node.touch_tenant(&tenant_id, track_lfu);
+                        let newly_attached =
+                            intermediate_node.touch_tenant(&tenant_id, next_timestamp(), track_lfu);
 
                         entry.insert(intermediate_node);
 
@@ -1035,7 +1099,7 @@ impl TokenTree {
                                 Some(t_match) => {
                                     matched_tokens += common_len;
                                     matched_tenants = child.matched_tenants();
-                                    child.touch_tenant(&t_match, track_lfu);
+                                    child.touch_tenant(&t_match, next_timestamp(), track_lfu);
                                     last_tenant = Some(t_match);
                                 }
                             }
@@ -1079,7 +1143,7 @@ impl TokenTree {
                             let new_node = Arc::new(Node::new(new_remaining.to_vec()));
                             let new_page_key = page_key_of(new_remaining, page_size);
                             new_node.set_parent(&intermediate_node, new_page_key);
-                            new_node.touch_tenant(&tenant_id, track_lfu);
+                            new_node.touch_tenant(&tenant_id, next_timestamp(), track_lfu);
                             intermediate_node.children.insert(new_page_key, new_node);
                             new_remaining.len()
                         } else {
@@ -1087,7 +1151,8 @@ impl TokenTree {
                         };
 
                         // Attach before publication (see `insert_from`).
-                        let newly_attached = intermediate_node.touch_tenant(&tenant_id, track_lfu);
+                        let newly_attached =
+                            intermediate_node.touch_tenant(&tenant_id, next_timestamp(), track_lfu);
 
                         entry.insert(intermediate_node);
 
@@ -1138,10 +1203,28 @@ impl TokenTree {
     /// advances are frozen at match time); only per-node access timestamps are
     /// approximate — a concurrently-split intermediate may miss a bump and evict
     /// slightly early.
+    #[inline]
     pub fn match_and_insert_with<'t, F>(&self, tokens: &[TokenId], select: F) -> PrefixMatchResult
     where
         F: FnOnce(&PrefixMatchResult) -> Option<&'t str>,
     {
+        // `select` runs exactly once; the Option carries the FnOnce through
+        // the FnMut interface of the non-generic walk below.
+        let mut select = Some(select);
+        self.match_and_insert_dyn(tokens, &mut |result| {
+            select.take().and_then(|select| select(result))
+        })
+    }
+
+    /// The whole fused descent, behind one indirect call. It is deliberately
+    /// not generic over the closure: a generic walk is monomorphized into
+    /// every calling crate and compiled at that crate's optimization level,
+    /// whereas this body is compiled once, here, at this crate's.
+    fn match_and_insert_dyn<'t>(
+        &self,
+        tokens: &[TokenId],
+        select: &mut dyn FnMut(&PrefixMatchResult) -> Option<&'t str>,
+    ) -> PrefixMatchResult {
         let page_size = self.page_size;
         let input_token_count = tokens.len();
 
@@ -1166,19 +1249,32 @@ impl TokenTree {
         let tokens = &tokens[..aligned_len];
 
         let track_lfu = self.eviction_policy == EvictionPolicy::Lfu;
+        // One LRU stamp per request. Every node this request touches gets the
+        // same value, which orders it after every earlier request and before
+        // every later one, the only property eviction needs. That is one
+        // contended atomic per request instead of one per node on the match
+        // and another per node on the insert replay.
+        let ts = next_timestamp();
 
         // ---- Phase 1: MATCH descent (mirrors match_prefix_with_counts) ----
         // Additionally record every traversed edge so insert can replay its
         // per-node work without re-walking, and capture the fall-off node +
         // remaining slice for the splice.
         let mut matched_tokens = 0usize;
-        let mut last_tenant: Option<TenantId> = None;
-        let mut last_match_node: Option<NodeRef> = None;
         let mut remaining = tokens;
-        let mut current = Arc::clone(&self.root);
-        // Every full-match node we descended through, in order.
-        // Pre-allocated; most matched paths are well under this depth.
+        // Every full-match node we descended through, in order, and the tenant
+        // the match stamped on it (`None` once the match is frozen). Each node
+        // is cloned once, into `path`; `current` indexes it (`None` = root).
         let mut path: Vec<NodeRef> = Vec::with_capacity(16);
+        let mut stamped: Vec<Option<TenantId>> = Vec::with_capacity(16);
+        // The page key each edge of `path` was descended by, so the replay can
+        // confirm an edge still exists before it attaches a tenant under it.
+        let mut keys: Vec<TokenPageKey> = Vec::with_capacity(16);
+        let mut current: Option<usize> = None;
+        // Where the match resolved: the deepest full-match node that had a
+        // tenant (an index into `path`), or the partial-match node.
+        let mut last_full: Option<usize> = None;
+        let mut partial: Option<(NodeRef, TenantId)> = None;
         // Once match would stop (all-evicted node / partial), freeze the match
         // result but keep descending for insert (insert's reach is a superset).
         let mut match_frozen = false;
@@ -1186,13 +1282,21 @@ impl TokenTree {
         enum MatchStep {
             Stop,
             Retry,
-            Continue { next: NodeRef, advance: usize },
+            Continue {
+                next: NodeRef,
+                advance: usize,
+                tenant: Option<TenantId>,
+            },
         }
 
         while remaining.len() >= page_size {
             let page_key = page_key_of(remaining, page_size);
+            let current_node = match current {
+                Some(i) => &path[i],
+                None => &self.root,
+            };
 
-            let step = match current.children.get(&page_key) {
+            let step = match current_node.children.get(&page_key) {
                 None => MatchStep::Stop,
                 Some(child_ref) => 'probe: {
                     let child = Arc::clone(child_ref.value());
@@ -1200,7 +1304,7 @@ impl TokenTree {
 
                     let child_tokens = child.tokens.read();
                     // Stale-edge check (see `match_prefix_with_counts`).
-                    if !std::ptr::eq(child.parent.read().as_ptr(), Arc::as_ptr(&current)) {
+                    if !std::ptr::eq(child.parent.read().as_ptr(), Arc::as_ptr(current_node)) {
                         drop(child_tokens);
                         std::hint::spin_loop();
                         break 'probe MatchStep::Retry;
@@ -1217,12 +1321,11 @@ impl TokenTree {
                         MatchStep::Stop
                     } else if match_len < child_tokens.len() {
                         // Partial match within the node: match stops here.
+                        drop(child_tokens);
                         if !match_frozen {
-                            if let Some(t) = child.get_any_tenant() {
-                                child.touch_tenant(&t, track_lfu);
+                            if let Some(t) = child.touch_any_tenant(ts, track_lfu) {
                                 matched_tokens += match_len;
-                                last_tenant = Some(t);
-                                last_match_node = Some(Arc::clone(&child));
+                                partial = Some((child, t));
                             }
                             // (If the node is all-evicted, match records nothing
                             // and simply stops — same as match_prefix_with_counts.)
@@ -1230,29 +1333,28 @@ impl TokenTree {
                         }
                         // Insert also stops descending here (it will split this
                         // node). Do NOT push to `path`; the splice handles it.
-                        drop(child_tokens);
                         MatchStep::Stop
                     } else {
                         // Full match: match continues (if not frozen) and insert
                         // continues regardless.
                         drop(child_tokens);
+                        let mut tenant = None;
                         if !match_frozen {
-                            match child.get_any_tenant() {
+                            match child.touch_any_tenant(ts, track_lfu) {
                                 None => {
                                     // All-evicted: match stops, insert continues.
                                     match_frozen = true;
                                 }
                                 Some(t) => {
-                                    child.touch_tenant(&t, track_lfu);
                                     matched_tokens += match_len;
-                                    last_tenant = Some(t);
-                                    last_match_node = Some(Arc::clone(&child));
+                                    tenant = Some(t);
                                 }
                             }
                         }
                         MatchStep::Continue {
                             next: child,
                             advance: match_len,
+                            tenant,
                         }
                     }
                 }
@@ -1261,22 +1363,39 @@ impl TokenTree {
             match step {
                 MatchStep::Stop => break,
                 MatchStep::Retry => continue,
-                MatchStep::Continue { next, advance } => {
-                    path.push(Arc::clone(&next));
+                MatchStep::Continue {
+                    next,
+                    advance,
+                    tenant,
+                } => {
+                    if tenant.is_some() {
+                        last_full = Some(path.len());
+                    }
+                    path.push(next);
+                    stamped.push(tenant);
+                    keys.push(page_key);
                     remaining = &remaining[advance..];
-                    current = next;
+                    current = Some(path.len() - 1);
                 }
             }
         }
 
         // ---- Decide the insert tenant from the match result ----
+        let (tenant, matched_tenants) = match (&partial, last_full) {
+            (Some((node, t)), _) => (Arc::clone(t), node.matched_tenants()),
+            (None, Some(i)) => (
+                stamped[i]
+                    .as_ref()
+                    .map_or_else(|| intern_tenant("empty"), Arc::clone),
+                path[i].matched_tenants(),
+            ),
+            (None, None) => (intern_tenant("empty"), Vec::new()),
+        };
         let result = PrefixMatchResult {
-            tenant: last_tenant.unwrap_or_else(|| intern_tenant("empty")),
+            tenant,
             matched_token_count: matched_tokens,
             input_token_count,
-            matched_tenants: last_match_node
-                .map(|node| node.matched_tenants())
-                .unwrap_or_default(),
+            matched_tenants,
         };
         let Some(tenant) = select(&result) else {
             // No insert (router selected no worker).
@@ -1287,21 +1406,72 @@ impl TokenTree {
         let tenant_id = intern_tenant(tenant);
 
         // ---- Phase 2: INSERT replay for `tenant_id` (no second walk) ----
-        // Mirrors insert_tokens' root bookkeeping.
-        self.root
+        // Mirrors insert_tokens' root bookkeeping: ensure-present, so read
+        // first and take the write-locked entry only when it is missing.
+        if !self
+            .root
             .tenant_last_access_time
-            .entry(Arc::clone(&tenant_id))
-            .or_insert(0);
-        self.tenant_token_count
-            .entry(Arc::clone(&tenant_id))
-            .or_insert(0);
+            .contains_key(tenant_id.as_ref())
+        {
+            self.root
+                .tenant_last_access_time
+                .entry(Arc::clone(&tenant_id))
+                .or_insert(0);
+        }
+        if !self.tenant_token_count.contains_key(tenant_id.as_ref()) {
+            self.tenant_token_count
+                .entry(Arc::clone(&tenant_id))
+                .or_insert(0);
+        }
 
         let mut tokens_added = 0usize;
 
         // Replay insert's per-node work on every edge the match descended:
         // `insert_tokens` touches the inserting tenant on each full-match node
         // and counts its tokens.
-        for node in &path {
+        //
+        // Nothing held the path while `select` ran. An eviction that emptied
+        // a path node meanwhile has detached it from its parent, and a tenant
+        // attached to a detached node is credited tokens no eviction can find
+        // again. So each attach below is made under the parent's child entry
+        // (its shard read guard), after confirming the entry still names the
+        // node: the detach takes the same shard's write lock and removes the
+        // node only while it is still empty (see
+        // `cleanup_empty_ancestors_with_parent`), so the two serialize. A
+        // detach that came first shows here as a lost edge; an attach that
+        // came first leaves a node the detach keeps.
+        let mut lost_edge = false;
+        for (i, (node, matched)) in path.iter().zip(&stamped).enumerate() {
+            // The match stamped this very tenant on this node a moment ago (the
+            // common hit: the request routes to the worker it matched). While
+            // it is still attached there is nothing to re-stamp or credit: the
+            // stamp already is this request's `ts` and `touch_any_tenant` did
+            // the `last_tenant` refresh, so only the LFU hit that the replay's
+            // `touch_tenant` would have counted is still owed. A read-locked
+            // lookup confirms the attachment; if an eviction took the tenant
+            // off this node in between, fall through so the replay re-attaches
+            // and credits it exactly as the two-pass version did. An eviction
+            // that lands after this check is indistinguishable from one that
+            // lands right after the request returns.
+            if matched.as_ref().is_some_and(|t| Arc::ptr_eq(t, &tenant_id))
+                && node
+                    .tenant_last_access_time
+                    .contains_key(tenant_id.as_ref())
+            {
+                if track_lfu {
+                    node.hit_count.fetch_add(1, Ordering::Relaxed);
+                }
+                continue;
+            }
+            let parent = if i == 0 { &self.root } else { &path[i - 1] };
+            let edge = parent.children.get(&keys[i]);
+            if !edge
+                .as_ref()
+                .is_some_and(|edge| Arc::ptr_eq(edge.value(), node))
+            {
+                lost_edge = true;
+                break;
+            }
             // Credit the live length under the `tokens` read guard: a
             // concurrent split truncates the node and clones its tenant map in
             // one `tokens` write section, so this ordering decides both what
@@ -1309,23 +1479,46 @@ impl TokenTree {
             // match-time length would over-credit a node truncated since.
             // Count only newly-attached edges (atomic via touch_tenant).
             let node_tokens = node.tokens.read();
-            if node.touch_tenant(&tenant_id, track_lfu) {
+            if node.touch_tenant(&tenant_id, ts, track_lfu) {
                 tokens_added += node_tokens.len();
             }
+            drop(node_tokens);
+            drop(edge);
         }
 
-        // Splice only the unmatched suffix at the fall-off node (`current`),
-        // reusing insert_tokens' exact descent loop. It re-probes `current`'s
-        // children for `remaining` (a single child-map op, not a re-walk of the
-        // matched prefix) and handles the vacant / split / — and, under a
-        // concurrent split race, full-match-continue — cases identically to a
-        // standalone `insert_tokens`. The matched prefix above `current` was
-        // already re-attached by the loop above and is never re-walked.
-        if remaining.len() >= page_size {
+        if lost_edge {
+            // A path node left the tree between the match and the replay. The
+            // nodes credited above are attached and live; descend again from
+            // the root for the whole aligned sequence. `insert_from` credits
+            // only the edges it newly attaches, so nothing is counted twice,
+            // and it splices the suffix under live nodes, so the prompt is
+            // cached. One extra descent, in the rare case.
             tokens_added += Self::insert_from(
-                current,
+                Arc::clone(&self.root),
+                tokens,
+                Arc::clone(&tenant_id),
+                ts,
+                track_lfu,
+                page_size,
+            );
+        } else if remaining.len() >= page_size {
+            // Splice only the unmatched suffix at the fall-off node
+            // (`current`), reusing insert_tokens' exact descent loop. It
+            // re-probes `current`'s children for `remaining` (a single
+            // child-map op, not a re-walk of the matched prefix) and handles
+            // the vacant / split / — and, under a concurrent split race,
+            // full-match-continue — cases identically to a standalone
+            // `insert_tokens`. The matched prefix above `current` was already
+            // re-attached by the loop above and is never re-walked.
+            let fall_off = match current {
+                Some(i) => Arc::clone(&path[i]),
+                None => Arc::clone(&self.root),
+            };
+            tokens_added += Self::insert_from(
+                fall_off,
                 remaining,
                 Arc::clone(&tenant_id),
+                ts,
                 track_lfu,
                 page_size,
             );
@@ -1565,7 +1758,20 @@ impl TokenTree {
             };
             drop(page_key_guard);
 
-            parent.children.remove(&page_key);
+            // Detach only if the parent still holds this exact node under the key,
+            // and only while the node is still empty. The children map is concurrent
+            // and this walk runs during eviction, so a store can install a different
+            // node under the same page key after the emptiness check above, and the
+            // fused walk's insert replay can attach a tenant to this very node under
+            // this entry's shard read guard (it confirms the edge first, see
+            // `match_and_insert_dyn`). Removing the key unconditionally would drop
+            // that live replacement, or a node whose tenant was just credited for
+            // it, with every descendant it owns: the index silently shrinks or the
+            // credit leaks. `remove_if` evaluates the predicate under the shard
+            // lock, so the checks and the removal cannot be split.
+            parent.children.remove_if(&page_key, |_, child| {
+                Arc::ptr_eq(child, &current) && child.is_empty()
+            });
 
             if parent_leaf_info.is_none() && self.is_tenant_leaf(&parent, tenant_id) {
                 if let Some(ts) = parent.tenant_last_access_time.get(tenant_id.as_ref()) {
@@ -1951,2092 +2157,4 @@ impl RadixTree for TokenTree {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::{sync::Arc, thread};
-
-    use super::*;
-
-    /// Helper to create a page-aligned token sequence starting from `base`.
-    /// Creates `pages` full pages of tokens.
-    fn make_tokens(base: u32, pages: usize) -> Vec<TokenId> {
-        (0..(pages * PAGE_SIZE)).map(|i| base + i as u32).collect()
-    }
-
-    #[test]
-    fn test_basic_insert_match() {
-        let tree = TokenTree::new();
-
-        // Insert 2 pages (32 tokens)
-        let tokens = make_tokens(1, 2);
-        tree.insert_tokens(&tokens, "tenant1");
-
-        // Exact match
-        let result = tree.match_prefix_with_counts(&tokens);
-        assert_eq!(result.matched_token_count, 32);
-        assert_eq!(result.tenant.as_ref(), "tenant1");
-
-        // Match first page only
-        let first_page = make_tokens(1, 1);
-        let result = tree.match_prefix_with_counts(&first_page);
-        assert_eq!(result.matched_token_count, PAGE_SIZE);
-        assert_eq!(result.tenant.as_ref(), "tenant1");
-
-        // Match with extra tokens (truncated to page boundary)
-        let mut extended = tokens.clone();
-        extended.extend([100, 101, 102, 103, 104]);
-        let result = tree.match_prefix_with_counts(&extended);
-        assert_eq!(result.matched_token_count, 32);
-    }
-
-    #[test]
-    fn test_short_sequences_skipped() {
-        let tree = TokenTree::new();
-
-        // Sequences shorter than PAGE_SIZE are skipped
-        tree.insert_tokens(&[1, 2, 3, 4, 5], "tenant1");
-
-        // Should have no entries (too short)
-        let counts = tree.get_tenant_token_counts();
-        assert!(counts.is_empty() || counts.get("tenant1").copied().unwrap_or(0) == 0);
-
-        // Lookup also returns 0 for short sequences
-        let result = tree.match_prefix_with_counts(&[1, 2, 3, 4, 5]);
-        assert_eq!(result.matched_token_count, 0);
-        assert_eq!(result.input_token_count, 5);
-    }
-
-    #[test]
-    fn test_multiple_tenants() {
-        let tree = TokenTree::new();
-
-        let tokens = make_tokens(1, 1);
-        tree.insert_tokens(&tokens, "tenant1");
-        tree.insert_tokens(&tokens, "tenant2");
-
-        let result = tree.match_prefix_with_counts(&tokens);
-        assert_eq!(result.matched_token_count, PAGE_SIZE);
-        // Either tenant is valid
-        assert!(result.tenant.as_ref() == "tenant1" || result.tenant.as_ref() == "tenant2");
-    }
-
-    #[test]
-    fn test_prefix_split() {
-        let tree = TokenTree::new();
-
-        // Insert 3 pages first
-        let long_tokens = make_tokens(1, 3);
-        tree.insert_tokens(&long_tokens, "tenant1");
-
-        // Insert 1 page (causes split)
-        let short_tokens = make_tokens(1, 1);
-        tree.insert_tokens(&short_tokens, "tenant2");
-
-        // Short match
-        let result = tree.match_prefix_with_counts(&short_tokens);
-        assert_eq!(result.matched_token_count, PAGE_SIZE);
-
-        // Long match
-        let result = tree.match_prefix_with_counts(&long_tokens);
-        assert_eq!(result.matched_token_count, 3 * PAGE_SIZE);
-        assert_eq!(result.tenant.as_ref(), "tenant1");
-    }
-
-    #[test]
-    fn test_empty_input() {
-        let tree = TokenTree::new();
-
-        let tokens = make_tokens(1, 1);
-        tree.insert_tokens(&tokens, "tenant1");
-
-        let result = tree.match_prefix_with_counts(&[]);
-        assert_eq!(result.matched_token_count, 0);
-        assert_eq!(result.input_token_count, 0);
-    }
-
-    #[test]
-    fn test_matched_tenants_all_holders_of_deepest_node() {
-        let tree = TokenTree::new();
-        let tokens = make_tokens(1, 2);
-        tree.insert_tokens(&tokens, "tenant1");
-        tree.insert_tokens(&tokens, "tenant2");
-        // tenant3 holds only the first page — not the deepest matched node.
-        tree.insert_tokens(&make_tokens(1, 1), "tenant3");
-
-        let result = tree.match_prefix_with_counts(&tokens);
-        assert_eq!(result.matched_token_count, 32);
-        let mut tenants: Vec<&str> = result.matched_tenants.iter().map(AsRef::as_ref).collect();
-        tenants.sort_unstable();
-        assert_eq!(tenants, ["tenant1", "tenant2"]);
-    }
-
-    #[test]
-    fn test_matched_tenants_empty_on_no_match() {
-        let tree = TokenTree::new();
-        tree.insert_tokens(&make_tokens(1, 1), "tenant1");
-
-        let result = tree.match_prefix_with_counts(&make_tokens(1000, 1));
-        assert_eq!(result.matched_token_count, 0);
-        assert!(result.matched_tenants.is_empty());
-    }
-
-    #[test]
-    fn test_matched_tenants_capped() {
-        let tree = TokenTree::new();
-        let tokens = make_tokens(1, 1);
-        for i in 0..(MATCHED_TENANTS_CAP + 4) {
-            tree.insert_tokens(&tokens, &format!("tenant{i}"));
-        }
-
-        let result = tree.match_prefix_with_counts(&tokens);
-        assert_eq!(result.matched_token_count, PAGE_SIZE);
-        assert_eq!(result.matched_tenants.len(), MATCHED_TENANTS_CAP);
-    }
-
-    #[test]
-    fn test_match_and_insert_with_populates_matched_tenants() {
-        let tree = TokenTree::new();
-        let tokens = make_tokens(1, 2);
-        tree.insert_tokens(&tokens, "tenant1");
-        tree.insert_tokens(&tokens, "tenant2");
-
-        let result = tree.match_and_insert_with(&tokens, |result| {
-            let mut tenants: Vec<&str> = result.matched_tenants.iter().map(AsRef::as_ref).collect();
-            tenants.sort_unstable();
-            assert_eq!(tenants, ["tenant1", "tenant2"]);
-            Some("tenant3")
-        });
-        assert_eq!(result.matched_token_count, 32);
-
-        // The insert made tenant3 a holder of the same path.
-        let result = tree.match_prefix_with_counts(&tokens);
-        assert!(result
-            .matched_tenants
-            .iter()
-            .any(|tenant| tenant.as_ref() == "tenant3"));
-    }
-
-    #[test]
-    fn test_no_match() {
-        let tree = TokenTree::new();
-
-        let tokens = make_tokens(1, 1);
-        tree.insert_tokens(&tokens, "tenant1");
-
-        // Different page key
-        let other = make_tokens(1000, 1);
-        let result = tree.match_prefix_with_counts(&other);
-        assert_eq!(result.matched_token_count, 0);
-    }
-
-    #[test]
-    fn test_eviction() {
-        let tree = TokenTree::new();
-
-        let tokens1 = make_tokens(1, 2);
-        let tokens2 = make_tokens(1, 3);
-        tree.insert_tokens(&tokens1, "tenant1");
-        tree.insert_tokens(&tokens2, "tenant1");
-
-        let counts = tree.get_tenant_token_counts();
-        assert!(counts.get("tenant1").unwrap() > &0);
-
-        tree.evict(&TenantId::from("tenant1"), 0);
-
-        // After eviction, counts should be reduced
-        let new_counts = tree.get_tenant_token_counts();
-        let new_count = new_counts.get("tenant1").copied().unwrap_or(0);
-        assert!(new_count < *counts.get("tenant1").unwrap());
-    }
-
-    #[test]
-    fn test_concurrent_insert_match() {
-        let tree = Arc::new(TokenTree::new());
-        let mut handles = vec![];
-
-        // Spawn inserters - use page-aligned sequences
-        for i in 0..4 {
-            let tree = Arc::clone(&tree);
-            handles.push(thread::spawn(move || {
-                for j in 0..100 {
-                    let base = (i * 1000000 + j * 1000) as u32;
-                    let tokens = make_tokens(base, 2);
-                    tree.insert_tokens(&tokens, &format!("tenant{i}"));
-                }
-            }));
-        }
-
-        // Spawn matchers
-        for i in 0..4 {
-            let tree = Arc::clone(&tree);
-            handles.push(thread::spawn(move || {
-                for j in 0..100 {
-                    let base = (i * 1000000 + j * 1000) as u32;
-                    let tokens = make_tokens(base, 2);
-                    let _ = tree.match_prefix_with_counts(&tokens);
-                }
-            }));
-        }
-
-        for handle in handles {
-            handle.join().unwrap();
-        }
-    }
-
-    #[test]
-    fn test_prefix_match_with_counts() {
-        let tree = TokenTree::new();
-
-        let tokens = make_tokens(1, 2);
-        tree.insert_tokens(&tokens, "tenant1");
-
-        // Exact match
-        let result = tree.match_prefix_with_counts(&tokens);
-        assert_eq!(result.matched_token_count, 2 * PAGE_SIZE);
-        assert_eq!(result.input_token_count, 2 * PAGE_SIZE);
-
-        // Match first page
-        let first_page = make_tokens(1, 1);
-        let result = tree.match_prefix_with_counts(&first_page);
-        assert_eq!(result.matched_token_count, PAGE_SIZE);
-        assert_eq!(result.input_token_count, PAGE_SIZE);
-
-        // Extended input (aligned)
-        let extended = make_tokens(1, 3);
-        let result = tree.match_prefix_with_counts(&extended);
-        assert_eq!(result.matched_token_count, 2 * PAGE_SIZE);
-        assert_eq!(result.input_token_count, 3 * PAGE_SIZE);
-    }
-
-    #[test]
-    fn test_disjoint_paths() {
-        let tree = TokenTree::new();
-
-        let tokens1 = make_tokens(1, 1);
-        let tokens2 = make_tokens(1000, 1);
-        let tokens3 = make_tokens(2000, 1);
-
-        tree.insert_tokens(&tokens1, "tenant1");
-        tree.insert_tokens(&tokens2, "tenant2");
-        tree.insert_tokens(&tokens3, "tenant3");
-
-        let result = tree.match_prefix_with_counts(&tokens1);
-        assert_eq!(result.matched_token_count, PAGE_SIZE);
-        assert_eq!(result.tenant.as_ref(), "tenant1");
-
-        let result = tree.match_prefix_with_counts(&tokens2);
-        assert_eq!(result.matched_token_count, PAGE_SIZE);
-        assert_eq!(result.tenant.as_ref(), "tenant2");
-
-        let result = tree.match_prefix_with_counts(&tokens3);
-        assert_eq!(result.matched_token_count, PAGE_SIZE);
-        assert_eq!(result.tenant.as_ref(), "tenant3");
-    }
-
-    #[test]
-    fn test_branching_paths() {
-        let tree = TokenTree::new();
-
-        // Common first page, different second page
-        let mut tokens1 = make_tokens(1, 1);
-        tokens1.extend(make_tokens(100, 1));
-
-        let mut tokens2 = make_tokens(1, 1);
-        tokens2.extend(make_tokens(200, 1));
-
-        let mut tokens3 = make_tokens(1, 1);
-        tokens3.extend(make_tokens(300, 1));
-
-        tree.insert_tokens(&tokens1, "tenant1");
-        tree.insert_tokens(&tokens2, "tenant2");
-        tree.insert_tokens(&tokens3, "tenant3");
-
-        let result = tree.match_prefix_with_counts(&tokens1);
-        assert_eq!(result.matched_token_count, 2 * PAGE_SIZE);
-        assert_eq!(result.tenant.as_ref(), "tenant1");
-
-        let result = tree.match_prefix_with_counts(&tokens2);
-        assert_eq!(result.matched_token_count, 2 * PAGE_SIZE);
-        assert_eq!(result.tenant.as_ref(), "tenant2");
-
-        // Partial match at branch point
-        let first_page = make_tokens(1, 1);
-        let result = tree.match_prefix_with_counts(&first_page);
-        assert_eq!(result.matched_token_count, PAGE_SIZE);
-    }
-
-    #[test]
-    fn test_radix_tree_trait() {
-        let tree = TokenTree::new();
-
-        let tokens = make_tokens(1, 2);
-        RadixTree::insert(&tree, &tokens, "tenant1");
-
-        let tenant = RadixTree::prefix_match(&tree, &tokens);
-        assert!(tenant.is_some());
-        assert_eq!(tenant.unwrap().as_ref(), "tenant1");
-
-        // Extended input - should match 2 pages (short sequences get 0)
-        let extended = make_tokens(1, 3);
-        let result = RadixTree::prefix_match_with_counts(&tree, &extended);
-        assert_eq!(result.matched_count(), 2 * PAGE_SIZE);
-        assert_eq!(result.input_count(), 3 * PAGE_SIZE);
-
-        assert!(RadixTree::tenant_size(&tree, &TenantId::from("tenant1")) > 0);
-    }
-
-    #[test]
-    fn test_clear() {
-        let tree = TokenTree::new();
-
-        let tokens1 = make_tokens(1, 1);
-        let tokens2 = make_tokens(1000, 1);
-        tree.insert_tokens(&tokens1, "tenant1");
-        tree.insert_tokens(&tokens2, "tenant2");
-
-        assert!(!tree.get_tenant_token_counts().is_empty());
-
-        tree.clear();
-
-        assert!(tree.get_tenant_token_counts().is_empty());
-        let result = tree.match_prefix_with_counts(&tokens1);
-        assert_eq!(result.matched_token_count, 0);
-    }
-
-    #[test]
-    fn test_tenant_token_count() {
-        let tree = TokenTree::new();
-
-        let tokens1 = make_tokens(1, 2);
-        let tokens2 = make_tokens(1, 3);
-        let tokens3 = make_tokens(1000, 1);
-        tree.insert_tokens(&tokens1, "tenant1");
-        tree.insert_tokens(&tokens2, "tenant1");
-        tree.insert_tokens(&tokens3, "tenant2");
-
-        let tenant1_id: TenantId = Arc::from("tenant1");
-        let tenant2_id: TenantId = Arc::from("tenant2");
-
-        assert!(tree.tenant_token_size(&tenant1_id) >= PAGE_SIZE);
-        assert!(tree.tenant_token_size(&tenant2_id) >= PAGE_SIZE);
-
-        let counts = tree.get_tenant_token_counts();
-        assert!(counts.contains_key("tenant1"));
-        assert!(counts.contains_key("tenant2"));
-    }
-
-    #[test]
-    fn test_cold_start() {
-        let tree = TokenTree::new();
-        // Short sequences return 0 (no cache benefit)
-        let result = tree.match_prefix_with_counts(&[1, 2, 3, 4, 5]);
-        assert_eq!(result.matched_token_count, 0);
-        assert_eq!(result.input_token_count, 5);
-
-        // Page-sized sequences also return 0 on empty tree
-        let tokens = make_tokens(1, 1);
-        let result = tree.match_prefix_with_counts(&tokens);
-        assert_eq!(result.matched_token_count, 0);
-        assert_eq!(result.input_token_count, PAGE_SIZE);
-    }
-
-    #[test]
-    fn test_exact_match_seq() {
-        let tree = TokenTree::new();
-
-        for i in 0..100 {
-            let base = (i * 1000) as u32;
-            let tokens = make_tokens(base, 2);
-            tree.insert_tokens(&tokens, &format!("tenant{i}"));
-        }
-
-        for i in 0..100 {
-            let base = (i * 1000) as u32;
-            let tokens = make_tokens(base, 2);
-            let result = tree.match_prefix_with_counts(&tokens);
-            assert_eq!(result.matched_token_count, 2 * PAGE_SIZE);
-            assert_eq!(result.tenant.as_ref(), &format!("tenant{i}"));
-        }
-    }
-
-    #[test]
-    fn test_exact_match_concurrent() {
-        let tree = Arc::new(TokenTree::new());
-        let num_threads = 8;
-        let entries_per_thread = 100;
-
-        // Insert phase
-        let mut handles = vec![];
-        for t in 0..num_threads {
-            let tree = Arc::clone(&tree);
-            handles.push(thread::spawn(move || {
-                for i in 0..entries_per_thread {
-                    let base = (t * 1000000 + i * 1000) as u32;
-                    let tokens = make_tokens(base, 2);
-                    tree.insert_tokens(&tokens, &format!("tenant{t}"));
-                }
-            }));
-        }
-        for handle in handles {
-            handle.join().unwrap();
-        }
-
-        // Match phase
-        let mut handles = vec![];
-        for t in 0..num_threads {
-            let tree = Arc::clone(&tree);
-            handles.push(thread::spawn(move || {
-                for i in 0..entries_per_thread {
-                    let base = (t * 1000000 + i * 1000) as u32;
-                    let tokens = make_tokens(base, 2);
-                    let result = tree.match_prefix_with_counts(&tokens);
-                    assert_eq!(result.matched_token_count, 2 * PAGE_SIZE);
-                    assert_eq!(result.tenant.as_ref(), &format!("tenant{t}"));
-                }
-            }));
-        }
-        for handle in handles {
-            handle.join().unwrap();
-        }
-    }
-
-    #[test]
-    fn test_partial_match_concurrent() {
-        let tree = Arc::new(TokenTree::new());
-        let num_threads = 8;
-        let entries_per_thread = 100;
-
-        // Insert full sequences (3 pages)
-        let mut handles = vec![];
-        for t in 0..num_threads {
-            let tree = Arc::clone(&tree);
-            handles.push(thread::spawn(move || {
-                for i in 0..entries_per_thread {
-                    let base = (t * 1000000 + i * 1000) as u32;
-                    let tokens = make_tokens(base, 3);
-                    tree.insert_tokens(&tokens, &format!("tenant{t}"));
-                }
-            }));
-        }
-        for handle in handles {
-            handle.join().unwrap();
-        }
-
-        // Match with partial (1 page)
-        let mut handles = vec![];
-        for t in 0..num_threads {
-            let tree = Arc::clone(&tree);
-            handles.push(thread::spawn(move || {
-                for i in 0..entries_per_thread {
-                    let base = (t * 1000000 + i * 1000) as u32;
-                    let partial = make_tokens(base, 1);
-                    let result = tree.match_prefix_with_counts(&partial);
-                    assert_eq!(result.matched_token_count, PAGE_SIZE);
-                }
-            }));
-        }
-        for handle in handles {
-            handle.join().unwrap();
-        }
-    }
-
-    #[test]
-    fn test_group_prefix_insert_match_concurrent() {
-        let tree = Arc::new(TokenTree::new());
-        let num_threads = 8;
-
-        // All threads share the same prefix (1 page)
-        let common_prefix = make_tokens(100, 1);
-
-        let mut handles = vec![];
-        for t in 0..num_threads {
-            let tree = Arc::clone(&tree);
-            let prefix = common_prefix.clone();
-            handles.push(thread::spawn(move || {
-                for i in 0..50 {
-                    let mut tokens = prefix.clone();
-                    let suffix = make_tokens((t * 10000 + i * 100) as u32, 1);
-                    tokens.extend(suffix);
-                    tree.insert_tokens(&tokens, &format!("tenant{t}"));
-                }
-            }));
-        }
-        for handle in handles {
-            handle.join().unwrap();
-        }
-
-        // Verify prefix matching works
-        let result = tree.match_prefix_with_counts(&common_prefix);
-        assert_eq!(result.matched_token_count, PAGE_SIZE);
-    }
-
-    #[test]
-    fn test_mixed_concurrent_insert_match() {
-        let tree = Arc::new(TokenTree::new());
-        let num_threads = 4;
-
-        // Pre-populate some data
-        for i in 0..100 {
-            let base = (i * 1000) as u32;
-            let tokens = make_tokens(base, 2);
-            tree.insert_tokens(&tokens, &format!("initial{i}"));
-        }
-
-        let mut handles = vec![];
-
-        // Concurrent inserters
-        for t in 0..num_threads {
-            let tree = Arc::clone(&tree);
-            handles.push(thread::spawn(move || {
-                for i in 0..100 {
-                    let base = (10000000 + t * 100000 + i * 1000) as u32;
-                    let tokens = make_tokens(base, 2);
-                    tree.insert_tokens(&tokens, &format!("new_tenant{t}"));
-                }
-            }));
-        }
-
-        // Concurrent matchers (matching existing data)
-        for t in 0..num_threads {
-            let tree = Arc::clone(&tree);
-            handles.push(thread::spawn(move || {
-                for _ in 0..100 {
-                    let base = ((t * 10) * 1000) as u32;
-                    let tokens = make_tokens(base, 2);
-                    let result = tree.match_prefix_with_counts(&tokens);
-                    assert!(result.matched_token_count > 0);
-                }
-            }));
-        }
-
-        for handle in handles {
-            handle.join().unwrap();
-        }
-    }
-
-    #[test]
-    fn test_simple_eviction() {
-        let tree = TokenTree::new();
-
-        let tokens1 = make_tokens(1, 2);
-        let tokens2 = make_tokens(1000, 2);
-        tree.insert_tokens(&tokens1, "tenant1");
-        tree.insert_tokens(&tokens2, "tenant2");
-
-        let tenant1_id: TenantId = Arc::from("tenant1");
-        tree.evict_tenant(&tenant1_id, 0);
-
-        // tenant2 should still work
-        let result = tree.match_prefix_with_counts(&tokens2);
-        assert_eq!(result.matched_token_count, 2 * PAGE_SIZE);
-        assert_eq!(result.tenant.as_ref(), "tenant2");
-    }
-
-    #[test]
-    fn test_advanced_eviction() {
-        let tree = TokenTree::new();
-
-        // Insert multiple paths for tenant1
-        let mut tokens1 = make_tokens(1, 1);
-        tokens1.extend(make_tokens(100, 1));
-        let mut tokens2 = make_tokens(1, 1);
-        tokens2.extend(make_tokens(200, 1));
-        let mut tokens3 = make_tokens(1, 1);
-        tokens3.extend(make_tokens(300, 1));
-
-        tree.insert_tokens(&tokens1, "tenant1");
-        tree.insert_tokens(&tokens2, "tenant1");
-        tree.insert_tokens(&tokens3, "tenant1");
-
-        let tenant1_id: TenantId = Arc::from("tenant1");
-
-        // Partial eviction
-        let initial_size = tree.tenant_token_size(&tenant1_id);
-        tree.evict_tenant(&tenant1_id, initial_size / 2);
-        let after_size = tree.tenant_token_size(&tenant1_id);
-
-        assert!(after_size <= initial_size);
-    }
-
-    #[test]
-    fn test_concurrent_operations_with_eviction() {
-        let tree = Arc::new(TokenTree::new());
-        let num_threads = 4;
-
-        // Pre-populate
-        for i in 0..100 {
-            let base = (i * 1000) as u32;
-            let tokens = make_tokens(base, 2);
-            tree.insert_tokens(&tokens, &format!("tenant{}", i % 4));
-        }
-
-        let mut handles = vec![];
-
-        // Inserters
-        for t in 0..num_threads {
-            let tree = Arc::clone(&tree);
-            handles.push(thread::spawn(move || {
-                for i in 0..50 {
-                    let base = (10000000 + t * 100000 + i * 1000) as u32;
-                    let tokens = make_tokens(base, 2);
-                    tree.insert_tokens(&tokens, &format!("tenant{t}"));
-                }
-            }));
-        }
-
-        // Evictors
-        for t in 0..num_threads {
-            let tree = Arc::clone(&tree);
-            handles.push(thread::spawn(move || {
-                let tenant_id: TenantId = Arc::from(format!("tenant{t}"));
-                for _ in 0..10 {
-                    tree.evict_tenant(&tenant_id, 50);
-                    thread::sleep(std::time::Duration::from_millis(1));
-                }
-            }));
-        }
-
-        // Matchers
-        for _ in 0..num_threads {
-            let tree = Arc::clone(&tree);
-            handles.push(thread::spawn(move || {
-                for i in 0..50 {
-                    let base = (i * 1000) as u32;
-                    let tokens = make_tokens(base, 1);
-                    let _ = tree.match_prefix_with_counts(&tokens);
-                }
-            }));
-        }
-
-        for handle in handles {
-            handle.join().unwrap();
-        }
-
-        // Tree-wide total stays in sync with per-tenant counts.
-        let sum: usize = tree.get_tenant_token_counts().values().sum();
-        assert_eq!(tree.total_token_size(), sum);
-    }
-
-    #[test]
-    fn test_get_used_size_per_tenant() {
-        let tree = TokenTree::new();
-
-        let tokens1 = make_tokens(1, 2);
-        let tokens2 = make_tokens(1, 3);
-        let tokens3 = make_tokens(1000, 1);
-        tree.insert_tokens(&tokens1, "tenant1");
-        tree.insert_tokens(&tokens2, "tenant1");
-        tree.insert_tokens(&tokens3, "tenant2");
-
-        let counts = tree.get_tenant_token_counts();
-
-        // tokens2 shares tokens1's full 2-page prefix: tenant1 owns exactly
-        // 3 pages, not 2 + 3.
-        assert_eq!(*counts.get("tenant1").unwrap(), 3 * PAGE_SIZE);
-        assert_eq!(*counts.get("tenant2").unwrap(), PAGE_SIZE);
-    }
-
-    #[test]
-    fn repeat_insert_does_not_inflate_tenant_count() {
-        let tree = TokenTree::new();
-        let tokens = make_tokens(1, 3);
-
-        tree.insert_tokens(&tokens, "tenant1");
-        tree.insert_tokens(&tokens, "tenant1");
-        tree.insert_tokens(&tokens, "tenant1");
-
-        let counts = tree.get_tenant_token_counts();
-        assert_eq!(*counts.get("tenant1").unwrap(), 3 * PAGE_SIZE);
-    }
-
-    #[test]
-    fn match_and_insert_with_repeat_keeps_count_stable() {
-        let tree = TokenTree::new();
-        let tokens = make_tokens(1, 3);
-
-        for _ in 0..3 {
-            tree.match_and_insert_with(&tokens, |_| Some("tenant1"));
-        }
-
-        let counts = tree.get_tenant_token_counts();
-        assert_eq!(*counts.get("tenant1").unwrap(), 3 * PAGE_SIZE);
-    }
-
-    #[test]
-    fn match_and_insert_repeat_keeps_count_stable() {
-        let tree = TokenTree::new();
-        let tokens = make_tokens(1, 3);
-
-        tree.match_and_insert(&tokens, "tenant1");
-        tree.match_and_insert(&tokens, "tenant1");
-        tree.match_and_insert(&tokens, "tenant1");
-
-        let counts = tree.get_tenant_token_counts();
-        assert_eq!(*counts.get("tenant1").unwrap(), 3 * PAGE_SIZE);
-    }
-
-    #[test]
-    fn test_prefix_match_tenant() {
-        let tree = TokenTree::new();
-
-        let tokens = make_tokens(1, 2);
-        tree.insert_tokens(&tokens, "tenant1");
-        tree.insert_tokens(&tokens, "tenant2");
-
-        // Both tenants should have access time updated
-        let result = tree.match_prefix_with_counts(&tokens);
-        assert_eq!(result.matched_token_count, 2 * PAGE_SIZE);
-        // tenant should be either tenant1 or tenant2 (last_tenant cache)
-        assert!(result.tenant.as_ref() == "tenant1" || result.tenant.as_ref() == "tenant2");
-    }
-
-    #[test]
-    fn test_simple_tenant_eviction() {
-        let tree = TokenTree::new();
-
-        let tokens1 = make_tokens(1, 2);
-        let tokens2 = make_tokens(1000, 2);
-        tree.insert_tokens(&tokens1, "tenant1");
-        tree.insert_tokens(&tokens2, "tenant2");
-
-        let tenant1_id: TenantId = Arc::from("tenant1");
-        tree.evict_tenant(&tenant1_id, 0);
-
-        // tenant2 should be unaffected
-        let result = tree.match_prefix_with_counts(&tokens2);
-        assert_eq!(result.matched_token_count, 2 * PAGE_SIZE);
-        assert_eq!(result.tenant.as_ref(), "tenant2");
-    }
-
-    #[test]
-    fn test_complex_tenant_eviction() {
-        let tree = TokenTree::new();
-
-        // Create overlapping paths (common first page, different second pages)
-        let mut tokens1 = make_tokens(1, 1);
-        tokens1.extend(make_tokens(100, 1));
-        let mut tokens2 = make_tokens(1, 1);
-        tokens2.extend(make_tokens(200, 1));
-        let mut tokens3 = make_tokens(1, 1);
-        tokens3.extend(make_tokens(300, 1));
-
-        tree.insert_tokens(&tokens1, "tenant1");
-        tree.insert_tokens(&tokens2, "tenant2");
-        tree.insert_tokens(&tokens3, "tenant1");
-
-        let tenant1_id: TenantId = Arc::from("tenant1");
-        tree.evict_tenant(&tenant1_id, 0);
-
-        // tenant2's path should still work
-        let result = tree.match_prefix_with_counts(&tokens2);
-        assert_eq!(result.matched_token_count, 2 * PAGE_SIZE);
-        assert_eq!(result.tenant.as_ref(), "tenant2");
-    }
-
-    #[test]
-    fn test_empty_node_cleanup_after_eviction() {
-        // Test that empty nodes are removed from the tree after tenant eviction
-        // This prevents memory bloat from orphaned nodes
-        let tree = TokenTree::new();
-
-        // Insert a path only owned by tenant1
-        let tokens1 = make_tokens(500, 2); // Unique path
-        tree.insert_tokens(&tokens1, "tenant1");
-
-        // Verify tree has children before eviction
-        assert!(
-            !tree.root.children.is_empty(),
-            "Tree should have children after insert"
-        );
-
-        // Evict tenant1 completely
-        let tenant1_id: TenantId = Arc::from("tenant1");
-        tree.evict_tenant(&tenant1_id, 0);
-
-        // Verify empty nodes were cleaned up
-        assert!(
-            tree.root.children.is_empty(),
-            "Empty nodes should be removed after tenant eviction"
-        );
-
-        // Verify tenant count is zero
-        assert_eq!(tree.tenant_token_size(&tenant1_id), 0);
-    }
-
-    #[test]
-    fn test_partial_cleanup_shared_nodes() {
-        // Test that shared nodes are NOT cleaned up when still owned by other tenants
-        let tree = TokenTree::new();
-
-        // Both tenants share the same path
-        let tokens = make_tokens(100, 2);
-        tree.insert_tokens(&tokens, "tenant1");
-        tree.insert_tokens(&tokens, "tenant2");
-
-        // Evict tenant1
-        let tenant1_id: TenantId = Arc::from("tenant1");
-        tree.evict_tenant(&tenant1_id, 0);
-
-        // Tree should still have children (owned by tenant2)
-        assert!(
-            !tree.root.children.is_empty(),
-            "Shared nodes should NOT be removed when other tenants exist"
-        );
-
-        // tenant2 should still work
-        let result = tree.match_prefix_with_counts(&tokens);
-        assert_eq!(result.matched_token_count, 2 * PAGE_SIZE);
-        assert_eq!(result.tenant.as_ref(), "tenant2");
-    }
-
-    #[test]
-    fn test_leaf_first_eviction() {
-        // Test that eviction follows leaf-first LRU like SGLang's radix cache
-        //
-        // Tree structure for tenant1:
-        //   root -> [A: page1] -> [B: page2] -> [C: page3]
-        //
-        // When we evict, C (leaf) should be evicted first, then B, then A.
-        // This ensures shared prefixes (like system prompts near root) survive longer.
-
-        let tree = TokenTree::new();
-
-        // Insert a 3-page path: A -> B -> C
-        let path_abc = make_tokens(1, 3); // 3 pages
-        tree.insert_tokens(&path_abc, "tenant1");
-
-        // Also insert just the first page (shared prefix)
-        let path_a = make_tokens(1, 1); // 1 page
-        tree.insert_tokens(&path_a, "tenant1");
-
-        // Initial count should be 3 pages (A, B, C share with the single A)
-        let initial_count = tree.tenant_token_size(&Arc::from("tenant1"));
-        assert_eq!(initial_count, 3 * PAGE_SIZE);
-
-        // Evict to keep only 2 pages - should evict C (the leaf)
-        let tenant1_id: TenantId = Arc::from("tenant1");
-        tree.evict_tenant(&tenant1_id, 2 * PAGE_SIZE);
-
-        // After evicting C, we should still match A and B
-        let result = tree.match_prefix_with_counts(&path_abc);
-        // Should match 2 pages (A and B), not 3
-        assert!(
-            result.matched_token_count <= 2 * PAGE_SIZE,
-            "Expected at most 2 pages matched after evicting leaf, got {}",
-            result.matched_token_count / PAGE_SIZE
-        );
-
-        // The prefix path should still work
-        let result = tree.match_prefix_with_counts(&path_a);
-        assert_eq!(
-            result.matched_token_count, PAGE_SIZE,
-            "Shared prefix A should still be cached"
-        );
-
-        // Evict more - should evict B (now the new leaf)
-        tree.evict_tenant(&tenant1_id, PAGE_SIZE);
-
-        // Now only A should remain
-        let result = tree.match_prefix_with_counts(&path_abc);
-        assert!(
-            result.matched_token_count <= PAGE_SIZE,
-            "Expected at most 1 page matched after evicting B"
-        );
-
-        // A should still work
-        let result = tree.match_prefix_with_counts(&path_a);
-        assert_eq!(
-            result.matched_token_count, PAGE_SIZE,
-            "Root prefix A should survive longest"
-        );
-    }
-
-    #[test]
-    fn test_single_page_operations() {
-        let tree = TokenTree::new();
-
-        // Single page operations
-        let tokens1 = make_tokens(1, 1);
-        let tokens2 = make_tokens(1000, 1);
-        let tokens3 = make_tokens(2000, 1);
-
-        tree.insert_tokens(&tokens1, "tenant1");
-        tree.insert_tokens(&tokens2, "tenant2");
-        tree.insert_tokens(&tokens3, "tenant3");
-
-        let result = tree.match_prefix_with_counts(&tokens1);
-        assert_eq!(result.matched_token_count, PAGE_SIZE);
-        assert_eq!(result.tenant.as_ref(), "tenant1");
-
-        let result = tree.match_prefix_with_counts(&tokens2);
-        assert_eq!(result.matched_token_count, PAGE_SIZE);
-        assert_eq!(result.tenant.as_ref(), "tenant2");
-
-        let result = tree.match_prefix_with_counts(&tokens3);
-        assert_eq!(result.matched_token_count, PAGE_SIZE);
-        assert_eq!(result.tenant.as_ref(), "tenant3");
-    }
-
-    #[test]
-    fn test_prefix_is_subset_of_existing() {
-        let tree = TokenTree::new();
-
-        // Insert longer sequence first (3 pages)
-        let long_tokens = make_tokens(1, 3);
-        tree.insert_tokens(&long_tokens, "tenant1");
-
-        // Insert prefix (1 page)
-        let short_tokens = make_tokens(1, 1);
-        tree.insert_tokens(&short_tokens, "tenant2");
-
-        // Short match
-        let result = tree.match_prefix_with_counts(&short_tokens);
-        assert_eq!(result.matched_token_count, PAGE_SIZE);
-
-        // Long match
-        let result = tree.match_prefix_with_counts(&long_tokens);
-        assert_eq!(result.matched_token_count, 3 * PAGE_SIZE);
-        assert_eq!(result.tenant.as_ref(), "tenant1");
-    }
-
-    #[test]
-    fn test_existing_is_prefix_of_new() {
-        let tree = TokenTree::new();
-
-        // Insert shorter first (1 page)
-        let short_tokens = make_tokens(1, 1);
-        tree.insert_tokens(&short_tokens, "tenant1");
-
-        // Insert longer (3 pages)
-        let long_tokens = make_tokens(1, 3);
-        tree.insert_tokens(&long_tokens, "tenant2");
-
-        // Short match
-        let result = tree.match_prefix_with_counts(&short_tokens);
-        assert_eq!(result.matched_token_count, PAGE_SIZE);
-
-        // Long match
-        let result = tree.match_prefix_with_counts(&long_tokens);
-        assert_eq!(result.matched_token_count, 3 * PAGE_SIZE);
-        assert_eq!(result.tenant.as_ref(), "tenant2");
-    }
-
-    #[test]
-    fn test_prefix_match_with_counts_accuracy() {
-        let tree = TokenTree::new();
-
-        // Insert 4 pages
-        let tokens = make_tokens(1, 4);
-        tree.insert_tokens(&tokens, "tenant1");
-
-        // Exact match
-        let result = tree.match_prefix_with_counts(&tokens);
-        assert_eq!(result.matched_token_count, 4 * PAGE_SIZE);
-        assert_eq!(result.input_token_count, 4 * PAGE_SIZE);
-
-        // Partial match (2 pages)
-        let partial = make_tokens(1, 2);
-        let result = tree.match_prefix_with_counts(&partial);
-        assert_eq!(result.matched_token_count, 2 * PAGE_SIZE);
-        assert_eq!(result.input_token_count, 2 * PAGE_SIZE);
-
-        // Extended match (input longer than inserted)
-        let extended = make_tokens(1, 6);
-        let result = tree.match_prefix_with_counts(&extended);
-        assert_eq!(result.matched_token_count, 4 * PAGE_SIZE);
-        assert_eq!(result.input_token_count, 6 * PAGE_SIZE);
-    }
-
-    #[test]
-    fn test_split_at_page_boundary() {
-        let tree = TokenTree::new();
-
-        // Insert 3 pages
-        let long_tokens = make_tokens(1, 3);
-        tree.insert_tokens(&long_tokens, "tenant1");
-
-        // Insert 1 page (causes split at page boundary)
-        let short_tokens = make_tokens(1, 1);
-        tree.insert_tokens(&short_tokens, "tenant2");
-
-        // 1 page match
-        let result = tree.match_prefix_with_counts(&short_tokens);
-        assert_eq!(result.matched_token_count, PAGE_SIZE);
-
-        // 3 pages match
-        let result = tree.match_prefix_with_counts(&long_tokens);
-        assert_eq!(result.matched_token_count, 3 * PAGE_SIZE);
-        assert_eq!(result.tenant.as_ref(), "tenant1");
-    }
-
-    #[test]
-    fn test_multiple_splits_same_path() {
-        let tree = TokenTree::new();
-
-        // Insert 4 pages first
-        let tokens4 = make_tokens(1, 4);
-        tree.insert_tokens(&tokens4, "tenant1");
-
-        // Insert 3 pages
-        let tokens3 = make_tokens(1, 3);
-        tree.insert_tokens(&tokens3, "tenant2");
-
-        // Insert 2 pages
-        let tokens2 = make_tokens(1, 2);
-        tree.insert_tokens(&tokens2, "tenant3");
-
-        // Insert 1 page
-        let tokens1 = make_tokens(1, 1);
-        tree.insert_tokens(&tokens1, "tenant4");
-
-        // All should match correctly
-        let result = tree.match_prefix_with_counts(&tokens1);
-        assert_eq!(result.matched_token_count, PAGE_SIZE);
-
-        let result = tree.match_prefix_with_counts(&tokens2);
-        assert_eq!(result.matched_token_count, 2 * PAGE_SIZE);
-
-        let result = tree.match_prefix_with_counts(&tokens3);
-        assert_eq!(result.matched_token_count, 3 * PAGE_SIZE);
-
-        let result = tree.match_prefix_with_counts(&tokens4);
-        assert_eq!(result.matched_token_count, 4 * PAGE_SIZE);
-    }
-
-    #[test]
-    fn test_high_contention_same_prefix() {
-        let tree = Arc::new(TokenTree::new());
-        let prefix = make_tokens(100, 1);
-        let num_threads = 16;
-
-        let mut handles = vec![];
-        for t in 0..num_threads {
-            let tree = Arc::clone(&tree);
-            let p = prefix.clone();
-            handles.push(thread::spawn(move || {
-                for i in 0..100 {
-                    let mut tokens = p.clone();
-                    let suffix = make_tokens((t * 10000 + i * 100) as u32, 1);
-                    tokens.extend(suffix);
-                    tree.insert_tokens(&tokens, &format!("tenant{t}"));
-                }
-            }));
-        }
-
-        for handle in handles {
-            handle.join().unwrap();
-        }
-
-        // Verify prefix matching
-        let result = tree.match_prefix_with_counts(&prefix);
-        assert_eq!(result.matched_token_count, PAGE_SIZE);
-    }
-
-    #[test]
-    fn test_rapid_insert_remove_cycles() {
-        let tree = Arc::new(TokenTree::new());
-        let num_threads = 4;
-
-        let mut handles = vec![];
-        for t in 0..num_threads {
-            let tree = Arc::clone(&tree);
-            handles.push(thread::spawn(move || {
-                let tenant_id: TenantId = Arc::from(format!("tenant{t}"));
-                for cycle in 0..10 {
-                    // Insert
-                    for i in 0..20 {
-                        let base = (t * 10000000 + cycle * 100000 + i * 1000) as u32;
-                        let tokens = make_tokens(base, 2);
-                        tree.insert_tokens(&tokens, &format!("tenant{t}"));
-                    }
-                    // Evict
-                    tree.evict_tenant(&tenant_id, 10);
-                }
-            }));
-        }
-
-        for handle in handles {
-            handle.join().unwrap();
-        }
-    }
-
-    #[test]
-    fn test_eviction_empty_tree() {
-        let tree = TokenTree::new();
-        let tenant_id: TenantId = Arc::from("nonexistent");
-
-        // Should not panic
-        tree.evict_tenant(&tenant_id, 0);
-        tree.evict_tenant(&tenant_id, 100);
-    }
-
-    #[test]
-    fn test_eviction_zero_max_size() {
-        let tree = TokenTree::new();
-
-        let tokens1 = make_tokens(1, 2);
-        let tokens2 = make_tokens(1000, 2);
-        tree.insert_tokens(&tokens1, "tenant1");
-        tree.insert_tokens(&tokens2, "tenant1");
-
-        let tenant_id: TenantId = Arc::from("tenant1");
-        tree.evict_tenant(&tenant_id, 0);
-
-        // Eviction with max_size=0 should remove entries
-        let size = tree.tenant_token_size(&tenant_id);
-        assert!(size < 4 * PAGE_SIZE);
-    }
-
-    #[test]
-    fn test_eviction_single_tenant_all_entries() {
-        let tree = TokenTree::new();
-
-        // Insert multiple entries for one tenant
-        for i in 0..10 {
-            let base = (i * 1000) as u32;
-            let tokens = make_tokens(base, 2);
-            tree.insert_tokens(&tokens, "tenant1");
-        }
-
-        let tenant_id: TenantId = Arc::from("tenant1");
-        let initial_size = tree.tenant_token_size(&tenant_id);
-        assert!(initial_size > 0);
-
-        tree.evict_tenant(&tenant_id, 0);
-
-        let final_size = tree.tenant_token_size(&tenant_id);
-        assert!(final_size < initial_size);
-    }
-
-    #[test]
-    fn test_last_tenant_cache_update() {
-        let tree = TokenTree::new();
-
-        let tokens = make_tokens(1, 1);
-        tree.insert_tokens(&tokens, "tenant1");
-        tree.insert_tokens(&tokens, "tenant2");
-
-        // First match
-        let result1 = tree.match_prefix_with_counts(&tokens);
-        let first_tenant = result1.tenant.clone();
-
-        // Match again - should get cached tenant
-        let result2 = tree.match_prefix_with_counts(&tokens);
-        assert_eq!(result2.tenant, first_tenant);
-    }
-
-    #[test]
-    fn test_stale_cache_after_tenant_removal() {
-        let tree = TokenTree::new();
-
-        let tokens = make_tokens(1, 2);
-        tree.insert_tokens(&tokens, "tenant1");
-        tree.insert_tokens(&tokens, "tenant2");
-
-        // Match to populate cache
-        let _ = tree.match_prefix_with_counts(&tokens);
-
-        // Evict one tenant
-        let tenant1_id: TenantId = Arc::from("tenant1");
-        tree.evict_tenant(&tenant1_id, 0);
-
-        // Match should still work (tenant2 or cache still valid)
-        let result = tree.match_prefix_with_counts(&tokens);
-        assert_eq!(result.matched_token_count, 2 * PAGE_SIZE);
-    }
-
-    #[test]
-    fn test_token_count_consistency_after_operations() {
-        let tree = TokenTree::new();
-
-        // Insert
-        let tokens1 = make_tokens(1, 3);
-        let tokens2 = make_tokens(1, 5);
-        tree.insert_tokens(&tokens1, "tenant1");
-        tree.insert_tokens(&tokens2, "tenant1");
-
-        let tenant1_id: TenantId = Arc::from("tenant1");
-        let count1 = tree.tenant_token_size(&tenant1_id);
-        assert!(count1 >= PAGE_SIZE);
-
-        // Partial eviction
-        tree.evict_tenant(&tenant1_id, count1 / 2);
-        let count2 = tree.tenant_token_size(&tenant1_id);
-        assert!(count2 <= count1);
-
-        // Insert more
-        let tokens3 = make_tokens(2000, 2);
-        tree.insert_tokens(&tokens3, "tenant1");
-        let count3 = tree.tenant_token_size(&tenant1_id);
-        assert!(count3 >= count2);
-    }
-
-    #[test]
-    fn test_tree_structure_integrity_after_stress() {
-        let tree = Arc::new(TokenTree::new());
-        let num_threads = 8;
-
-        let mut handles = vec![];
-
-        // Stress insert
-        for t in 0..num_threads {
-            let tree = Arc::clone(&tree);
-            handles.push(thread::spawn(move || {
-                for i in 0..200 {
-                    let base = (t * 10000000 + i * 1000) as u32;
-                    let tokens = make_tokens(base, 2);
-                    tree.insert_tokens(&tokens, &format!("tenant{t}"));
-                }
-            }));
-        }
-
-        for handle in handles {
-            handle.join().unwrap();
-        }
-
-        // Verify structure by matching
-        for t in 0..num_threads {
-            for i in 0..10 {
-                let base = (t * 10000000 + i * 1000) as u32;
-                let tokens = make_tokens(base, 2);
-                let result = tree.match_prefix_with_counts(&tokens);
-                assert_eq!(result.matched_token_count, 2 * PAGE_SIZE);
-            }
-        }
-    }
-
-    #[test]
-    fn test_very_long_sequences() {
-        let tree = TokenTree::new();
-
-        // Insert a very long sequence (64 pages = 1024 tokens)
-        let long_seq = make_tokens(1, 64);
-        tree.insert_tokens(&long_seq, "tenant1");
-
-        // Match the full sequence
-        let result = tree.match_prefix_with_counts(&long_seq);
-        assert_eq!(result.matched_token_count, 64 * PAGE_SIZE);
-        assert_eq!(result.tenant.as_ref(), "tenant1");
-
-        // Match a prefix (32 pages)
-        let prefix = make_tokens(1, 32);
-        let result = tree.match_prefix_with_counts(&prefix);
-        assert_eq!(result.matched_token_count, 32 * PAGE_SIZE);
-    }
-
-    #[test]
-    fn test_many_tenants_same_path() {
-        let tree = TokenTree::new();
-
-        let tokens = make_tokens(1, 2);
-
-        for i in 0..100 {
-            tree.insert_tokens(&tokens, &format!("tenant{i}"));
-        }
-
-        let result = tree.match_prefix_with_counts(&tokens);
-        assert_eq!(result.matched_token_count, 2 * PAGE_SIZE);
-
-        // Some tenants should have registered
-        let counts = tree.get_tenant_token_counts();
-        assert!(!counts.is_empty()); // At least some tenants tracked
-    }
-
-    #[test]
-    fn test_token_id_edge_values() {
-        let tree = TokenTree::new();
-
-        // Test with edge case token IDs in page-aligned sequences
-        // Create page starting with 0
-        let mut zeros_page: Vec<TokenId> = (0..PAGE_SIZE as u32).collect();
-        zeros_page[0] = 0;
-        tree.insert_tokens(&zeros_page, "tenant1");
-
-        // Create page starting with u32::MAX
-        let mut max_page: Vec<TokenId> = (0..PAGE_SIZE as u32).collect();
-        max_page[0] = u32::MAX;
-        tree.insert_tokens(&max_page, "tenant2");
-
-        // Create page with mixed edge values
-        let mut mixed_page: Vec<TokenId> = (0..PAGE_SIZE as u32).collect();
-        mixed_page[0] = 0;
-        mixed_page[1] = u32::MAX;
-        tree.insert_tokens(&mixed_page, "tenant3");
-
-        let (matched, tenant) = tree.prefix_match_legacy(&zeros_page);
-        assert_eq!(matched.len(), PAGE_SIZE);
-        assert!(tenant == "tenant1" || tenant == "tenant3");
-
-        let (matched, tenant) = tree.prefix_match_legacy(&max_page);
-        assert_eq!(matched.len(), PAGE_SIZE);
-        assert_eq!(tenant, "tenant2");
-    }
-
-    #[test]
-    fn test_hit_ratio_calculation() {
-        use crate::MatchResult;
-
-        let tree = TokenTree::new();
-        let one_page = make_tokens(1, 1); // 1 page = PAGE_SIZE tokens
-        tree.insert_tokens(&one_page, "tenant1");
-
-        // 100% hit ratio - query exactly the inserted sequence
-        let result = tree.match_prefix_with_counts(&one_page);
-        assert!((result.hit_ratio() - 1.0).abs() < 0.001);
-
-        // 50% hit ratio - query 2 pages, only 1 page cached
-        let two_pages = make_tokens(1, 2);
-        let result = tree.match_prefix_with_counts(&two_pages);
-        assert!((result.hit_ratio() - 0.5).abs() < 0.001);
-
-        // 0% hit ratio - query non-existent tokens (but page-aligned)
-        let no_match = make_tokens(1000, 1);
-        let result = tree.match_prefix_with_counts(&no_match);
-        assert_eq!(result.hit_ratio(), 0.0);
-    }
-
-    #[test]
-    fn test_reset_via_trait() {
-        use crate::RadixTree;
-
-        let tree = TokenTree::new();
-        tree.insert_tokens(&make_tokens(1, 1), "tenant1");
-        tree.insert_tokens(&make_tokens(100, 1), "tenant2");
-
-        assert!(!tree.get_tenant_token_counts().is_empty());
-
-        RadixTree::reset(&tree);
-
-        assert!(tree.get_tenant_token_counts().is_empty());
-    }
-
-    #[test]
-    fn test_eviction_policy_lru() {
-        // LRU: Evict oldest by last access time
-        let tree = TokenTree::with_policy(EvictionPolicy::Lru);
-
-        // Insert 3 paths, access them in order (oldest first)
-        let tokens1 = make_tokens(1, 1);
-        let tokens2 = make_tokens(100, 1);
-        let tokens3 = make_tokens(200, 1);
-
-        tree.insert_tokens(&tokens1, "tenant1"); // Oldest
-        tree.insert_tokens(&tokens2, "tenant1");
-        tree.insert_tokens(&tokens3, "tenant1"); // Newest
-
-        // Access tokens2 to make it newer
-        let _ = tree.match_prefix_with_counts(&tokens2);
-
-        // Evict 1 page - should evict tokens1 (oldest by last_access_time)
-        tree.evict_tenant(&Arc::from("tenant1"), 2 * PAGE_SIZE);
-
-        // tokens1 should be evicted, tokens2 and tokens3 should remain
-        let result = tree.match_prefix_with_counts(&tokens1);
-        assert_eq!(
-            result.matched_token_count, 0,
-            "tokens1 should be evicted (oldest)"
-        );
-
-        let result = tree.match_prefix_with_counts(&tokens2);
-        assert_eq!(
-            result.matched_token_count, PAGE_SIZE,
-            "tokens2 should remain"
-        );
-
-        let result = tree.match_prefix_with_counts(&tokens3);
-        assert_eq!(
-            result.matched_token_count, PAGE_SIZE,
-            "tokens3 should remain"
-        );
-    }
-
-    #[test]
-    fn test_eviction_policy_mru() {
-        // MRU: Evict newest by last access time (opposite of LRU)
-        let tree = TokenTree::with_policy(EvictionPolicy::Mru);
-
-        let tokens1 = make_tokens(1, 1);
-        let tokens2 = make_tokens(100, 1);
-        let tokens3 = make_tokens(200, 1);
-
-        tree.insert_tokens(&tokens1, "tenant1"); // Oldest
-        tree.insert_tokens(&tokens2, "tenant1");
-        tree.insert_tokens(&tokens3, "tenant1"); // Newest
-
-        // Evict 1 page - should evict tokens3 (newest by last_access_time)
-        tree.evict_tenant(&Arc::from("tenant1"), 2 * PAGE_SIZE);
-
-        // tokens3 should be evicted (newest), tokens1 and tokens2 should remain
-        let result = tree.match_prefix_with_counts(&tokens3);
-        assert_eq!(
-            result.matched_token_count, 0,
-            "tokens3 should be evicted (newest)"
-        );
-
-        let result = tree.match_prefix_with_counts(&tokens1);
-        assert_eq!(
-            result.matched_token_count, PAGE_SIZE,
-            "tokens1 should remain"
-        );
-    }
-
-    #[test]
-    fn test_eviction_policy_fifo() {
-        // FIFO: Evict oldest by creation time (not affected by access)
-        let tree = TokenTree::with_policy(EvictionPolicy::Fifo);
-
-        let tokens1 = make_tokens(1, 1);
-        let tokens2 = make_tokens(100, 1);
-        let tokens3 = make_tokens(200, 1);
-
-        tree.insert_tokens(&tokens1, "tenant1"); // First created
-        tree.insert_tokens(&tokens2, "tenant1");
-        tree.insert_tokens(&tokens3, "tenant1"); // Last created
-
-        // Access tokens1 multiple times (shouldn't affect FIFO)
-        for _ in 0..10 {
-            let _ = tree.match_prefix_with_counts(&tokens1);
-        }
-
-        // Evict 1 page - should evict tokens1 (oldest by creation_time)
-        tree.evict_tenant(&Arc::from("tenant1"), 2 * PAGE_SIZE);
-
-        // tokens1 should be evicted despite being accessed most recently
-        let result = tree.match_prefix_with_counts(&tokens1);
-        assert_eq!(
-            result.matched_token_count, 0,
-            "tokens1 should be evicted (oldest creation)"
-        );
-    }
-
-    #[test]
-    fn test_eviction_policy_filo() {
-        // FILO: Evict newest by creation time (stack-like)
-        let tree = TokenTree::with_policy(EvictionPolicy::Filo);
-
-        let tokens1 = make_tokens(1, 1);
-        let tokens2 = make_tokens(100, 1);
-        let tokens3 = make_tokens(200, 1);
-
-        tree.insert_tokens(&tokens1, "tenant1"); // First created
-        tree.insert_tokens(&tokens2, "tenant1");
-        tree.insert_tokens(&tokens3, "tenant1"); // Last created
-
-        // Evict 1 page - should evict tokens3 (newest by creation_time)
-        tree.evict_tenant(&Arc::from("tenant1"), 2 * PAGE_SIZE);
-
-        // tokens3 should be evicted (newest creation)
-        let result = tree.match_prefix_with_counts(&tokens3);
-        assert_eq!(
-            result.matched_token_count, 0,
-            "tokens3 should be evicted (newest creation)"
-        );
-
-        let result = tree.match_prefix_with_counts(&tokens1);
-        assert_eq!(
-            result.matched_token_count, PAGE_SIZE,
-            "tokens1 should remain"
-        );
-    }
-
-    #[test]
-    fn test_eviction_policy_lfu() {
-        // LFU: Evict least frequently used (by hit_count)
-        let tree = TokenTree::with_policy(EvictionPolicy::Lfu);
-
-        let tokens1 = make_tokens(1, 1);
-        let tokens2 = make_tokens(100, 1);
-        let tokens3 = make_tokens(200, 1);
-
-        tree.insert_tokens(&tokens1, "tenant1");
-        tree.insert_tokens(&tokens2, "tenant1");
-        tree.insert_tokens(&tokens3, "tenant1");
-
-        // Access tokens1 many times to increase its hit_count
-        for _ in 0..20 {
-            let _ = tree.match_prefix_with_counts(&tokens1);
-        }
-
-        // Access tokens3 a few times
-        for _ in 0..5 {
-            let _ = tree.match_prefix_with_counts(&tokens3);
-        }
-
-        // tokens2 has the lowest hit_count (only 1 from insert)
-
-        // Evict 1 page - should evict tokens2 (lowest hit_count)
-        tree.evict_tenant(&Arc::from("tenant1"), 2 * PAGE_SIZE);
-
-        // tokens2 should be evicted (least frequently used)
-        let result = tree.match_prefix_with_counts(&tokens2);
-        assert_eq!(
-            result.matched_token_count, 0,
-            "tokens2 should be evicted (lowest hit count)"
-        );
-
-        // tokens1 should remain (highest hit count)
-        let result = tree.match_prefix_with_counts(&tokens1);
-        assert_eq!(
-            result.matched_token_count, PAGE_SIZE,
-            "tokens1 should remain (high hit count)"
-        );
-    }
-
-    #[test]
-    fn test_eviction_policy_enum_default() {
-        // Default should be LRU
-        assert_eq!(EvictionPolicy::default(), EvictionPolicy::Lru);
-    }
-
-    #[test]
-    fn test_tree_with_policy_getter() {
-        let tree_lru = TokenTree::with_policy(EvictionPolicy::Lru);
-        assert_eq!(tree_lru.eviction_policy(), EvictionPolicy::Lru);
-
-        let tree_lfu = TokenTree::with_policy(EvictionPolicy::Lfu);
-        assert_eq!(tree_lfu.eviction_policy(), EvictionPolicy::Lfu);
-
-        let tree_fifo = TokenTree::with_policy(EvictionPolicy::Fifo);
-        assert_eq!(tree_fifo.eviction_policy(), EvictionPolicy::Fifo);
-    }
-
-    #[test]
-    fn test_tree_with_config() {
-        // Test with_config constructor with valid page_size
-        let tree = TokenTree::with_config(PAGE_SIZE, EvictionPolicy::Lfu);
-        assert_eq!(tree.page_size(), PAGE_SIZE);
-        assert_eq!(tree.eviction_policy(), EvictionPolicy::Lfu);
-
-        // Verify defaults: new() should use PAGE_SIZE=16 and LRU
-        let tree_default = TokenTree::new();
-        assert_eq!(tree_default.page_size(), 16);
-        assert_eq!(tree_default.eviction_policy(), EvictionPolicy::Lru);
-
-        // with_policy should use default page_size
-        let tree_policy = TokenTree::with_policy(EvictionPolicy::Fifo);
-        assert_eq!(tree_policy.page_size(), PAGE_SIZE);
-        assert_eq!(tree_policy.eviction_policy(), EvictionPolicy::Fifo);
-    }
-
-    #[test]
-    #[should_panic(expected = "page_size must be at least 1")]
-    fn test_tree_with_config_invalid_page_size() {
-        let _tree = TokenTree::with_config(0, EvictionPolicy::Lru);
-    }
-
-    #[test]
-    fn test_iter_entries_empty_tree() {
-        let tree = TokenTree::new();
-        let entries: Vec<_> = tree.iter_entries().collect();
-        assert!(entries.is_empty());
-    }
-
-    #[test]
-    fn test_iter_entries_single_insert() {
-        let tree = TokenTree::new();
-        let tokens: Vec<TokenId> = (0..16).collect();
-        tree.insert_tokens(&tokens, "worker-1");
-
-        let entries: Vec<(Vec<TokenId>, Vec<String>)> = tree
-            .iter_entries()
-            .map(|(p, ts)| (p, ts.into_iter().map(|(t, _)| t.to_string()).collect()))
-            .collect();
-        let leaf = entries
-            .iter()
-            .find(|(p, _)| p == &tokens)
-            .expect("leaf with the inserted tokens");
-        assert_eq!(leaf.1, vec!["worker-1".to_string()]);
-    }
-
-    #[test]
-    fn test_iter_entries_pre_order_lex_sorted() {
-        // Two inserts with a shared prefix produce a split node.
-        // Children sort by `TokenPageKey` lexicographically, so
-        // the smaller-page-key child emits first.
-        let tree = TokenTree::new();
-        let prefix: Vec<TokenId> = (0..16).collect();
-        let mut a: Vec<TokenId> = prefix.clone();
-        a.extend(0..16); // child page = [0..16]
-        let mut b: Vec<TokenId> = prefix.clone();
-        b.extend(100..116); // child page = [100..116]
-        tree.insert_tokens(&a, "wa");
-        tree.insert_tokens(&b, "wb");
-
-        let paths: Vec<Vec<TokenId>> = tree.iter_entries().map(|(p, _)| p).collect();
-        // Order: shared "0..16" parent appears first via wa being
-        // present at index 0 of children; the actual leaves come
-        // through in lex order.
-        assert!(paths.contains(&a));
-        assert!(paths.contains(&b));
-        let pos_a = paths.iter().position(|p| p == &a).unwrap();
-        let pos_b = paths.iter().position(|p| p == &b).unwrap();
-        assert!(pos_a < pos_b, "page-key 0..16 < 100..116");
-    }
-
-    /// Build the same sequence of operations two ways — `match_prefix_with_counts`
-    /// + `insert_tokens` (the legacy pair) vs the fused `match_and_insert` — and
-    /// assert the returned match results and the resulting per-tenant token
-    /// counts match step for step. Timestamps are intentionally not compared
-    /// (the fused path may consume a different number of monotonic ticks).
-    fn assert_fused_matches_pair(ops: &[(Vec<TokenId>, &str)]) {
-        let pair = TokenTree::new();
-        let fused = TokenTree::new();
-        for (tokens, tenant) in ops {
-            let r_pair = pair.match_prefix_with_counts(tokens);
-            pair.insert_tokens(tokens, tenant);
-
-            let r_fused = fused.match_and_insert(tokens, tenant);
-
-            assert_eq!(
-                r_pair.matched_token_count, r_fused.matched_token_count,
-                "matched_token_count mismatch for tenant {tenant}"
-            );
-            assert_eq!(
-                r_pair.input_token_count, r_fused.input_token_count,
-                "input_token_count mismatch"
-            );
-            // Tenant is approximate (get_any_tenant), but for these
-            // single-tenant-per-path scenarios it is deterministic.
-            assert_eq!(
-                r_pair.tenant.as_ref(),
-                r_fused.tenant.as_ref(),
-                "matched tenant mismatch"
-            );
-            // Compare as sets: tenant-map iteration order is unstable.
-            let sorted = |result: &PrefixMatchResult| {
-                let mut tenants: Vec<&str> =
-                    result.matched_tenants.iter().map(AsRef::as_ref).collect();
-                tenants.sort_unstable();
-                tenants.into_iter().map(String::from).collect::<Vec<_>>()
-            };
-            assert_eq!(
-                sorted(&r_pair),
-                sorted(&r_fused),
-                "matched_tenants mismatch for tenant {tenant}"
-            );
-        }
-        assert_eq!(
-            pair.get_tenant_token_counts(),
-            fused.get_tenant_token_counts(),
-            "tenant token counts diverged between pair and fused"
-        );
-    }
-
-    #[test]
-    fn test_match_and_insert_equiv_fresh_and_full_match() {
-        let a = make_tokens(1, 3);
-        assert_fused_matches_pair(&[
-            (a.clone(), "w1"), // fresh insert (single node)
-            (a.clone(), "w1"), // exact re-insert (full match continue)
-            (a, "w2"),         // same path, different tenant (full match, adds w2)
-        ]);
-    }
-
-    #[test]
-    fn test_match_and_insert_equiv_prefix_of_child_split() {
-        let long = make_tokens(1, 3);
-        let short = make_tokens(1, 1); // prefix of `long` -> splits the node
-        assert_fused_matches_pair(&[(long, "w1"), (short, "w2")]);
-    }
-
-    #[test]
-    fn test_match_and_insert_equiv_diverge_split() {
-        // Shared first page, diverging second page -> partial/diverge split.
-        let mut a = make_tokens(1, 1);
-        a.extend(make_tokens(100, 1));
-        let mut b = make_tokens(1, 1);
-        b.extend(make_tokens(200, 1));
-        assert_fused_matches_pair(&[(a, "w1"), (b, "w2")]);
-    }
-
-    #[test]
-    fn test_match_and_insert_equiv_disjoint() {
-        let a = make_tokens(1, 2);
-        let b = make_tokens(1000, 2);
-        assert_fused_matches_pair(&[(a, "w1"), (b, "w2")]);
-    }
-
-    #[test]
-    fn test_match_and_insert_equiv_short_sequence() {
-        // Below PAGE_SIZE: insert is a no-op, match returns 0.
-        assert_fused_matches_pair(&[(vec![1, 2, 3], "w1")]);
-    }
-
-    /// The `_with` closure form must behave like `match_and_insert` when the
-    /// closure always returns the same tenant, and must skip the insert (leaving
-    /// the tree unchanged) when it returns `None`.
-    #[test]
-    fn test_match_and_insert_with_select_and_skip() {
-        let tokens = make_tokens(1, 3);
-
-        // Always-insert closure == match_and_insert(tokens, "w1").
-        let via_with = TokenTree::new();
-        let r = via_with.match_and_insert_with(&tokens, |_| Some("w1"));
-        let via_plain = TokenTree::new();
-        let r2 = via_plain.match_and_insert(&tokens, "w1");
-        assert_eq!(r.matched_token_count, r2.matched_token_count);
-        assert_eq!(
-            via_with.get_tenant_token_counts(),
-            via_plain.get_tenant_token_counts()
-        );
-
-        // Seed a tree, then a None-returning closure must NOT mutate it.
-        let tree = TokenTree::new();
-        tree.insert_tokens(&tokens, "w1");
-        let before = tree.get_tenant_token_counts();
-        let r = tree.match_and_insert_with(&tokens, |_| None);
-        assert_eq!(r.matched_token_count, tokens.len()); // full match observed
-        assert_eq!(
-            tree.get_tenant_token_counts(),
-            before,
-            "None selection must not insert"
-        );
-    }
-
-    /// Concurrency stress test — settles whether the fused
-    /// `match_and_insert` / `match_and_insert_with` path corrupts
-    /// `tenant_token_count` or loses routes under concurrent node splits
-    /// (the review concern).
-    ///
-    /// Invariant under test (exact, concurrency-independent): a tenant's
-    /// count equals the tokens it owns — `align_to_page(input_len)` counted
-    /// once on first attach, never again on repeats — no matter how nodes are
-    /// split mid-flight or how calls interleave (first-attach is atomic in
-    /// `touch_tenant`, per-node `advance`s are frozen at match time, and the
-    /// suffix splice re-walks from the fall-off node). Inflation from repeat
-    /// traffic or concurrent splits fails the exact-equality assert below.
-    /// There is no background eviction in a bare `TokenTree`.
-    ///
-    /// Both variants run concurrently (inline + replay) on overlapping, nested,
-    /// diverging prefixes chosen to force splits.
-    #[test]
-    fn test_concurrent_match_and_insert_count_and_route_integrity() {
-        const N_PREFIXES: usize = 8;
-        const N_THREADS: usize = 8;
-        const ITERS: usize = 3000;
-
-        // Nested shared head [1,2,3,…] (a shorter prefix matching inside a
-        // longer node forces a split) + a disjoint divergent tail per tenant.
-        let prefixes: Vec<Vec<TokenId>> = (0..N_PREFIXES)
-            .map(|j| {
-                let mut v = make_tokens(1, j + 1);
-                v.extend(make_tokens(10_000 + (j as u32) * 100, 1));
-                v
-            })
-            .collect();
-        let tenants: Vec<String> = (0..N_PREFIXES).map(|j| format!("t{j}")).collect();
-        let lens: Vec<usize> = prefixes
-            .iter()
-            .map(|p| align_to_page(p.len(), PAGE_SIZE))
-            .collect();
-
-        let tree = Arc::new(TokenTree::new());
-        let prefixes = Arc::new(prefixes);
-        let tenants = Arc::new(tenants);
-
-        let handles: Vec<_> = (0..N_THREADS)
-            .map(|t| {
-                let tree = Arc::clone(&tree);
-                let prefixes = Arc::clone(&prefixes);
-                let tenants = Arc::clone(&tenants);
-                thread::spawn(move || {
-                    let mut local = [0usize; N_PREFIXES];
-                    for i in 0..ITERS {
-                        let j = (t + i) % N_PREFIXES;
-                        if t % 2 == 0 {
-                            // replay variant (#1: count-drift concern)
-                            let tn = tenants[j].as_str();
-                            tree.match_and_insert_with(&prefixes[j], |_| Some(tn));
-                        } else {
-                            // inline variant (#2: touch-order concern)
-                            tree.match_and_insert(&prefixes[j], tenants[j].as_str());
-                        }
-                        local[j] += 1;
-                    }
-                    local
-                })
-            })
-            .collect();
-
-        let mut total = [0usize; N_PREFIXES];
-        for h in handles {
-            let local = h.join().expect("worker panicked (deadlock/corruption)");
-            for j in 0..N_PREFIXES {
-                total[j] += local[j];
-            }
-        }
-
-        // DEFINITIVE: exact, concurrency-independent count. Repeat traffic
-        // must not inflate ownership: each tenant owns its full path exactly
-        // once regardless of iteration count or interleaving (first-attach is
-        // atomic in touch_tenant).
-        let counts = tree.get_tenant_token_counts();
-        for j in 0..N_PREFIXES {
-            assert!(total[j] > 0);
-            let expected = lens[j];
-            let actual = counts.get(&tenants[j]).copied().unwrap_or(0);
-            assert_eq!(
-                actual, expected,
-                "tenant {} token count diverged under concurrency: expected {expected}, got {actual}",
-                tenants[j]
-            );
-        }
-
-        // Route integrity: every prefix is still fully cached at the end.
-        for j in 0..N_PREFIXES {
-            let r = tree.match_prefix_with_counts(&prefixes[j]);
-            assert_eq!(
-                r.matched_token_count, lens[j],
-                "prefix {j} not fully cached after concurrent stress (route loss)"
-            );
-        }
-    }
-
-    #[test]
-    fn test_evict_by_size_shared_budget_lru_tenants() {
-        let tree = TokenTree::new();
-
-        // 8 tenants, 2 pages each: every tenant is far below the budget on
-        // its own, but the tree-wide total is double the budget.
-        for t in 0..8u32 {
-            let tokens = make_tokens(t * 100_000 + 1, 2);
-            tree.insert_tokens(&tokens, &format!("tenant{t}"));
-        }
-        assert_eq!(tree.total_token_size(), 8 * 2 * PAGE_SIZE);
-
-        let max_size = 4 * 2 * PAGE_SIZE;
-        tree.evict_tenant_by_size(max_size);
-
-        assert!(tree.total_token_size() <= max_size);
-        // Least-recently-used tenants are evicted first.
-        for t in 0..4u32 {
-            let tokens = make_tokens(t * 100_000 + 1, 2);
-            let result = tree.match_prefix_with_counts(&tokens);
-            assert_eq!(
-                result.matched_token_count, 0,
-                "tenant{t} (LRU) should be evicted"
-            );
-            let tenant: TenantId = Arc::from(format!("tenant{t}"));
-            assert_eq!(tree.tenant_token_size(&tenant), 0);
-        }
-        for t in 4..8u32 {
-            let tokens = make_tokens(t * 100_000 + 1, 2);
-            let result = tree.match_prefix_with_counts(&tokens);
-            assert_eq!(
-                result.matched_token_count,
-                2 * PAGE_SIZE,
-                "tenant{t} should survive"
-            );
-        }
-    }
-
-    #[test]
-    fn test_evict_by_size_under_budget_is_noop() {
-        let tree = TokenTree::new();
-        for t in 0..4u32 {
-            let tokens = make_tokens(t * 100_000 + 1, 2);
-            tree.insert_tokens(&tokens, &format!("tenant{t}"));
-        }
-        let counts_before = tree.get_tenant_token_counts();
-        assert_eq!(tree.total_token_size(), 4 * 2 * PAGE_SIZE);
-
-        // At and above the budget: nothing may change.
-        tree.evict_tenant_by_size(4 * 2 * PAGE_SIZE);
-        tree.evict_tenant_by_size(usize::MAX);
-
-        assert_eq!(tree.get_tenant_token_counts(), counts_before);
-        assert_eq!(tree.total_token_size(), 4 * 2 * PAGE_SIZE);
-        for t in 0..4u32 {
-            let tokens = make_tokens(t * 100_000 + 1, 2);
-            assert_eq!(
-                tree.match_prefix_with_counts(&tokens).matched_token_count,
-                2 * PAGE_SIZE
-            );
-        }
-    }
-
-    #[test]
-    fn test_total_count_consistent_with_tenant_sum() {
-        fn assert_consistent(tree: &TokenTree) {
-            let sum: usize = tree.get_tenant_token_counts().values().sum();
-            assert_eq!(
-                tree.total_token_size(),
-                sum,
-                "total must equal per-tenant sum"
-            );
-        }
-
-        let tree = TokenTree::new();
-        assert_consistent(&tree);
-
-        // All insert paths, including a re-insert and a skipped insert.
-        for t in 0..6u32 {
-            let tokens = make_tokens(t * 100_000 + 1, 3);
-            tree.insert_tokens(&tokens, &format!("tenant{t}"));
-        }
-        tree.insert_tokens(&make_tokens(1, 3), "tenant0");
-        tree.match_and_insert(&make_tokens(600_001, 2), "tenant1");
-        tree.match_and_insert_with(&make_tokens(700_001, 2), |_| Some("tenant2"));
-        tree.match_and_insert_with(&make_tokens(800_001, 2), |_| None);
-        assert_consistent(&tree);
-
-        // Per-tenant eviction.
-        tree.evict_tenant(&Arc::from("tenant0"), PAGE_SIZE);
-        assert_consistent(&tree);
-
-        // Global eviction.
-        let total = tree.total_token_size();
-        tree.evict_tenant_by_size(total / 2);
-        assert_consistent(&tree);
-        assert!(tree.total_token_size() <= total / 2);
-
-        // Tenant purge.
-        tree.remove_tenant_all(&Arc::from("tenant2"));
-        assert_consistent(&tree);
-
-        // No-op eviction and reset.
-        tree.evict_tenant_by_size(usize::MAX);
-        assert_consistent(&tree);
-        tree.clear();
-        assert_consistent(&tree);
-        assert_eq!(tree.total_token_size(), 0);
-    }
-
-    #[test]
-    fn test_remove_tenant_all_purges_tenant_and_keeps_others() {
-        let tree = TokenTree::new();
-
-        // Shared first page; a distinct second page per tenant.
-        let mut tokens1 = make_tokens(1, 1);
-        tokens1.extend(make_tokens(100, 1));
-        let mut tokens2 = make_tokens(1, 1);
-        tokens2.extend(make_tokens(200, 1));
-        tree.insert_tokens(&tokens1, "tenant1");
-        tree.insert_tokens(&tokens2, "tenant2");
-
-        tree.remove_tenant_all(&Arc::from("tenant1"));
-
-        // Count entry is gone (not merely zero), root entry included.
-        assert!(!tree.get_tenant_token_counts().contains_key("tenant1"));
-        assert!(!tree.root.tenant_last_access_time.contains_key("tenant1"));
-
-        // tenant1's path only matches the shared page, now owned by tenant2.
-        let r = tree.match_prefix_with_counts(&tokens1);
-        assert_eq!(r.matched_token_count, PAGE_SIZE);
-        assert_eq!(r.tenant.as_ref(), "tenant2");
-
-        // tenant1's sole-owner branch is detached from the shared node.
-        assert_eq!(tree.root.children.len(), 1);
-        let shared = Arc::clone(tree.root.children.iter().next().unwrap().value());
-        assert_eq!(shared.children.len(), 1);
-
-        // tenant2 still matches its full prefix.
-        let r = tree.match_prefix_with_counts(&tokens2);
-        assert_eq!(r.matched_token_count, 2 * PAGE_SIZE);
-        assert_eq!(r.tenant.as_ref(), "tenant2");
-    }
-
-    #[test]
-    fn test_remove_tenant_all_prunes_unrelated_subtrees() {
-        let tree = TokenTree::new();
-        let target = make_tokens(1, 2);
-        tree.insert_tokens(&target, "target");
-
-        let mut unrelated = make_tokens(10_000, 1);
-        for page in 1..=64 {
-            unrelated.extend(make_tokens(10_000 + page * 100, 1));
-            tree.insert_tokens(&unrelated, "other");
-        }
-
-        let tenant = Arc::from("target");
-        let mut nodes = Vec::new();
-        tree.collect_tenant_nodes_pruned(&tree.root, &tenant, &mut nodes);
-
-        assert_eq!(nodes.len(), 1);
-
-        tree.remove_tenant_all(&tenant);
-        assert!(!tree.get_tenant_token_counts().contains_key("target"));
-        assert_eq!(
-            tree.match_prefix_with_counts(&unrelated)
-                .matched_token_count,
-            unrelated.len()
-        );
-    }
-
-    #[test]
-    fn test_remove_tenant_all_sole_owner_detaches_subtree() {
-        let tree = TokenTree::new();
-        // Chain root -> [page] -> [2 pages], all owned by tenant1 only.
-        tree.insert_tokens(&make_tokens(500, 1), "tenant1");
-        tree.insert_tokens(&make_tokens(500, 3), "tenant1");
-        assert!(!tree.root.children.is_empty());
-
-        tree.remove_tenant_all(&Arc::from("tenant1"));
-
-        assert!(tree.root.children.is_empty());
-        assert!(!tree.get_tenant_token_counts().contains_key("tenant1"));
-        let r = tree.match_prefix_with_counts(&make_tokens(500, 3));
-        assert_eq!(r.matched_token_count, 0);
-    }
-
-    /// One full round at a non-default page size: page alignment, sub-page
-    /// skip, split at a page boundary, and prefix subsumption across
-    /// different-length inserts.
-    fn roundtrip_at_page_size(page: usize) {
-        let tree = TokenTree::with_config(page, EvictionPolicy::default());
-        let seq: Vec<TokenId> = (0..(3 * page) as u32).collect();
-
-        // Sub-page: uncacheable.
-        tree.insert_tokens(&seq[..page - 1], "w1");
-        assert_eq!(tree.match_prefix_with_counts(&seq).matched_token_count, 0);
-
-        // Three pages under w1; a two-page prefix must subsume.
-        tree.insert_tokens(&seq, "w1");
-        let full = tree.match_prefix_with_counts(&seq);
-        assert_eq!(full.matched_token_count, 3 * page);
-        assert_eq!(full.tenant.as_ref(), "w1");
-        assert_eq!(
-            tree.match_prefix_with_counts(&seq[..2 * page])
-                .matched_token_count,
-            2 * page
-        );
-
-        // Diverge after page 1 under w2: forces a split at a page boundary.
-        let mut fork: Vec<TokenId> = seq[..page].to_vec();
-        fork.extend((0..(2 * page) as u32).map(|i| 900_000 + i));
-        tree.insert_tokens(&fork, "w2");
-        let forked = tree.match_prefix_with_counts(&fork);
-        assert_eq!(forked.matched_token_count, 3 * page);
-        assert_eq!(forked.tenant.as_ref(), "w2");
-        // Shared first page still matches; unaligned tails truncate.
-        let mut partial: Vec<TokenId> = seq[..page].to_vec();
-        partial.extend([1_000_001, 1_000_002]);
-        assert_eq!(
-            tree.match_prefix_with_counts(&partial).matched_token_count,
-            page
-        );
-    }
-
-    #[test]
-    fn configurable_page_size_roundtrip() {
-        for page in [1, 3, 16, 512, 4096] {
-            roundtrip_at_page_size(page);
-        }
-    }
-
-    #[test]
-    fn per_tree_page_size_is_independent() {
-        let coarse = TokenTree::with_config(512, EvictionPolicy::default());
-        let seq: Vec<TokenId> = (0..600).collect();
-        coarse.insert_tokens(&seq, "w1");
-        // 600 tokens = one 512 page; the 88-token tail is uncacheable.
-        assert_eq!(
-            coarse.match_prefix_with_counts(&seq).matched_token_count,
-            512
-        );
-
-        let fine = TokenTree::new();
-        fine.insert_tokens(&seq, "w1");
-        // Default 16: aligned to 592.
-        assert_eq!(fine.match_prefix_with_counts(&seq).matched_token_count, 592);
-    }
-}
+mod tests;

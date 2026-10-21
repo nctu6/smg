@@ -4,20 +4,32 @@ use std::fmt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ResponseEvent {
     Created,
+    /// A background response has been accepted and waits for its turn; the
+    /// public API emits it right after `response.created` on a stream that
+    /// was created with `background: true`.
+    Queued,
     InProgress,
     Completed,
+    Incomplete,
+    Failed,
 }
 
 impl ResponseEvent {
     pub const CREATED: &'static str = "response.created";
+    pub const QUEUED: &'static str = "response.queued";
     pub const IN_PROGRESS: &'static str = "response.in_progress";
     pub const COMPLETED: &'static str = "response.completed";
+    pub const INCOMPLETE: &'static str = "response.incomplete";
+    pub const FAILED: &'static str = "response.failed";
 
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Created => Self::CREATED,
+            Self::Queued => Self::QUEUED,
             Self::InProgress => Self::IN_PROGRESS,
             Self::Completed => Self::COMPLETED,
+            Self::Incomplete => Self::INCOMPLETE,
+            Self::Failed => Self::FAILED,
         }
     }
 }
@@ -637,11 +649,43 @@ impl fmt::Display for RealtimeServerEvent {
 pub fn is_response_event(event_type: &str) -> bool {
     matches!(
         event_type,
-        ResponseEvent::CREATED | ResponseEvent::IN_PROGRESS | ResponseEvent::COMPLETED
+        ResponseEvent::CREATED
+            | ResponseEvent::QUEUED
+            | ResponseEvent::IN_PROGRESS
+            | ResponseEvent::COMPLETED
+            | ResponseEvent::INCOMPLETE
+            | ResponseEvent::FAILED
     )
 }
 
 /// Check if an item type string is a function call variant
 pub fn is_function_call_type(item_type: &str) -> bool {
     item_type == ItemType::FUNCTION_CALL || item_type == ItemType::FUNCTION_TOOL_CALL
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_is_a_lifecycle_event() {
+        assert_eq!(ResponseEvent::Failed.as_str(), "response.failed");
+        assert_eq!(ResponseEvent::FAILED, ResponseEvent::Failed.as_str());
+        assert!(is_response_event(ResponseEvent::FAILED));
+    }
+
+    #[test]
+    fn every_lifecycle_variant_round_trips_through_the_predicate() {
+        for event in [
+            ResponseEvent::Created,
+            ResponseEvent::Queued,
+            ResponseEvent::InProgress,
+            ResponseEvent::Completed,
+            ResponseEvent::Incomplete,
+            ResponseEvent::Failed,
+        ] {
+            assert!(is_response_event(event.as_str()), "{event}");
+        }
+        assert!(!is_response_event("response.output_item.added"));
+    }
 }
