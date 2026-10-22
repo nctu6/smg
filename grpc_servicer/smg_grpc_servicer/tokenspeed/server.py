@@ -88,6 +88,11 @@ def _grpc_server_options(max_message_bytes: int) -> list[tuple[str, int]]:
     return [
         ("grpc.max_send_message_length", max_message_bytes),
         ("grpc.max_receive_message_length", max_message_bytes),
+        # Admit more concurrent streams than the HTTP/2 default of 100: the
+        # gateway opens one Generate stream per in-flight request, and
+        # max_num_seqs (452) can exceed 100, so the default would reset the
+        # excess streams as a broken pipe (start_generation_failed) under load.
+        ("grpc.max_concurrent_streams", 2048),
         # Long EPD requests can spend minutes without sending DATA frames while
         # the Rust client still sends HTTP/2 keepalive pings.
         ("grpc.http2.min_ping_interval_without_data_ms", 10000),
