@@ -147,11 +147,7 @@ impl Gemma3Processor {
         crops
     }
 
-    fn process_one(
-        &self,
-        image: &DynamicImage,
-        config: &PreProcessorConfig,
-    ) -> Array3<f32> {
+    fn process_one(&self, image: &DynamicImage, config: &PreProcessorConfig) -> Array3<f32> {
         let size = config
             .get_target_size()
             .map(|(h, _)| h)
@@ -217,11 +213,8 @@ impl VisionPreProcessor for Gemma3Processor {
         }
 
         let encoder_input = stack_batch(&tensors)?;
-        let mut out = PreprocessedEncoderInputs::new(
-            encoder_input,
-            feature_token_counts,
-            item_sizes,
-        );
+        let mut out =
+            PreprocessedEncoderInputs::new(encoder_input, feature_token_counts, item_sizes);
         out.model_specific.insert(
             "num_patches".to_string(),
             ModelSpecificValue::IntVec(num_patches),
@@ -238,16 +231,16 @@ impl VisionPreProcessor for Gemma3Processor {
         width: u32,
         height: u32,
         config: &PreProcessorConfig,
-    ) -> usize {
+    ) -> Result<usize, TransformError> {
         let mm_tokens = Self::mm_tokens(config, self.mm_tokens_per_image);
         if !Self::pas_enabled(config) {
-            return mm_tokens;
+            return Ok(mm_tokens);
         }
         let (min_crop, max_crops, min_ratio) = Self::pas_params(config);
         // Synthetic image for crop-count only.
         let dummy = DynamicImage::new_rgb8(width.max(1), height.max(1));
         let n_crops = Self::pan_and_scan_crops(&dummy, min_crop, max_crops, min_ratio).len();
-        (1 + n_crops) * mm_tokens
+        Ok((1 + n_crops) * mm_tokens)
     }
 
     fn model_name(&self) -> &'static str {
@@ -265,8 +258,9 @@ impl VisionPreProcessor for Gemma3Processor {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use serde_json::json;
+
+    use super::*;
 
     fn pas_config() -> PreProcessorConfig {
         let mut cfg = PreProcessorConfig::default();

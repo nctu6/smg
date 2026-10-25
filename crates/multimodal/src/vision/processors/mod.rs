@@ -25,6 +25,7 @@
 //! - **Nemotron-H Omni** (`nemotron_omni`): C-RADIO dynamic resolution, an even 16px patch grid with CLIP normalization
 
 pub mod deepseek_v41;
+pub mod gemma3;
 pub mod gemma4;
 pub mod glm53_flash;
 pub mod inkling;
@@ -45,6 +46,7 @@ pub mod qwen3_vl;
 pub mod qwen_vl_base;
 
 pub use deepseek_v41::DeepseekV41Processor;
+pub use gemma3::Gemma3Processor;
 pub use gemma4::Gemma4Processor;
 pub use glm53_flash::Glm53FlashProcessor;
 pub use inkling::InklingImageProcessor;

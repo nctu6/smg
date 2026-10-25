@@ -1,4 +1,5 @@
 mod deepseek_v41;
+mod gemma3;
 mod gemma4;
 mod glm53_flash;
 mod inkling;
@@ -19,6 +20,7 @@ pub mod transcription;
 
 use deepseek_v41::DeepseekV41VisionSpec;
 pub use deepseek_v41::DEEPSEEK_V41_IMAGE_PLACEHOLDER;
+use gemma3::Gemma3VisionSpec;
 use gemma4::Gemma4Spec;
 use glm53_flash::Glm53FlashSpec;
 use inkling::InklingSpec;
@@ -52,6 +54,9 @@ impl ModelRegistry {
             specs: vec![
                 // DeepSeek-V4.1 matches only its own model_type / id, so it can lead.
                 LazySpec::new(|| Box::new(DeepseekV41VisionSpec)),
+                // Gemma 3 must be registered before Gemma 4: Gemma3VisionSpec
+                // excludes gemma4 ids/model_type, so order is defensive.
+                LazySpec::new(|| Box::new(Gemma3VisionSpec)),
                 // Gemma 4 matches its own model_type / id only.
                 LazySpec::new(|| Box::new(Gemma4Spec)),
                 LazySpec::new(|| Box::new(Glm53FlashSpec)),

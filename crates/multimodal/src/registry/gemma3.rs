@@ -1,7 +1,5 @@
 use std::collections::HashMap;
 
-use serde_json::{json, Value};
-
 use crate::{
     encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs},
     registry::{ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult},
@@ -102,10 +100,9 @@ impl Gemma3VisionSpec {
 
     fn num_crops_list(preprocessed: &PreprocessedEncoderInputs) -> Vec<usize> {
         match preprocessed.model_specific.get("pan_and_scan_num_crops") {
-            Some(ModelSpecificValue::IntVec(v)) => v
-                .iter()
-                .map(|&c| usize::try_from(c).unwrap_or(0))
-                .collect(),
+            Some(ModelSpecificValue::IntVec(v)) => {
+                v.iter().map(|&c| usize::try_from(c).unwrap_or(0)).collect()
+            }
             Some(ModelSpecificValue::IntTensor { data, .. }) => data
                 .iter()
                 .map(|&c| usize::try_from(c).unwrap_or(0))
@@ -162,23 +159,12 @@ impl ModelProcessorSpec for Gemma3VisionSpec {
         Ok(HashMap::from([(Modality::Image, 16)]))
     }
 
-    fn processor_kwargs(&self, _metadata: &ModelMetadata) -> RegistryResult<Value> {
-        // Opt-in pan-and-scan via preprocessor_config / mm kwargs; default off.
-        Ok(json!({}))
-    }
-
     fn field_layouts(&self) -> HashMap<String, FieldLayout> {
         // Flat so pan-and-scan can attach multiple patches per logical image.
         HashMap::from([
-            (
-                "pixel_values".to_string(),
-                FieldLayout::flat("num_patches"),
-            ),
+            ("pixel_values".to_string(), FieldLayout::flat("num_patches")),
             ("num_patches".to_string(), FieldLayout::Batched),
-            (
-                "pan_and_scan_num_crops".to_string(),
-                FieldLayout::Batched,
-            ),
+            ("pan_and_scan_num_crops".to_string(), FieldLayout::Batched),
         ])
     }
 

@@ -287,6 +287,11 @@ const DEFAULT_PROCESSORS: &[(&[&str], ProcessorConstructor)] = &[
     (&["nemotronh_nano_omni", "nemotron-3-nano-omni"], || {
         Box::new(super::processors::NemotronOmniProcessor::new())
     }),
+    // Gemma 3 (the HF model_type and the released ids' spelling). Registered
+    // before Gemma 4 so a "gemma-3" id is not shadowed by a broader pattern.
+    (&["gemma3", "gemma-3"], || {
+        Box::new(super::processors::Gemma3Processor::new())
+    }),
     // Gemma 4 (the HF model_type and the released ids' spelling).
     (&["gemma4", "gemma-4"], || {
         Box::new(super::processors::Gemma4Processor::new())
@@ -453,6 +458,8 @@ mod tests {
             ("deepseek-v4.1", "deepseek_v41"),
             ("nemotronh_nano_omni", "nemotron_omni"),
             ("nemotron-3-nano-omni", "nemotron_omni"),
+            ("gemma3", "gemma3"),
+            ("gemma-3", "gemma3"),
             ("gemma4", "gemma4"),
             ("gemma-4", "gemma4"),
             ("glm-5.3-flash", "glm-5.3-flash"),
@@ -518,9 +525,15 @@ mod tests {
                 .expect("Gemma 4 vision processor");
             assert_eq!(processor.model_name(), "gemma4", "{model_id}");
         }
-        assert!(registry
+        // Gemma 3 now resolves to its own processor (registered before Gemma 4).
+        let g3 = registry
             .find("/models/local-checkpoint", Some("gemma3"))
-            .is_none());
+            .expect("Gemma 3 vision processor");
+        assert_eq!(g3.model_name(), "gemma3");
+        let g3_id = registry
+            .find("/models/google/gemma-3-27b-it", None)
+            .expect("Gemma 3 vision processor by id");
+        assert_eq!(g3_id.model_name(), "gemma3");
     }
 
     #[test]
