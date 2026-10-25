@@ -236,7 +236,7 @@ fn preprocess_matches_the_reference_fingerprints() {
                     "{}: calculate_num_tokens",
                     case.name
                 );
-                check(case, &out, "pixel_position_ids");
+                check(case, &out, "image_position_ids");
             }
             70 => {
                 // The engine's video frames: the image processor at the video budget.

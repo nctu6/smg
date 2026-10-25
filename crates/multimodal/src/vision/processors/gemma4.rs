@@ -5,7 +5,7 @@
 //! flat `(max_patches, patch_pixels)` tensor of `patch_size` x `patch_size`
 //! RGB patches in row-major order, zero-padded to `max_patches =
 //! max_soft_tokens * pooling_kernel_size^2`, and per patch its `(x, y)` grid
-//! coordinates, `-1` for the padding (`pixel_position_ids` on the engine
+//! coordinates, `-1` for the padding (`image_position_ids` on the engine
 //! side). The image is resized with its aspect ratio kept to the largest size
 //! whose sides are multiples of `pooling_kernel_size * patch_size` within the
 //! patch budget (the reference `get_aspect_ratio_preserving_size`), rescaled
@@ -451,7 +451,7 @@ impl VisionPreProcessor for Gemma4Processor {
         let (tensor, positions, tokens) = stack(encoded, params)?;
         let sizes = images.iter().map(GenericImageView::dimensions).collect();
         Ok(PreprocessedEncoderInputs::new(tensor, tokens, sizes)
-            .with_extra("pixel_position_ids", positions))
+            .with_extra("image_position_ids", positions))
     }
 
     fn preprocess_video(
@@ -598,9 +598,9 @@ mod tests {
         assert_eq!(values[[0, 2304, 0]], 0.0);
         assert_eq!(values[[0, 2519, 767]], 0.0);
         let ModelSpecificValue::IntTensor { data, shape } =
-            &out.model_specific["pixel_position_ids"]
+            &out.model_specific["image_position_ids"]
         else {
-            panic!("pixel_position_ids must be an int tensor");
+            panic!("image_position_ids must be an int tensor");
         };
         assert_eq!(shape, &[1, 2520, 2]);
         assert_eq!(&data[..6], &[0, 0, 1, 0, 2, 0]);

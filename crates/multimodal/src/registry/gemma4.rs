@@ -241,7 +241,7 @@ impl ModelProcessorSpec for Gemma4Spec {
         let image_layouts = || {
             EncoderFieldLayouts::new(
                 FieldLayout::Batched,
-                HashMap::from([("pixel_position_ids".to_string(), FieldLayout::Batched)]),
+                HashMap::from([("image_position_ids".to_string(), FieldLayout::Batched)]),
             )
         };
         Some(match modality {
@@ -340,7 +340,7 @@ impl ModelProcessorSpec for Gemma4Spec {
         // frames flat over the batch and sliced per clip by its frame count.
         HashMap::from([
             ("pixel_values".to_string(), FieldLayout::Batched),
-            ("pixel_position_ids".to_string(), FieldLayout::Batched),
+            ("image_position_ids".to_string(), FieldLayout::Batched),
             (
                 "pixel_values_videos".to_string(),
                 FieldLayout::flat("video_frame_counts"),
@@ -792,7 +792,7 @@ mod tests {
         assert_eq!(image.encoder_input, FieldLayout::Batched);
         assert_eq!(
             image.model_specific,
-            HashMap::from([("pixel_position_ids".to_string(), FieldLayout::Batched)])
+            HashMap::from([("image_position_ids".to_string(), FieldLayout::Batched)])
         );
         let video = spec.encoder_field_layouts_for(Modality::Video);
         assert_eq!(video.encoder_input, FieldLayout::flat("video_frame_counts"));
