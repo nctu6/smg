@@ -578,13 +578,27 @@ fn expand_served_model_cards(
         names.insert(0, model_card.id.clone());
     }
 
+    // Extra served names are first-class ids, not aliases of each other: the
+    // extra cards carry no aliases, and the canonical card drops any alias
+    // that is also an extra name. The canonical card keeps the other aliases
+    // (`--model-alias` attached by `build_model_card`), so a client name that
+    // is only an alias still routes.
+    let canonical_aliases: Vec<String> = model_card
+        .aliases
+        .iter()
+        .filter(|alias| !names.contains(alias))
+        .cloned()
+        .collect();
     names
         .into_iter()
         .map(|id| {
             let mut card = model_card.clone();
-            card.id = id;
-            // Extra served names are first-class ids, not aliases of each other.
-            card.aliases.clear();
+            if id == model_card.id {
+                card.aliases = canonical_aliases.clone();
+            } else {
+                card.id = id;
+                card.aliases.clear();
+            }
             card
         })
         .collect()
@@ -1962,6 +1976,32 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn served_model_cards_keep_the_router_aliases_on_the_canonical_card() {
+        // A ZMQ worker reports no served model name: its card is the
+        // gateway's `--model`, and `ts serve` names the engine's
+        // `--served-model-name` with `--model-alias served=model`.
+        let spec = WorkerSpec::new("ipc:///tmp/engine");
+        let aliases = alias_map(&[("qwen-served", "/models/qwen")]);
+        let card = build_model_card("/models/qwen", &spec, &HashMap::new(), &aliases);
+        let cards = expand_served_model_cards(&card, &HashMap::new());
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].id, "/models/qwen");
+        assert_eq!(cards[0].aliases, vec!["qwen-served".to_string()]);
+        // Extra served names become their own cards; an alias that is also
+        // an extra name is dropped from the canonical card, other aliases stay.
+        let aliases = alias_map(&[("extra", "/models/qwen"), ("qwen-served", "/models/qwen")]);
+        let card = build_model_card("/models/qwen", &spec, &HashMap::new(), &aliases);
+        let labels = HashMap::from([(
+            "served_model_names".to_string(),
+            r#"["/models/qwen", "extra"]"#.to_string(),
+        )]);
+        let cards = expand_served_model_cards(&card, &labels);
+        let ids: Vec<&str> = cards.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, vec!["/models/qwen", "extra"]);
+        assert_eq!(cards[0].aliases, vec!["qwen-served".to_string()]);
+        assert!(cards[1].aliases.is_empty());
+    }
     #[test]
     fn model_alias_map_attaches_matching_aliases_to_discovered_card() {
         // The service-discovery path supplies no user card, so the card is
