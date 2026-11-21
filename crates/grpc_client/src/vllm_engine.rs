@@ -603,6 +603,7 @@ mod tests {
             no_stop_trim: false,
             ignore_eos: false,
             skip_special_tokens: true,
+            add_special_tokens: true,
             lora_path: None,
             session_params: None,
             return_hidden_states: false,

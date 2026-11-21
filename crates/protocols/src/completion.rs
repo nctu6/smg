@@ -129,6 +129,12 @@ pub struct CompletionRequest {
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub skip_special_tokens: bool,
 
+    /// Let the tokenizer add its special tokens (such as BOS) to the prompt,
+    /// as vLLM does: `true` unless the request says otherwise. Serialized only
+    /// when `false`: `true` is what a worker applies without the field.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub add_special_tokens: bool,
+
     /// Path to LoRA adapter(s) for model customization
     pub lora_path: Option<String>,
 
